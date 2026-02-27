@@ -1,23 +1,91 @@
-# Virtual environment
-.venv/
+# ===============================
+# 🔐 Environment Variables
+# ===============================
 .env
+.env.*
+!.env.sample
 
-# Python
+# ===============================
+# 🐍 Python
+# ===============================
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Logs
+# ===============================
+# 🧪 Virtual Environment
+# ===============================
+.venv/
+venv/
+ENV/
+env/
+
+# ===============================
+# 📦 UV
+# ===============================
+# Uncomment if you DO NOT want lock file in repo
+# uv.lock
+
+# ===============================
+# 📝 Logs
+# ===============================
 logs/
 *.log
 
-# OS
+# ===============================
+# 🖥 OS Files
+# ===============================
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# UV
-uv.lock
-
-# VSCode
+# ===============================
+# 🧠 IDE / Editor
+# ===============================
 .vscode/
+.idea/
+*.swp
+*.swo
+
+# ===============================
+# 📊 Excel / Temp Files
+# ===============================
+~$*.xlsx
+~$*.xls
+
+# ===============================
+# 🧾 Database (if local dev DB files)
+# ===============================
+*.sqlite3
+*.db
+
+# ===============================
+# 📂 Coverage / Testing
+# ===============================
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ===============================
+# 🔒 Secrets
+# ===============================
+*.pem
+*.key
+*.crt
