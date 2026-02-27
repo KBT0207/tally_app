@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Data</TYPE>
+        <ID>Profit &amp; Loss A/c</ID>
+    </HEADER>
+
+    <BODY>
+        <DESC>
+            <STATICVARIABLES>
+                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <SVCURRENTCOMPANY>COMPANY_NAME_HERE</SVCURRENTCOMPANY>
+                <SVFROMDATE>FROM_DATE</SVFROMDATE>
+                <SVTODATE>TO_DATE</SVTODATE>
+                <EXPLODEFLAG>Yes</EXPLODEFLAG>
+            </STATICVARIABLES>
+        </DESC>
+    </BODY>
+</ENVELOPE>

@@ -1,0 +1,25 @@
+[project]
+name = "tally-app"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "apscheduler>=3.11.2",
+    "cryptography>=46.0.5",
+    "customtkinter>=5.2.2",
+    "defusedxml>=0.7.1",
+    "lxml>=6.0.2",
+    "marshmallow>=4.2.2",
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.1",
+    "pillow>=12.1.1",
+    "pyautogui>=0.9.54",
+    "pymysql>=1.1.2",
+    "python-dotenv==1.0.0",
+    "requests>=2.32.5",
+    "rq>=2.7.0",
+    "sqlalchemy>=2.0.47",
+    "xlwings>=0.33.20",
+    "xmltodict>=1.0.4",
+]

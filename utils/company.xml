@@ -1,0 +1,22 @@
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Collection</TYPE>
+        <ID>DetailedCompanyList</ID>
+    </HEADER>
+    <BODY>
+        <DESC>
+            <TDL>
+                <TDLMESSAGE>
+                    <COLLECTION NAME="DetailedCompanyList">
+                        <TYPE>Company</TYPE>
+                        <FETCH>
+                            *
+                        </FETCH>
+                    </COLLECTION>
+                </TDLMESSAGE>
+            </TDL>
+        </DESC>
+    </BODY>
+</ENVELOPE>

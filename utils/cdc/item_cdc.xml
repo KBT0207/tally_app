@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Collection</TYPE>
+        <ID>StockItemCDC</ID>
+    </HEADER>
+    <BODY>
+        <DESC>
+            <STATICVARIABLES>
+                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <SVCURRENTCOMPANY></SVCURRENTCOMPANY>
+            </STATICVARIABLES>
+            <TDL>
+                <TDLMESSAGE>
+                    <COLLECTION NAME="StockItemCDC">
+                        <TYPE>StockItem</TYPE>
+                        <FETCH>NAME</FETCH>
+                        <FETCH>BASEUNITS</FETCH>
+                        <FETCH>PARENT</FETCH>
+                        <FETCH>CATEGORY</FETCH>
+                        <FETCH>GSTTYPEOFSUPPLY</FETCH>
+                        <FETCH>OPENINGVALUE</FETCH>
+                        <FETCH>OPENINGBALANCE</FETCH>
+                        <FETCH>OPENINGRATE</FETCH>
+                        <FETCH>ENTEREDBY</FETCH>
+                        <FETCH>ALTERID</FETCH>
+                        <FETCH>GUID</FETCH>
+                        <FETCH>REMOTEALTGUID</FETCH>
+                        <FETCH>ISDELETED</FETCH>
+                        <FILTER>StockItemCDCFilter</FILTER>
+                    </COLLECTION>
+                    <SYSTEM TYPE="Formulae" NAME="StockItemCDCFilter">
+                        $$IsNumeric:$ALTERID AND $$Number:$ALTERID > PLACEHOLDER_ALTER_ID
+                    </SYSTEM>
+                </TDLMESSAGE>
+            </TDL>
+        </DESC>
+    </BODY>
+</ENVELOPE>

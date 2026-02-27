@@ -1,0 +1,34 @@
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Collection</TYPE>
+        <ID>IncrementalGroups</ID>
+    </HEADER>
+    <BODY>
+        <DESC>
+            <STATICVARIABLES>
+                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <SVCURRENTCOMPANY>COMPANY_NAME_HERE</SVCURRENTCOMPANY>
+            </STATICVARIABLES>
+            <TDL>
+                <TDLMESSAGE>
+                    <COLLECTION NAME="IncrementalGroups">
+                        <TYPE>Group</TYPE>
+                        <FILTER>AlterIdFilter</FILTER>
+
+                        <FETCH>GUID</FETCH>
+                        <FETCH>ALTERID</FETCH>
+                        <FETCH>MASTERID</FETCH>
+                        <FETCH>NAME</FETCH>
+                        <FETCH>PARENT</FETCH>
+                        <FETCH>ISDELETED</FETCH>
+                    </COLLECTION>
+                    <SYSTEM TYPE="Formulae" NAME="AlterIdFilter">
+                        $ALTERID > PLACEHOLDER_ALTER_ID
+                    </SYSTEM>
+                </TDLMESSAGE>
+            </TDL>
+        </DESC>
+    </BODY>
+</ENVELOPE>
