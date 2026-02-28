@@ -3,6 +3,10 @@ gui/pages/logs_page.py
 ========================
 Real-time log viewer page.
 
+Phase 3 fixes:
+  - bind_all("<MouseWheel>") replaced with Enter/Leave scoped binding
+    (same fix as home_page — prevents scroll leaking to other pages)
+
 Features:
   - Tabs: Live (sync events streamed from queue) | Main Log | Error Log
   - Tail log files — auto-detects today's log file, re-checks every 2s
@@ -23,21 +27,16 @@ from datetime import datetime
 from gui.state  import AppState
 from gui.styles import Color, Font, Spacing
 
-# How many lines to load from file on open
-TAIL_LINES = 500
-# Polling interval for file tail (ms)
+TAIL_LINES       = 500
 TAIL_INTERVAL_MS = 2000
-# Max lines to keep in Live tab before trimming
-MAX_LIVE_LINES = 2000
-
-LOGS_DIR = "logs"
+MAX_LIVE_LINES   = 2000
+LOGS_DIR         = "logs"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Log level → color tag
 # ─────────────────────────────────────────────────────────────────────────────
 def _level_tag(line: str) -> str:
-    """Detect log level from line text and return a tag name."""
     u = line.upper()
     if " ERROR " in u or " ERROR]" in u or "✗" in line:
         return "ERROR"
@@ -54,20 +53,16 @@ def _level_tag(line: str) -> str:
 #  LogTextWidget — scrollable Text with color tags, search, toolbar
 # ─────────────────────────────────────────────────────────────────────────────
 class LogTextWidget(tk.Frame):
-    """
-    Reusable scrollable log viewer.
-    Used once per tab.
-    """
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=Color.BG_ROOT, **kwargs)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        self._auto_scroll  = True
-        self._filter_text  = ""
-        self._all_lines: list[str] = []   # full buffer
-        self._line_count   = 0
+        self._auto_scroll = True
+        self._filter_text = ""
+        self._all_lines: list[str] = []
+        self._line_count  = 0
 
         self._build_toolbar()
         self._build_text()
@@ -80,7 +75,6 @@ class LogTextWidget(tk.Frame):
         bar.grid(row=0, column=0, sticky="ew")
         bar.columnconfigure(1, weight=1)
 
-        # Left — filter
         left = tk.Frame(bar, bg=Color.BG_TABLE_HEADER)
         left.grid(row=0, column=0, sticky="w", padx=Spacing.SM, pady=Spacing.XS)
 
@@ -96,7 +90,6 @@ class LogTextWidget(tk.Frame):
             relief="solid", bd=1,
         ).pack(side="left", padx=(4, Spacing.MD))
 
-        # Level filter
         tk.Label(left, text="Level:", font=Font.BODY_SM,
                  bg=Color.BG_TABLE_HEADER, fg=Color.TEXT_SECONDARY).pack(side="left")
 
@@ -112,7 +105,6 @@ class LogTextWidget(tk.Frame):
         )
         level_menu.pack(side="left", padx=(4, 0))
 
-        # Right — buttons
         right = tk.Frame(bar, bg=Color.BG_TABLE_HEADER)
         right.grid(row=0, column=1, sticky="e", padx=Spacing.SM)
 
@@ -169,10 +161,32 @@ class LogTextWidget(tk.Frame):
         self._text.tag_config("INFO",    foreground=Color.LOG_INFO)
         self._text.tag_config("SUCCESS", foreground=Color.LOG_SUCCESS)
         self._text.tag_config("WARNING", foreground=Color.LOG_WARNING)
-        self._text.tag_config("ERROR",   foreground=Color.LOG_ERROR,
-                              font=Font.MONO)
+        self._text.tag_config("ERROR",   foreground=Color.LOG_ERROR, font=Font.MONO)
         self._text.tag_config("DEBUG",   foreground=Color.LOG_DEBUG)
         self._text.tag_config("SEARCH",  background="#FFF3CD")
+
+        # ── Phase 3 fix: scope mousewheel to text widget only ─────────────────
+        self._text.bind("<Enter>", self._on_text_enter)
+        self._text.bind("<Leave>", self._on_text_leave)
+
+    def _on_text_enter(self, e):
+        self._text.bind_all("<MouseWheel>", self._on_mousewheel)
+        self._text.bind_all("<Button-4>",   self._on_scroll_up_linux)
+        self._text.bind_all("<Button-5>",   self._on_scroll_down_linux)
+
+    def _on_text_leave(self, e):
+        self._text.unbind_all("<MouseWheel>")
+        self._text.unbind_all("<Button-4>")
+        self._text.unbind_all("<Button-5>")
+
+    def _on_mousewheel(self, e):
+        self._text.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+    def _on_scroll_up_linux(self, e):
+        self._text.yview_scroll(-1, "units")
+
+    def _on_scroll_down_linux(self, e):
+        self._text.yview_scroll(1, "units")
 
     def _build_statusbar(self):
         bar = tk.Frame(self, bg=Color.BG_TABLE_HEADER,
@@ -199,21 +213,16 @@ class LogTextWidget(tk.Frame):
     #  Public API
     # ─────────────────────────────────────────────────────────────────────────
     def append_line(self, line: str, tag: str = None):
-        """Append a single log line. Thread-safe via .after() — call from any thread."""
         self._all_lines.append(line)
-
-        # Trim buffer
         if len(self._all_lines) > MAX_LIVE_LINES:
             self._all_lines = self._all_lines[-MAX_LIVE_LINES:]
 
-        # Only show if it passes current filter
         if self._passes_filter(line):
             self._insert_line(line, tag or _level_tag(line))
 
         self._update_status()
 
     def append_lines(self, lines: list[str]):
-        """Bulk append — more efficient than calling append_line() repeatedly."""
         self._all_lines.extend(lines)
         if len(self._all_lines) > MAX_LIVE_LINES:
             self._all_lines = self._all_lines[-MAX_LIVE_LINES:]
@@ -239,7 +248,6 @@ class LogTextWidget(tk.Frame):
         self._update_status()
 
     def set_lines(self, lines: list[str]):
-        """Replace entire content."""
         self.clear()
         self.append_lines(lines)
 
@@ -259,8 +267,7 @@ class LogTextWidget(tk.Frame):
         text_filter  = self._filter_text
 
         if level_filter != "ALL":
-            tag = _level_tag(line)
-            if tag != level_filter:
+            if _level_tag(line) != level_filter:
                 return False
 
         if text_filter and text_filter.lower() not in line.lower():
@@ -273,7 +280,6 @@ class LogTextWidget(tk.Frame):
         self._apply_filter()
 
     def _apply_filter(self):
-        """Re-render all buffered lines applying current filter."""
         self._line_count = 0
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
@@ -291,7 +297,6 @@ class LogTextWidget(tk.Frame):
         if self._auto_scroll:
             self._text.see("end")
 
-        # Show match count
         total = len(self._all_lines)
         filter_active = self._filter_text or self._level_var.get() != "ALL"
         if filter_active:
@@ -302,8 +307,7 @@ class LogTextWidget(tk.Frame):
         self._update_status()
 
     def _update_status(self):
-        total = len(self._all_lines)
-        self._status_lbl.configure(text=f"{total:,} lines")
+        self._status_lbl.configure(text=f"{len(self._all_lines):,} lines")
 
     def _copy_all(self):
         content = self._text.get("1.0", "end")
@@ -337,9 +341,9 @@ class LogsPage(tk.Frame):
         self.navigate = navigate
         self.app      = app
 
-        self._tail_after_id   = None
-        self._main_file_pos   = 0    # byte position in main log file
-        self._error_file_pos  = 0
+        self._tail_after_id      = None
+        self._main_file_pos      = 0
+        self._error_file_pos     = 0
         self._current_main_file  = None
         self._current_error_file = None
 
@@ -357,7 +361,7 @@ class LogsPage(tk.Frame):
         )
         tab_bar.grid(row=0, column=0, sticky="ew")
 
-        self._tabs: dict[str, tk.Frame] = {}
+        self._tabs: dict[str, LogTextWidget] = {}
         self._tab_btns: dict[str, tk.Button] = {}
         self._active_tab = "live"
 
@@ -384,7 +388,6 @@ class LogsPage(tk.Frame):
             btn.pack(side="left")
             self._tab_btns[key] = btn
 
-        # Right side — reload + today's file label
         right = tk.Frame(tab_bar, bg=Color.BG_HEADER)
         right.pack(side="right", padx=Spacing.MD)
 
@@ -401,7 +404,7 @@ class LogsPage(tk.Frame):
             cursor="hand2", command=self._reload_current_file,
         ).pack(side="left")
 
-        # ── Content area — stacked frames ─────────────────
+        # ── Content area ──────────────────────────────────
         content = tk.Frame(self, bg=Color.BG_ROOT)
         content.grid(row=1, column=0, sticky="nsew")
         content.rowconfigure(0, weight=1)
@@ -412,7 +415,6 @@ class LogsPage(tk.Frame):
             widget.grid(row=0, column=0, sticky="nsew")
             self._tabs[key] = widget
 
-        # Show live tab first
         self._tabs["live"].tkraise()
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -442,21 +444,16 @@ class LogsPage(tk.Frame):
     #  File log loading
     # ─────────────────────────────────────────────────────────────────────────
     def _log_filename(self, kind: str) -> str:
-        """Return today's log filename. kind = 'main' | 'error'"""
         date_str = datetime.now().strftime("%d-%b-%Y")
         return os.path.join(LOGS_DIR, f"{kind}_{date_str}.log")
 
     def _load_log_file(self, kind: str):
-        """Load last TAIL_LINES lines from today's log file into the tab."""
         path   = self._log_filename(kind)
         widget = self._tabs[kind]
         widget.clear()
 
         if not os.path.exists(path):
-            widget.append_line(
-                f"Log file not found: {path}",
-                "WARNING",
-            )
+            widget.append_line(f"Log file not found: {path}", "WARNING")
             return
 
         try:
@@ -466,10 +463,9 @@ class LogsPage(tk.Frame):
             lines = [l.rstrip() for l in all_lines[-TAIL_LINES:]]
             widget.set_lines(lines)
 
-            # Remember file position for tailing
             if kind == "main":
-                self._current_main_file  = path
-                self._main_file_pos      = os.path.getsize(path)
+                self._current_main_file = path
+                self._main_file_pos     = os.path.getsize(path)
             else:
                 self._current_error_file = path
                 self._error_file_pos     = os.path.getsize(path)
@@ -478,10 +474,6 @@ class LogsPage(tk.Frame):
             widget.append_line(f"Could not read log file: {e}", "ERROR")
 
     def _tail_log_files(self):
-        """
-        Called every TAIL_INTERVAL_MS ms.
-        Reads any new bytes appended to today's log files.
-        """
         for kind in ("main", "error"):
             path = self._log_filename(kind)
             if not os.path.exists(path):
@@ -490,7 +482,6 @@ class LogsPage(tk.Frame):
             pos_attr  = f"_{kind}_file_pos"
             file_attr = f"_current_{kind}_file"
 
-            # If date rolled over, reset position
             if getattr(self, file_attr) != path:
                 setattr(self, file_attr, path)
                 setattr(self, pos_attr, 0)
@@ -507,13 +498,11 @@ class LogsPage(tk.Frame):
 
                     new_lines = [l.rstrip() for l in new_text.splitlines() if l.strip()]
                     if new_lines and self._active_tab == kind:
-                        widget = self._tabs[kind]
-                        widget.append_lines(new_lines)
+                        self._tabs[kind].append_lines(new_lines)
 
             except Exception:
                 pass
 
-        # Reschedule
         self._tail_after_id = self.after(TAIL_INTERVAL_MS, self._tail_log_files)
 
     def _reload_current_file(self):
@@ -521,13 +510,9 @@ class LogsPage(tk.Frame):
             self._load_log_file(self._active_tab)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Live tab — receives lines from app queue via append_log()
+    #  Live tab — receives lines from app queue
     # ─────────────────────────────────────────────────────────────────────────
     def append_log(self, line: str):
-        """
-        Called by app.py queue handler when a sync log line arrives.
-        Always runs on main thread (called from _handle_queue_msg).
-        """
         ts   = datetime.now().strftime("%H:%M:%S")
         full = f"{ts}  {line}"
         tag  = _level_tag(line)
@@ -537,21 +522,12 @@ class LogsPage(tk.Frame):
     #  Lifecycle
     # ─────────────────────────────────────────────────────────────────────────
     def on_show(self):
-        """Called every time this page is navigated to."""
-        # Start file tail polling if not already running
         if self._tail_after_id is None:
             self._tail_log_files()
 
-        # Auto-load today's file for whichever tab is active
         if self._active_tab in ("main", "error"):
-            # Only reload if file has changed
             current_path = self._log_filename(self._active_tab)
             attr = f"_current_{self._active_tab}_file"
             if getattr(self, attr) != current_path:
                 self._load_log_file(self._active_tab)
                 self._file_lbl.configure(text=current_path)
-
-    def on_hide(self):
-        """Stop tail polling when page not visible (optional optimisation)."""
-        # We leave it running so live tab always receives sync lines
-        pass

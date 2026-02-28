@@ -1,19 +1,15 @@
 """
 gui/pages/home_page.py
 =======================
-Home page — full company list with:
-  - ALL companies from Tally shown on first open (even not-yet-configured)
-  - Configured companies (from DB) with status, last sync, alter_id
-  - Not-configured companies (Tally-only) with a Configure button
-  - Tally open/offline indicator per card
-  - Checkboxes for single / multi-select
-  - Per-card Sync button (quick single company sync)
-  - Bulk action bar: Sync Selected, Schedule Selected
-  - Select All / Deselect All
-  - Search/filter bar
-  - Refresh button (re-queries DB + Tally)
-  - Live progress bar per card during sync
-  - Status auto-refreshes via AppState event system
+Home page — full company list.
+
+Phase 2 fixes:
+  - bind_all("<MouseWheel>") replaced with canvas-scoped binding
+    (old code leaked scroll events to all pages)
+  - _render_cards() now does IN-PLACE update when possible
+    (no more destroy+recreate flicker during active sync)
+  - Cards only fully rebuilt when company list changes (add/remove)
+  - Status + progress updates go directly to existing card widgets
 """
 
 import threading
@@ -36,6 +32,9 @@ class HomePage(tk.Frame):
         self._cards: dict[str, CompanyCard] = {}
         self._filter_var = tk.StringVar()
         self._filter_var.trace_add("write", self._on_filter_change)
+
+        # Track last rendered company set to detect add/remove
+        self._last_rendered_keys: list[str] = []
 
         self._build()
 
@@ -78,7 +77,7 @@ class HomePage(tk.Frame):
             relief="solid", bd=1, width=22,
         ).pack(side="left")
 
-        # Filter toggle: show all / configured only
+        # Filter toggle
         self._show_all_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
             right, text="Show unconfigured",
@@ -163,10 +162,35 @@ class HomePage(tk.Frame):
             "<Configure>",
             lambda e: self._canvas.itemconfig(cw, width=e.width)
         )
-        self._canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        )
+
+        # ── Phase 2 fix: scope mousewheel ONLY to the canvas ──────────────────
+        # Old: bind_all leaked scroll to every page in the app
+        # New: bind enters/leaves canvas — only active when mouse is over the list
+        self._canvas.bind("<Enter>", self._on_canvas_enter)
+        self._canvas.bind("<Leave>", self._on_canvas_leave)
+
+    def _on_canvas_enter(self, e):
+        """Enable mousewheel scrolling when mouse enters the company list."""
+        self._canvas.bind_all("<MouseWheel>",  self._on_mousewheel)
+        self._canvas.bind_all("<Button-4>",    self._on_mousewheel_linux)
+        self._canvas.bind_all("<Button-5>",    self._on_mousewheel_linux)
+
+    def _on_canvas_leave(self, e):
+        """Disable mousewheel scrolling when mouse leaves the company list."""
+        self._canvas.unbind_all("<MouseWheel>")
+        self._canvas.unbind_all("<Button-4>")
+        self._canvas.unbind_all("<Button-5>")
+
+    def _on_mousewheel(self, e):
+        """Windows / Mac scroll handler."""
+        self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+    def _on_mousewheel_linux(self, e):
+        """Linux scroll handler (Button-4 = up, Button-5 = down)."""
+        if e.num == 4:
+            self._canvas.yview_scroll(-1, "units")
+        elif e.num == 5:
+            self._canvas.yview_scroll(1, "units")
 
     def _build_action_bar(self):
         bar = tk.Frame(
@@ -205,7 +229,7 @@ class HomePage(tk.Frame):
         self._sched_sel_btn.pack(side="left")
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Render cards
+    #  Render cards — Phase 2: smart update vs full rebuild
     # ─────────────────────────────────────────────────────────────────────────
     def refresh_companies(self):
         """Called by app.py after DB + Tally load completes."""
@@ -213,50 +237,45 @@ class HomePage(tk.Frame):
         self._update_summary()
 
     def _render_cards(self, filter_text: str = ""):
+        """
+        Smart render:
+        - If the set of visible companies has NOT changed → update cards in place
+        - If companies were added or removed → full rebuild
+        This prevents flicker/destruction of cards during active sync.
+        """
+        companies = self._get_filtered_companies(filter_text)
+        new_keys  = [c.name for c in companies]
+
+        if new_keys == self._last_rendered_keys:
+            # ── In-place update: only touch status/badge, not widgets ─────────
+            for co in companies:
+                if co.name in self._cards:
+                    self._cards[co.name].update_status(co.status)
+            return
+
+        # ── Full rebuild: company list changed ────────────────────────────────
+        self._last_rendered_keys = new_keys
+
         for w in self._list_frame.winfo_children():
             w.destroy()
         self._cards.clear()
 
-        companies = list(self.state.companies.values())
-
-        # Filter by search text
-        if filter_text:
-            ft = filter_text.lower()
-            companies = [c for c in companies if ft in c.name.lower()]
-
-        # Optionally hide unconfigured
-        if not self._show_all_var.get():
-            companies = [c for c in companies
-                         if c.status != CompanyStatus.NOT_CONFIGURED]
-
         if not companies:
-            if filter_text:
-                msg = "No companies match your search."
-            elif not self._show_all_var.get():
-                msg = "No configured companies.\nClick ⟳ Refresh to load, or show unconfigured companies."
-            else:
-                msg = "No companies found.\nMake sure Tally is running, then click ⟳ Refresh."
-            tk.Label(
-                self._list_frame, text=msg,
-                font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
-                justify="center", pady=60,
-            ).pack(fill="both", expand=True)
+            self._render_empty_state(filter_text)
             return
 
-        # Sort: configured first (alphabetical within each group)
+        # Sort: configured first, then alphabetical within each group
         companies.sort(key=lambda c: (
             0 if c.status != CompanyStatus.NOT_CONFIGURED else 1,
             c.name.lower(),
         ))
 
-        # Section headers
-        shown_configured    = False
-        shown_unconfigured  = False
+        shown_configured   = False
+        shown_unconfigured = False
 
         for i, co in enumerate(companies):
             is_configured = (co.status != CompanyStatus.NOT_CONFIGURED)
 
-            # Section divider labels
             if is_configured and not shown_configured:
                 self._add_section_header("✓  Configured Companies", Color.SUCCESS_FG)
                 shown_configured = True
@@ -287,19 +306,45 @@ class HomePage(tk.Frame):
 
             tk.Frame(self._list_frame, bg=Color.BORDER_LIGHT, height=1).pack(fill="x")
 
+    def _get_filtered_companies(self, filter_text: str = "") -> list:
+        """Return filtered + visibility-filtered company list."""
+        companies = list(self.state.companies.values())
+
+        if filter_text:
+            ft = filter_text.lower()
+            companies = [c for c in companies if ft in c.name.lower()]
+
+        if not self._show_all_var.get():
+            companies = [c for c in companies
+                         if c.status != CompanyStatus.NOT_CONFIGURED]
+
+        return companies
+
+    def _render_empty_state(self, filter_text: str = ""):
+        if filter_text:
+            msg = "No companies match your search."
+        elif not self._show_all_var.get():
+            msg = "No configured companies.\nClick ⟳ Refresh to load, or show unconfigured companies."
+        else:
+            msg = "No companies found.\nMake sure Tally is running, then click ⟳ Refresh."
+
+        tk.Label(
+            self._list_frame, text=msg,
+            font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+            justify="center", pady=60,
+        ).pack(fill="both", expand=True)
+
     def _add_section_header(self, text: str, fg: str):
-        """Insert a subtle section label between groups."""
         f = tk.Frame(self._list_frame, bg=Color.BG_TABLE_HEADER)
         f.pack(fill="x")
         tk.Label(
-            f, text=text,
-            font=Font.BODY_SM_BOLD,
+            f, text=text, font=Font.BODY_SM_BOLD,
             bg=Color.BG_TABLE_HEADER, fg=fg,
             padx=Spacing.LG, pady=5, anchor="w",
         ).pack(fill="x")
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Configure company (NOT_CONFIGURED → dialog → save DB → refresh card)
+    #  Configure company
     # ─────────────────────────────────────────────────────────────────────────
     def _on_configure_company(self, name: str):
         co = self.state.get_company(name)
@@ -317,7 +362,8 @@ class HomePage(tk.Frame):
         self.wait_window(dialog)
 
         if dialog.saved:
-            # Re-render the list so the card changes to Configured view
+            # Full rebuild needed — company moved from NOT_CONFIGURED to CONFIGURED
+            self._last_rendered_keys = []   # force full rebuild
             self._render_cards(filter_text=self._filter_var.get().strip())
             self._update_summary()
 
@@ -325,10 +371,8 @@ class HomePage(tk.Frame):
     #  Selection
     # ─────────────────────────────────────────────────────────────────────────
     def _on_card_select(self, name: str, selected: bool):
-        # Silently reject selection of not-configured companies
         co = self.state.companies.get(name)
         if co and co.status == CompanyStatus.NOT_CONFIGURED:
-            # Force the card's checkbox back to unchecked
             if name in self._cards:
                 self._cards[name].set_selected(False)
             return
@@ -342,14 +386,12 @@ class HomePage(tk.Frame):
         self._update_action_bar()
 
     def _select_all(self):
-        # Only configured companies can be selected for sync/schedule
         self.state.selected_companies = [
             n for n, c in self.state.companies.items()
             if c.status != CompanyStatus.NOT_CONFIGURED
         ]
         for name, card in self._cards.items():
             co = self.state.companies.get(name)
-            # Only tick cards for configured companies; leave NOT_CONFIGURED unchecked
             card.set_selected(bool(co and co.status != CompanyStatus.NOT_CONFIGURED))
         self._update_action_bar()
 
@@ -360,12 +402,10 @@ class HomePage(tk.Frame):
         self._update_action_bar()
 
     def _update_action_bar(self):
-        # Only configured companies can actually be synced or scheduled
         configured_selected = [
             n for n in self.state.selected_companies
             if (co := self.state.companies.get(n)) and co.status != CompanyStatus.NOT_CONFIGURED
         ]
-        # Keep selected_companies clean — strip any NOT_CONFIGURED that slipped in
         self.state.selected_companies = configured_selected
 
         n = len(configured_selected)
@@ -391,10 +431,7 @@ class HomePage(tk.Frame):
             1 for c in self.state.companies.values()
             if c.status == CompanyStatus.SYNCING
         )
-        parts = [
-            f"{total} total",
-            f"{configured} configured",
-        ]
+        parts = [f"{total} total", f"{configured} configured"]
         if unconfigured:
             parts.append(f"{unconfigured} not configured")
         if tally_open:
@@ -412,8 +449,6 @@ class HomePage(tk.Frame):
         def worker():
             try:
                 self.app._load_companies_from_db(self.state.db_engine)
-                # Re-apply scheduler config to the brand-new CompanyState objects,
-                # then broadcast so ALL pages (home + scheduler) refresh together.
                 try:
                     from gui.controllers.company_controller import CompanyController
                     CompanyController(self.state).load_scheduler_config()
@@ -437,7 +472,6 @@ class HomePage(tk.Frame):
             messagebox.showwarning("Sync Running", "A sync is already in progress.")
             return
 
-        # Check if any selected company needs initial snapshot
         needs_snapshot = [
             n for n in self.state.selected_companies
             if (co := self.state.get_company(n)) and not co.is_initial_done
@@ -458,7 +492,6 @@ class HomePage(tk.Frame):
             ans = messagebox.askyesno("Initial Snapshot Required", msg)
             if ans:
                 from gui.state import SyncMode
-                # Use the earliest starting_from date among selected
                 dates = [
                     co.starting_from for n in self.state.selected_companies
                     if (co := self.state.get_company(n)) and co.starting_from
@@ -469,7 +502,6 @@ class HomePage(tk.Frame):
         self.navigate("sync")
 
     def _on_single_sync(self, name: str):
-        """Called when ▶ Sync is clicked on a single company card."""
         if self.state.sync_active:
             messagebox.showwarning("Sync Running", "A sync is already in progress.")
             return
@@ -483,17 +515,12 @@ class HomePage(tk.Frame):
             card.set_selected(n == name)
         self._update_action_bar()
 
-        # ── Smart sync flow: check initial snapshot ───────
         if not co.is_initial_done:
             self._handle_initial_snapshot_flow(name)
         else:
             self.navigate("sync")
 
     def _handle_initial_snapshot_flow(self, name: str):
-        """
-        Show InitialSnapshotDialog if is_initial_done is False.
-        User can choose full snapshot or skip to incremental.
-        """
         from gui.components.initial_snapshot_dialog import InitialSnapshotDialog
 
         co     = self.state.get_company(name)
@@ -501,14 +528,12 @@ class HomePage(tk.Frame):
         self.wait_window(dialog)
 
         if dialog.result is None:
-            return  # cancelled
+            return
 
         if dialog.result == "snapshot":
-            # Force snapshot mode on the state before navigating
             from gui.state import SyncMode
             self.state.sync_mode      = SyncMode.SNAPSHOT
-            self.state.sync_from_date = co.starting_from  # use configured start date
-        # else incremental — let sync_page decide
+            self.state.sync_from_date = co.starting_from
 
         self.navigate("sync")
 
@@ -532,11 +557,12 @@ class HomePage(tk.Frame):
         self._render_cards(filter_text=self._filter_var.get().strip())
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  AppState event callbacks  (always .after(0) for thread safety)
+    #  AppState event callbacks — Phase 2: in-place update, no rebuild
     # ─────────────────────────────────────────────────────────────────────────
     def _on_company_updated(self, name: str, company: CompanyState):
         def _do():
             if name in self._cards:
+                # Update badge only — no widget rebuild
                 self._cards[name].update_status(company.status)
             self._update_summary()
         self.after(0, _do)
@@ -544,12 +570,14 @@ class HomePage(tk.Frame):
     def _on_company_progress(self, name: str, pct: float, label: str):
         def _do():
             if name in self._cards:
+                # Update progress bar only — no widget rebuild
                 self._cards[name].update_progress(pct, label)
         self.after(0, _do)
 
     def _on_sync_finished(self):
         def _do():
             self._update_summary()
+            # Reset progress bars in place
             for card in self._cards.values():
                 card.update_progress(0.0, "")
         self.after(0, _do)

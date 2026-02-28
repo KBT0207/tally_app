@@ -48,6 +48,7 @@ class CompanyState:
     books_from:        Optional[str]        = None
     tally_host:        str                  = "localhost"
     tally_port:        int                  = 9000
+    tally_open:        bool                 = False  # ← FIXED: was missing, caused pill to never show
     # runtime progress (not persisted)
     progress_pct:      float                = 0.0
     progress_label:    str                  = ""
@@ -106,9 +107,9 @@ class VoucherSelection:
 # ─────────────────────────────────────────────
 @dataclass
 class TallyConnectionState:
-    host:      str  = "localhost"
-    port:      int  = 9000
-    connected: bool = False
+    host:       str             = "localhost"
+    port:       int             = 9000
+    connected:  bool            = False
     last_check: Optional[datetime] = None
 
 
@@ -127,11 +128,11 @@ class AppState:
         self.selected_companies: list[str]      = []   # names of ticked companies
 
         # ── Sync options (set on sync_page, read by sync_controller) ──
-        self.sync_mode:        str              = SyncMode.INCREMENTAL
-        self.sync_from_date:   Optional[str]    = None   # YYYYMMDD
-        self.sync_to_date:     Optional[str]    = None   # YYYYMMDD
+        self.sync_mode:         str              = SyncMode.INCREMENTAL
+        self.sync_from_date:    Optional[str]    = None   # YYYYMMDD
+        self.sync_to_date:      Optional[str]    = None   # YYYYMMDD
         self.voucher_selection: VoucherSelection = VoucherSelection()
-        self.batch_sequential: bool             = True   # True=sequential, False=parallel
+        self.batch_sequential:  bool             = True   # True=sequential, False=parallel
 
         # ── Tally connection ──────────────────────────────
         self.tally: TallyConnectionState        = TallyConnectionState()
@@ -139,8 +140,19 @@ class AppState:
         # ── DB engine (set by app.py on startup) ─────────
         self.db_engine                          = None
 
+        # ── DB config dict (set by app.py from ConfigManager) ────────────
+        # Shape: {"host": str, "port": int, "username": str,
+        #         "password": str, "database": str}
+        # Used by: SchedulerController (jobstore URL), settings page
+        self.db_config: Optional[dict]          = None
+
+        # ── Tally global config (set by app.py from ConfigManager) ───────
+        # Shape: {"host": str, "port": int}
+        # Used by: TallyConnector default, per-company override falls back here
+        self.tally_config: Optional[dict]       = None
+
         # ── Active sync tracking ──────────────────────────
-        self.sync_active:  bool                 = False
+        self.sync_active:    bool               = False
         self.sync_cancelled: bool               = False
 
         # ── Callbacks (pages register listeners here) ─────
@@ -212,3 +224,16 @@ class AppState:
         if self.sync_to_date:
             return self.sync_to_date
         return datetime.now().strftime('%Y%m%d')
+
+    # ── Config helpers ────────────────────────────────────────────────────────
+    def get_tally_host(self) -> str:
+        """Global Tally host from config. Falls back to localhost."""
+        if self.tally_config:
+            return self.tally_config.get("host", "localhost")
+        return "localhost"
+
+    def get_tally_port(self) -> int:
+        """Global Tally port from config. Falls back to 9000."""
+        if self.tally_config:
+            return int(self.tally_config.get("port", 9000))
+        return 9000

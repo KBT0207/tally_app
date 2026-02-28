@@ -3,13 +3,10 @@ gui/controllers/sync_controller.py
 =====================================
 Bridges the GUI sync page with the existing sync_service.py.
 
-Responsibilities:
-  - Accept sync parameters from the GUI (companies, mode, dates, vouchers)
-  - Run each company sync in a background thread
-  - Post progress events to a queue that the GUI polls
-  - Never block the main thread
-  - Support cancel mid-run
-  - Update AppState.company status throughout
+Phase 2 fix:
+  - sync_active flag is now set/cleared under a threading.Lock
+    to prevent race condition when scheduler fires at the same time
+    as a manual sync completing.
 
 Thread model:
   GUI thread  ──────────────────────────────────────────────►
@@ -34,6 +31,11 @@ from typing import Optional
 
 from gui.state  import AppState, CompanyStatus, SyncMode, VoucherSelection
 from logging_config import logger
+
+
+# ── Module-level lock shared across all SyncController instances ──────────────
+# Prevents two syncs (manual + scheduler) from running simultaneously
+_SYNC_LOCK = threading.Lock()
 
 
 # Voucher types in the order they sync (matches VOUCHER_CONFIG in sync_service)
@@ -62,31 +64,30 @@ class SyncController:
     def __init__(
         self,
         state:          AppState,
-        out_queue:      queue.Queue,       # GUI polls this
-        companies:      list[str],         # company names to sync
-        sync_mode:      str,               # SyncMode.INCREMENTAL | SNAPSHOT
-        from_date:      Optional[str],     # YYYYMMDD — global fallback (snapshot)
-        to_date:        str,               # YYYYMMDD — global fallback
-        vouchers,                          # VoucherSelection OR dict[str, VoucherSelection]
-        sequential:     bool = True,       # True=one at a time, False=parallel
-        from_dates_map: Optional[dict] = None,  # per-company from dates (YYYYMMDD|None)
-        to_dates_map:   Optional[dict] = None,  # per-company to dates  (YYYYMMDD)
+        out_queue:      queue.Queue,
+        companies:      list[str],
+        sync_mode:      str,
+        from_date:      Optional[str],
+        to_date:        str,
+        vouchers,
+        sequential:     bool = True,
+        from_dates_map: Optional[dict] = None,
+        to_dates_map:   Optional[dict] = None,
     ):
         self._state      = state
         self._q          = out_queue
         self._companies  = companies
         self._sync_mode  = sync_mode
-        self._from_date  = from_date       # global fallback
-        self._to_date    = to_date         # global fallback
-        # Per-company date maps (override global for each company)
-        # from_dates_map[name] = None means "use alter_id / incremental"
-        self._from_dates = from_dates_map or {n: from_date  for n in companies}
-        self._to_dates   = to_dates_map   or {n: to_date    for n in companies}
-        # Normalise vouchers: always dict[company_name → VoucherSelection]
+        self._from_date  = from_date
+        self._to_date    = to_date
+        self._from_dates = from_dates_map or {n: from_date for n in companies}
+        self._to_dates   = to_dates_map   or {n: to_date   for n in companies}
+
         if isinstance(vouchers, dict):
             self._vouchers_map = vouchers
         else:
             self._vouchers_map = {n: vouchers for n in companies}
+
         self._sequential = sequential
         self._cancelled  = False
         self._threads: list[threading.Thread] = []
@@ -95,9 +96,20 @@ class SyncController:
     #  Public API
     # ─────────────────────────────────────────────────────────────────────────
     def start(self):
-        """Start the sync. Returns immediately — work happens in background."""
-        self._state.sync_active    = True
-        self._state.sync_cancelled = False
+        """
+        Start the sync. Returns immediately — work happens in background.
+
+        Phase 2: Uses module-level lock to prevent double-sync race condition.
+        If another sync is already running, logs a warning and aborts.
+        """
+        with _SYNC_LOCK:
+            if self._state.sync_active:
+                logger.warning("[SyncController] Sync already active — skipping duplicate start")
+                # Post all_done so caller doesn't hang waiting
+                self._q.put(("all_done",))
+                return
+            self._state.sync_active    = True
+            self._state.sync_cancelled = False
 
         if self._sequential:
             t = threading.Thread(target=self._run_sequential, daemon=True)
@@ -113,7 +125,7 @@ class SyncController:
         self._log_all("Cancellation requested — stopping after current step...", "WARNING")
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Sequential run — one company at a time
+    #  Sequential run
     # ─────────────────────────────────────────────────────────────────────────
     def _run_sequential(self):
         total = len(self._companies)
@@ -126,7 +138,7 @@ class SyncController:
         self._finish()
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Parallel run — all companies simultaneously
+    #  Parallel run
     # ─────────────────────────────────────────────────────────────────────────
     def _run_parallel(self):
         threads = []
@@ -138,7 +150,6 @@ class SyncController:
         for t in threads:
             t.start()
 
-        # Wait for all in a watcher thread so we don't block GUI
         def watcher():
             for t in threads:
                 t.join()
@@ -147,20 +158,20 @@ class SyncController:
         threading.Thread(target=watcher, daemon=True).start()
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Sync one company — calls existing sync_service functions
+    #  Sync one company
     # ─────────────────────────────────────────────────────────────────────────
     def _sync_one(self, company_name: str):
         engine = self._state.db_engine
         if not engine:
-            self._post("log", company_name, "No DB engine — cannot sync", "ERROR")
+            self._post("log",    company_name, "No DB engine — cannot sync", "ERROR")
             self._post("status", company_name, CompanyStatus.SYNC_ERROR)
-            self._post("done", company_name, False)
+            self._post("done",   company_name, False)
             return
 
         self._post("status",   company_name, CompanyStatus.SYNCING)
         self._post("progress", company_name, 0.0, "Connecting to Tally...")
 
-        # ── Step 1: connect to Tally ──────────────────────
+        # ── Connect to Tally ──────────────────────────────
         try:
             from services.tally_connector import TallyConnector
             co_state = self._state.get_company(company_name)
@@ -171,7 +182,7 @@ class SyncController:
             if tally.status != "Connected":
                 raise ConnectionError(f"Tally not reachable at {host}:{port}")
 
-            self._post("log", company_name, "✓ Tally connected", "SUCCESS")
+            self._post("log",      company_name, "✓ Tally connected", "SUCCESS")
             self._post("progress", company_name, 5.0, "Tally connected")
 
         except Exception as e:
@@ -186,73 +197,50 @@ class SyncController:
             self._post("done",   company_name, False)
             return
 
-        # ── Step 2: determine dates ───────────────────────
+        # ── Determine dates ───────────────────────────────
         company_dict = self._build_company_dict(company_name)
         co_state     = self._state.get_company(company_name)
 
-        # Per-company dates (may be None for incremental)
         from_date = self._from_dates.get(company_name, self._from_date)
         to_date   = self._to_dates.get(company_name, self._to_date)
 
-        # Scenario A: INCREMENTAL — no explicit dates needed
-        #   Uses alter_id to fetch only changed records.
-        #   BUT: if initial sync hasn't been done yet, force a full snapshot
-        #   using the company's starting_from date.
         if self._sync_mode == SyncMode.INCREMENTAL:
             if co_state and not co_state.is_initial_done:
                 self._post("log", company_name,
                     "⚠  Initial sync not done yet — running full snapshot first.", "WARNING")
                 from_date = co_state.starting_from or company_dict.get("starting_from")
-                # to_date stays as-is (today)
             else:
-                # True incremental — from_date stays None
                 from_date = None
 
-        # Scenario B: SNAPSHOT with per-company dates
-        #   from_date set by the row's custom From entry (or falls back to global)
-        # Scenario C: SNAPSHOT with global dates only
-        #   from_date = global_from, to_date = global_to
-        # Both B and C are already resolved in from_date / to_date above.
-
-        # Final guard: if from_date is still None for snapshot, use company default
         if self._sync_mode == SyncMode.SNAPSHOT and not from_date:
             from_date = (co_state.starting_from if co_state else None) \
                         or company_dict.get("starting_from", "20240401")
             self._post("log", company_name,
                 f"ℹ  No from date specified — using company default: {from_date}", "INFO")
 
-        # Log what we're actually using
         if from_date:
-            self._post("log", company_name,
-                f"📅  Date range: {from_date} → {to_date}", "INFO")
+            self._post("log", company_name, f"📅  Date range: {from_date} → {to_date}", "INFO")
         else:
-            self._post("log", company_name,
-                f"📅  Incremental (alter_id) up to {to_date}", "INFO")
+            self._post("log", company_name, f"📅  Incremental (alter_id) up to {to_date}", "INFO")
 
-        # ── Step 3: determine which vouchers to sync ──────
-        # Look up this company's specific voucher selection; fall back to
-        # the first available if somehow the company is missing from the map.
+        # ── Determine vouchers ────────────────────────────
         voucher_sel = self._vouchers_map.get(
             company_name,
             next(iter(self._vouchers_map.values())) if self._vouchers_map else VoucherSelection()
         )
         selected = voucher_sel.selected_types()
-        self._post(
-            "log", company_name,
-            f"Syncing: {', '.join(selected)}", "INFO"
-        )
+        self._post("log", company_name, f"Syncing: {', '.join(selected)}", "INFO")
 
-        # ── Step 4: run sync via sync_service ─────────────
+        # ── Run sync ──────────────────────────────────────
         try:
             total_steps = len(selected)
             done_steps  = 0
 
-            # Build filtered VOUCHER_CONFIG based on selection
             from services.sync_service import (
-                VOUCHER_CONFIG, _sync_ledgers, _sync_items, _sync_trial_balance, _sync_voucher
+                VOUCHER_CONFIG, _sync_ledgers, _sync_items,
+                _sync_trial_balance, _sync_voucher
             )
 
-            # Ledgers (special — always done first if selected)
             if "ledger" in selected:
                 if self._cancelled:
                     raise InterruptedError("Cancelled")
@@ -264,7 +252,6 @@ class SyncController:
                 self._post("progress", company_name, pct, "Ledgers done")
                 self._post("log",      company_name, "✓ Ledgers done", "SUCCESS")
 
-            # Items / StockItem master (special — snapshot/CDC, no date range)
             if "items" in selected:
                 if self._cancelled:
                     raise InterruptedError("Cancelled")
@@ -275,7 +262,6 @@ class SyncController:
                 done_steps += 1
                 self._post("log", company_name, "✓ Items done", "SUCCESS")
 
-            # Trial balance (special — also done directly)
             if "trial_balance" in selected:
                 if self._cancelled:
                     raise InterruptedError("Cancelled")
@@ -287,7 +273,6 @@ class SyncController:
                 done_steps += 1
                 self._post("log", company_name, "✓ Trial Balance done", "SUCCESS")
 
-            # All other voucher types
             voucher_configs = [
                 cfg for cfg in VOUCHER_CONFIG
                 if cfg["voucher_type"] in selected
@@ -323,7 +308,6 @@ class SyncController:
             self._post("log",      company_name, f"✓ {company_name} sync complete", "SUCCESS")
             self._post("done",     company_name, True)
 
-            # Update state
             self._state.set_company_status(
                 company_name,
                 CompanyStatus.SYNC_DONE,
@@ -342,13 +326,17 @@ class SyncController:
             self._post("done",   company_name, False)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Helpers
+    #  Finish — Phase 2: clear sync_active under lock
     # ─────────────────────────────────────────────────────────────────────────
     def _finish(self):
-        self._state.sync_active = False
+        with _SYNC_LOCK:
+            self._state.sync_active = False
         self._q.put(("all_done",))
         logger.info("[SyncController] All company syncs finished")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Helpers
+    # ─────────────────────────────────────────────────────────────────────────
     def _post(self, *args):
         self._q.put(args)
 
@@ -357,7 +345,6 @@ class SyncController:
             self._post("log", name, message, level)
 
     def _build_company_dict(self, name: str) -> dict:
-        """Build the dict format that sync_service.sync_company expects."""
         co = self._state.get_company(name)
         if co:
             return {

@@ -3,10 +3,12 @@ gui/controllers/company_controller.py
 =======================================
 Loads and persists per-company scheduler configuration in MySQL.
 
-Table: company_scheduler_config  (see database/models/scheduler_config.py)
-  One row per company — upserted on every save.
-
-Replaces the old scheduler_config.json flat-file approach.
+Phase 2 fix:
+  - next_run_label() now accepts an optional `scheduler_controller` argument
+    and reads the true next_run_time directly from the live APScheduler job.
+  - Falls back to computed estimate only if scheduler is unavailable.
+  - This fixes the bug where the display always showed "from now + interval"
+    instead of the actual scheduled time.
 """
 
 from datetime import datetime, timedelta
@@ -36,7 +38,7 @@ class CompanyController:
     def load_scheduler_config(self):
         """
         Read company_scheduler_config table and apply to matching CompanyState
-        objects in state.companies.  Safe to call even if table is empty.
+        objects in state.companies. Safe to call even if table is empty.
         """
         engine = self._state.db_engine
         if not engine:
@@ -65,10 +67,7 @@ class CompanyController:
     #  Save one company  state → DB  (upsert)
     # ─────────────────────────────────────────────────────────────────────────
     def save_one(self, name: str):
-        """
-        Upsert scheduler config for a single company.
-        Uses MySQL  INSERT … ON DUPLICATE KEY UPDATE  for atomic upsert.
-        """
+        """Upsert scheduler config for a single company."""
         engine = self._state.db_engine
         if not engine:
             logger.warning("[CompanyController] No DB engine — cannot save scheduler config")
@@ -101,10 +100,6 @@ class CompanyController:
     #  Internal upsert helper
     # ─────────────────────────────────────────────────────────────────────────
     def _upsert(self, engine, name: str, co: CompanyState):
-        """
-        INSERT … ON DUPLICATE KEY UPDATE for one company row.
-        Works correctly whether the row already exists or not.
-        """
         Model   = _get_model()
         Session = sessionmaker(bind=engine)
         db      = Session()
@@ -137,21 +132,63 @@ class CompanyController:
             db.close()
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Compute next run time string for display  (no DB access needed)
+    #  Phase 2 fix: next run time — reads from live APScheduler job
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
-    def next_run_label(co: CompanyState) -> str:
-        """Return a human-readable 'Next run: ...' string for the scheduler UI."""
+    def next_run_label(
+        co: CompanyState,
+        scheduler_controller=None,   # pass SchedulerController instance if available
+    ) -> str:
+        """
+        Return a human-readable 'Next run: ...' string for the scheduler UI.
+
+        Phase 2: If scheduler_controller is provided, reads the TRUE next_run_time
+        from the live APScheduler job. This is accurate because APScheduler tracks
+        the actual scheduled fire time, not just "now + interval".
+
+        Falls back to an estimated computed time if:
+          - scheduler_controller is None (APScheduler not running)
+          - job not found (company not scheduled yet)
+        """
+        if not co.schedule_enabled:
+            return "—"
+
+        # ── Primary: read from live APScheduler job ───────────────────────────
+        if scheduler_controller is not None:
+            try:
+                next_run = scheduler_controller.get_next_run(co.name)
+                if next_run is not None:
+                    # APScheduler returns timezone-aware datetime — convert to local naive
+                    try:
+                        # Strip timezone for display
+                        next_local = next_run.replace(tzinfo=None)
+                    except Exception:
+                        next_local = next_run
+                    return next_local.strftime("%d %b %Y  %H:%M")
+            except Exception as e:
+                logger.debug(f"[CompanyController] Could not get next_run from scheduler: {e}")
+
+        # ── Fallback: estimate from current time + interval ───────────────────
+        # Used when APScheduler is unavailable (no APScheduler installed,
+        # scheduler not started yet, or job not yet registered)
+        return CompanyController._estimate_next_run(co)
+
+    @staticmethod
+    def _estimate_next_run(co: CompanyState) -> str:
+        """
+        Estimate next run time from current time + configured interval.
+        This is only an approximation — actual APScheduler time may differ.
+        """
         if not co.schedule_enabled:
             return "—"
 
         now = datetime.now()
 
         if co.schedule_interval == "minutes":
-            return (now + timedelta(minutes=co.schedule_value)).strftime("%d %b %Y  %H:%M")
+            return (now + timedelta(minutes=max(1, co.schedule_value))).strftime("%d %b %Y  %H:%M")
 
         elif co.schedule_interval == "hourly":
-            return (now + timedelta(hours=co.schedule_value)).strftime("%d %b %Y  %H:%M")
+            return (now + timedelta(hours=max(1, co.schedule_value))).strftime("%d %b %Y  %H:%M")
 
         elif co.schedule_interval == "daily":
             try:

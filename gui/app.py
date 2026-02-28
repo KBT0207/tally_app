@@ -3,13 +3,12 @@ gui/app.py
 ==========
 Root application window — the entry point for the entire GUI.
 
-Responsibilities:
-  - Create the main Tk window with ttkbootstrap theme
-  - Build the persistent sidebar + header
-  - Manage page switching (show/hide frames)
-  - Initialize AppState and pass it to all pages
-  - Handle app startup (DB connect, Tally ping) in background thread
-  - Handle clean shutdown (stop scheduler, close DB)
+Phase 1 changes:
+  - Replaced .env file with ConfigManager (AppData/TallySyncManager/config.json)
+  - Added SetupWizard shown automatically on first run or if DB fails
+  - db_config and tally_config now stored on AppState
+  - Main window only shown AFTER setup is complete and DB is ready
+  - Scheduler jobstore now correctly uses db_config from AppState
 
 Usage (from run_gui.py):
     from gui.app import TallySyncApp
@@ -30,7 +29,8 @@ try:
 except ImportError:
     HAS_TTKBOOTSTRAP = False
 
-from gui.state  import AppState, CompanyState, CompanyStatus
+from gui.state          import AppState, CompanyState, CompanyStatus
+from gui.config_manager import ConfigManager
 from gui.styles import (
     Color, Font, Spacing, Layout,
     NAV_ITEMS, APP_TITLE, APP_VERSION,
@@ -44,23 +44,41 @@ from gui.styles import (
 class TallySyncApp:
 
     def __init__(self):
-        self.state   = AppState()
-        self._q      = queue.Queue()          # background → GUI communication
-        self._frames = {}                     # page_key → Frame instance
-        self._active_page = None
+        self.state          = AppState()
+        self._q             = queue.Queue()
+        self._frames        = {}
+        self._active_page   = None
+        self._config        = ConfigManager()   # ← Phase 1: replaces .env
 
+        # ── Build root window (hidden until setup complete) ──
         self._build_root()
+
+        # ── Phase 1: Run setup wizard if needed BEFORE showing main UI ──
+        if not self._run_setup_if_needed():
+            # User cancelled setup — exit cleanly
+            self.root.destroy()
+            return
+
+        # ── Setup complete — load config into AppState ────────
+        self._apply_config_to_state()
+
+        # ── Build the main UI ─────────────────────────────────
         self._build_layout()
         self._build_sidebar()
         self._build_header()
         self._build_content_area()
         self._load_pages()
+
+        # Show main window now
+        self.root.deiconify()
+
         # Listen for sync_finished to detect post-snapshot completion
         self.state.on("sync_finished", self._on_sync_finished_app)
         self._snapshot_celebrated: set = set()
 
+        # ── Start background startup sequence ─────────────────
         self._start_startup_sequence()
-        self._poll_queue()                    # start queue polling loop
+        self._poll_queue()
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Root window
@@ -76,6 +94,9 @@ class TallySyncApp:
         self.root.minsize(Layout.MIN_WIDTH, Layout.MIN_HEIGHT)
         self.root.configure(bg=Color.BG_ROOT)
 
+        # Hide main window until setup is done
+        self.root.withdraw()
+
         # Center on screen
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
@@ -87,13 +108,91 @@ class TallySyncApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Main layout — 2 columns: sidebar | main
+    #  Phase 1: Setup wizard gate
+    # ─────────────────────────────────────────────────────────────────────────
+    def _run_setup_if_needed(self) -> bool:
+        """
+        Check if setup is needed. If yes, show the wizard.
+        Returns True if setup is complete (or was just completed).
+        Returns False if user cancelled — app should exit.
+
+        Cases that trigger the wizard:
+          1. First run — config.json doesn't exist yet
+          2. setup_complete = False — previous run failed or was cancelled
+          3. DB connection fails with existing config — credentials changed
+        """
+        # Case 1 & 2: No config or setup not marked complete
+        if not self._config.is_setup_complete():
+            return self._show_setup_wizard(error_msg="")
+
+        # Case 3: Config exists and setup_complete=True, but DB might be unreachable
+        db_cfg = self._config.get_db_config()
+        ok, detail = self._test_db_connection(db_cfg)
+        if not ok:
+            # Mark incomplete so next launch also shows wizard
+            self._config.mark_setup_incomplete()
+            error = (
+                f"Could not connect to the database with saved settings:\n\n"
+                f"{detail}\n\n"
+                f"Please reconfigure your database connection."
+            )
+            return self._show_setup_wizard(error_msg=error)
+
+        return True   # All good — existing config works
+
+    def _show_setup_wizard(self, error_msg: str = "") -> bool:
+        """Show the setup wizard. Returns True if completed, False if cancelled."""
+        from gui.components.setup_wizard import SetupWizard
+
+        wizard = SetupWizard(self.root, self._config, error_msg=error_msg)
+        self.root.wait_window(wizard)
+        return wizard.completed
+
+    def _test_db_connection(self, db_cfg: dict) -> tuple[bool, str]:
+        """Quick connection test. Returns (success, error_detail)."""
+        try:
+            from database.db_connector import DatabaseConnector
+            conn = DatabaseConnector(
+                username = db_cfg.get("username", "root"),
+                password = db_cfg.get("password", ""),
+                host     = db_cfg.get("host",     "localhost"),
+                port     = int(db_cfg.get("port", 3306)),
+                database = db_cfg.get("database", "tally_db"),
+            )
+            ok = conn.test_connection()
+            conn.close()
+            if ok:
+                return True, ""
+            return False, "Connection test returned False — check credentials."
+        except Exception as e:
+            return False, str(e)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Phase 1: Apply config to AppState
+    # ─────────────────────────────────────────────────────────────────────────
+    def _apply_config_to_state(self):
+        """
+        Load config from ConfigManager into AppState.
+        Called once after setup is confirmed complete.
+        """
+        db_cfg    = self._config.get_db_config()
+        tally_cfg = self._config.get_tally_config()
+
+        # Store on AppState so all controllers can access
+        self.state.db_config    = db_cfg
+        self.state.tally_config = tally_cfg
+
+        # Apply tally defaults to TallyConnectionState
+        self.state.tally.host = tally_cfg.get("host", "localhost")
+        self.state.tally.port = int(tally_cfg.get("port", 9000))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Main layout
     # ─────────────────────────────────────────────────────────────────────────
     def _build_layout(self):
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        # Left sidebar column
         self.sidebar_frame = tk.Frame(
             self.root,
             bg=Color.BG_SIDEBAR,
@@ -102,7 +201,6 @@ class TallySyncApp:
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
         self.sidebar_frame.grid_propagate(False)
 
-        # Right main column
         self.main_frame = tk.Frame(self.root, bg=Color.BG_ROOT)
         self.main_frame.grid(row=0, column=1, sticky="nsew")
         self.main_frame.rowconfigure(1, weight=1)
@@ -114,7 +212,6 @@ class TallySyncApp:
     def _build_sidebar(self):
         f = self.sidebar_frame
 
-        # ── Logo / Brand ─────────────────────────────────
         brand = tk.Frame(f, bg=Color.BG_SIDEBAR, height=Layout.HEADER_HEIGHT)
         brand.pack(fill="x")
         brand.pack_propagate(False)
@@ -129,12 +226,9 @@ class TallySyncApp:
             padx=Spacing.LG,
         ).pack(fill="x", expand=True)
 
-        # Separator
         tk.Frame(f, bg=Color.SIDEBAR_HOVER_BG, height=1).pack(fill="x")
 
-        # ── Nav Items ────────────────────────────────────
         self._nav_buttons = {}
-
         nav_container = tk.Frame(f, bg=Color.BG_SIDEBAR)
         nav_container.pack(fill="x", pady=(Spacing.SM, 0))
 
@@ -142,7 +236,6 @@ class TallySyncApp:
             btn = self._make_nav_button(nav_container, item)
             self._nav_buttons[item["page"]] = btn
 
-        # ── Bottom — version + tally status ──────────────
         bottom = tk.Frame(f, bg=Color.BG_SIDEBAR)
         bottom.pack(side="bottom", fill="x", padx=Spacing.MD, pady=Spacing.LG)
 
@@ -168,7 +261,6 @@ class TallySyncApp:
         ).pack(fill="x")
 
     def _make_nav_button(self, parent, item: dict) -> tk.Frame:
-        """Create a sidebar nav item that looks like a button."""
         container = tk.Frame(parent, bg=Color.BG_SIDEBAR, cursor="hand2")
         container.pack(fill="x")
 
@@ -176,22 +268,15 @@ class TallySyncApp:
         inner.pack(fill="x")
 
         icon_lbl = tk.Label(
-            inner,
-            text=item["icon"],
-            font=Font.BODY,
-            bg=Color.BG_SIDEBAR,
-            fg=Color.SIDEBAR_TEXT,
-            width=2,
+            inner, text=item["icon"],
+            font=Font.BODY, bg=Color.BG_SIDEBAR, fg=Color.SIDEBAR_TEXT, width=2,
         )
         icon_lbl.pack(side="left")
 
         text_lbl = tk.Label(
-            inner,
-            text=item["label"],
-            font=Font.SIDEBAR_ITEM,
-            bg=Color.BG_SIDEBAR,
-            fg=Color.SIDEBAR_TEXT,
-            anchor="w",
+            inner, text=item["label"],
+            font=Font.SIDEBAR_ITEM, bg=Color.BG_SIDEBAR,
+            fg=Color.SIDEBAR_TEXT, anchor="w",
         )
         text_lbl.pack(side="left", padx=(Spacing.SM, 0))
 
@@ -208,11 +293,10 @@ class TallySyncApp:
             self.navigate(page_key)
 
         for w in widgets:
-            w.bind("<Enter>",   on_enter)
-            w.bind("<Leave>",   on_leave)
-            w.bind("<Button-1>",on_click)
+            w.bind("<Enter>",    on_enter)
+            w.bind("<Leave>",    on_leave)
+            w.bind("<Button-1>", on_click)
 
-        # Store widget refs for active state toggling
         container._widgets  = widgets
         container._page_key = page_key
         return container
@@ -225,7 +309,7 @@ class TallySyncApp:
                 w.configure(bg=bg)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Header bar (top of main area)
+    #  Header bar
     # ─────────────────────────────────────────────────────────────────────────
     def _build_header(self):
         header = tk.Frame(
@@ -238,42 +322,30 @@ class TallySyncApp:
         header.grid_propagate(False)
         header.columnconfigure(0, weight=1)
 
-        # Page title (updated on navigate)
         self._header_title = tk.Label(
-            header,
-            text="Companies",
-            font=Font.HEADING_4,
-            bg=Color.BG_HEADER,
-            fg=Color.TEXT_PRIMARY,
-            anchor="w",
-            padx=Spacing.XL,
+            header, text="Companies",
+            font=Font.HEADING_4, bg=Color.BG_HEADER,
+            fg=Color.TEXT_PRIMARY, anchor="w", padx=Spacing.XL,
         )
-        self._header_title.grid(row=0, column=0, sticky="ew", pady=0)
+        self._header_title.grid(row=0, column=0, sticky="ew")
 
-        # Right side — DB status + time
         right = tk.Frame(header, bg=Color.BG_HEADER)
         right.grid(row=0, column=1, padx=Spacing.XL)
 
         self._db_status_lbl = tk.Label(
-            right,
-            text="● DB: Connecting...",
-            font=Font.BODY_SM,
-            bg=Color.BG_HEADER,
-            fg=Color.MUTED,
+            right, text="● DB: Connecting...",
+            font=Font.BODY_SM, bg=Color.BG_HEADER, fg=Color.MUTED,
         )
         self._db_status_lbl.pack(side="left", padx=(0, Spacing.LG))
 
         self._clock_lbl = tk.Label(
-            right,
-            text="",
-            font=Font.BODY_SM,
-            bg=Color.BG_HEADER,
-            fg=Color.TEXT_SECONDARY,
+            right, text="",
+            font=Font.BODY_SM, bg=Color.BG_HEADER, fg=Color.TEXT_SECONDARY,
         )
         self._clock_lbl.pack(side="left")
         self._update_clock()
 
-        # ⚙ DB Settings button
+        # ⚙ Settings button — opens setup wizard to let user change DB/Tally config
         tk.Button(
             right, text="⚙",
             font=Font.BODY, bg=Color.BG_HEADER, fg=Color.TEXT_SECONDARY,
@@ -281,7 +353,6 @@ class TallySyncApp:
             command=self.open_db_settings,
         ).pack(side="left", padx=(Spacing.MD, 0))
 
-        # Bottom border
         tk.Frame(self.main_frame, bg=Color.BORDER, height=1).grid(
             row=0, column=0, sticky="sew"
         )
@@ -292,7 +363,7 @@ class TallySyncApp:
         self.root.after(1000, self._update_clock)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Content area — pages stack here
+    #  Content area
     # ─────────────────────────────────────────────────────────────────────────
     def _build_content_area(self):
         self.content_frame = tk.Frame(self.main_frame, bg=Color.BG_ROOT)
@@ -304,12 +375,6 @@ class TallySyncApp:
     #  Page management
     # ─────────────────────────────────────────────────────────────────────────
     def _load_pages(self):
-        """
-        Import and instantiate all pages.
-        Each page is a Frame that fills the content_area.
-        They are stacked (grid) and only the active one is raised.
-        """
-        # Import here (not at top) to avoid circular imports
         from gui.pages.home_page      import HomePage
         from gui.pages.sync_page      import SyncPage
         from gui.pages.scheduler_page import SchedulerPage
@@ -334,19 +399,14 @@ class TallySyncApp:
             frame.grid(row=0, column=0, sticky="nsew")
             self._frames[key] = frame
 
-        # Show home page first
         self.navigate("home")
 
     def navigate(self, page_key: str):
-        """Switch to the given page."""
         if page_key not in self._frames:
             return
-
-        # Raise the target page
         self._frames[page_key].tkraise()
         self._active_page = page_key
 
-        # Update header title
         labels = {
             "home":      "Companies",
             "sync":      "Sync",
@@ -355,133 +415,32 @@ class TallySyncApp:
             "settings":  "Settings",
         }
         self._header_title.configure(text=labels.get(page_key, ""))
-
-        # Update sidebar active state
         self._set_active_nav(page_key)
 
-        # Notify the page it's being shown (if it has on_show)
         page = self._frames[page_key]
         if hasattr(page, "on_show"):
             page.on_show()
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  DB config — load from file or prompt user
-    # ─────────────────────────────────────────────────────────────────────────
-    _ENV_FILE = ".env"   # sits next to run_gui.py
-
-    def _load_db_config(self) -> dict:
-        """
-        Load DB credentials exclusively from .env file.
-
-        Expected keys (case-insensitive):
-            DB_USERNAME   — MySQL username
-            DB_PASSWORD   — MySQL password
-            DB_HOST       — host (default: localhost)
-            DB_PORT       — port (default: 3306)
-            DB_NAME       — database name
-
-        Raises RuntimeError with a clear message if the file is missing
-        or any required key is absent, which the startup worker will
-        catch and display as an error dialog.
-        """
-        import os
-
-        env_path = self._ENV_FILE
-
-        # ── Locate .env ───────────────────────────────────
-        if not os.path.exists(env_path):
-            # Also check one directory up (in case run from a sub-folder)
-            alt = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-            if os.path.exists(alt):
-                env_path = alt
-            else:
-                raise RuntimeError(
-                    f".env file not found.\n\n"
-                    f"Please create a file named  .env  next to run_gui.py  with:\n\n"
-                    f"  DB_USERNAME=root\n"
-                    f"  DB_PASSWORD=yourpassword\n"
-                    f"  DB_HOST=localhost\n"
-                    f"  DB_PORT=3306\n"
-                    f"  DB_NAME=tally_db"
-                )
-
-        # ── Parse .env (simple key=value, ignore comments/blanks) ─
-        env: dict[str, str] = {}
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                # Strip optional surrounding quotes  'val'  or  "val"
-                key = key.strip().upper()
-                val = val.strip().strip("'\"")
-                env[key] = val
-
-        # ── Validate required keys ────────────────────────
-        missing = [k for k in ("DB_USERNAME", "DB_NAME") if not env.get(k)]
-        if missing:
-            raise RuntimeError(
-                f"Missing required keys in .env: {', '.join(missing)}\n\n"
-                f"Your .env must contain at minimum:\n"
-                f"  DB_USERNAME=root\n"
-                f"  DB_PASSWORD=yourpassword\n"
-                f"  DB_HOST=localhost\n"
-                f"  DB_PORT=3306\n"
-                f"  DB_NAME=tally_db"
-            )
-
-        return {
-            "username": env.get("DB_USERNAME", "root"),
-            "password": env.get("DB_PASSWORD", ""),
-            "host":     env.get("DB_HOST",     "localhost"),
-            "port":     env.get("DB_PORT",     "3306"),
-            "database": env.get("DB_NAME",     "tally_db"),
-        }
-
-    @staticmethod
-    def _create_engine(cfg: dict):
-        """Create SQLAlchemy engine from config dict using DatabaseConnector."""
-        from database.db_connector import DatabaseConnector
-        from database.models.scheduler_config import Base as SchedBase
-
-        connector = DatabaseConnector(
-            username = cfg.get("username", "root"),
-            password = cfg.get("password", ""),
-            host     = cfg.get("host",     "localhost"),
-            port     = int(cfg.get("port", 3306)),
-            database = cfg.get("database", "tally_sync"),
-        )
-        connector.create_database_if_not_exists()
-        connector.create_tables()
-        engine = connector.get_engine()
-        # Create company_scheduler_config table if not yet present
-        SchedBase.metadata.create_all(engine, checkfirst=True)
-        return engine
-
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Startup sequence (background thread)
+    #  Phase 1: Startup sequence — uses ConfigManager, not .env
     # ─────────────────────────────────────────────────────────────────────────
     def _start_startup_sequence(self):
-        """
-        Connect to DB and Tally in background.
-        Results are posted to self._q for the GUI thread to handle.
-        """
         threading.Thread(target=self._startup_worker, daemon=True).start()
 
     def _startup_worker(self):
+        """
+        Background startup after setup wizard completes.
+        Config is already validated at this point — just connect and load.
+        """
         # ── Step 1: Connect to database ──────────────────
         try:
-            cfg    = self._load_db_config()
-            engine = self._create_engine(cfg)
-            self.state.db_engine      = engine
-            self.state.db_config      = cfg        # store for reconnect
+            db_cfg = self._config.get_db_config()    # ← ConfigManager, not .env
+            engine = self._create_engine(db_cfg)
+            self.state.db_engine = engine
             self._q.put(("db_status", True, "Connected"))
         except Exception as e:
             self._q.put(("db_status", False, str(e)))
-            return   # Can't do anything without DB
+            return
 
         # ── Step 2: Load companies from DB ───────────────
         try:
@@ -490,8 +449,6 @@ class TallySyncApp:
             self._q.put(("error", f"Failed to load companies: {e}"))
 
         # ── Step 3: Load scheduler config from DB ────────
-        # IMPORTANT: must run AFTER _load_companies_from_db so that the
-        # CompanyState objects already exist and can receive schedule fields.
         try:
             from gui.controllers.company_controller import CompanyController
             CompanyController(self.state).load_scheduler_config()
@@ -499,13 +456,21 @@ class TallySyncApp:
             from logging_config import logger
             logger.warning(f"[App] Could not load scheduler config: {e}")
 
-        # companies_loaded triggers home + scheduler page refresh
         self._q.put(("companies_loaded", None))
 
-        # ── Step 3: Ping Tally ────────────────────────────
+        # ── Step 4: Start APScheduler ─────────────────────
+        try:
+            from gui.controllers.scheduler_controller import SchedulerController
+            self._scheduler_controller = SchedulerController(self.state, self._q)
+            self._scheduler_controller.start()
+        except Exception as e:
+            from logging_config import logger
+            logger.warning(f"[App] Could not start scheduler: {e}")
+
+        # ── Step 5: Ping Tally ────────────────────────────
         try:
             from services.tally_connector import TallyConnector
-            tally = TallyConnector(
+            tally     = TallyConnector(
                 host=self.state.tally.host,
                 port=self.state.tally.port,
             )
@@ -513,24 +478,33 @@ class TallySyncApp:
             self.state.tally.connected  = connected
             self.state.tally.last_check = datetime.now()
             self._q.put(("tally_status", connected))
-        except Exception as e:
+        except Exception:
             self._q.put(("tally_status", False))
 
-    def _load_companies_from_db(self, engine):
-        """
-        Read companies from DB and merge with live Tally company list.
+    @staticmethod
+    def _create_engine(cfg: dict):
+        """Create SQLAlchemy engine from config dict."""
+        from database.db_connector import DatabaseConnector
 
-        Strategy:
-          - DB companies  → always shown as Configured (or Sync Done etc.)
-          - Tally-only    → shown as Not Configured, with a Configure button
-          - DB-only       → shown as Configured but flagged tally_open=False
-          - Both          → Configured, tally_open=True
-        """
+        connector = DatabaseConnector(
+            username = cfg.get("username", "root"),
+            password = cfg.get("password", ""),
+            host     = cfg.get("host",     "localhost"),
+            port     = int(cfg.get("port", 3306)),
+            database = cfg.get("database", "tally_db"),
+        )
+        connector.create_database_if_not_exists()
+        connector.create_tables()
+        return connector.get_engine()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Load companies (unchanged from original)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _load_companies_from_db(self, engine):
         from sqlalchemy.orm import sessionmaker
         from database.models.company    import Company
         from database.models.sync_state import SyncState
 
-        # ── Step 1: Load DB companies ─────────────────────
         Session = sessionmaker(bind=engine)
         db      = Session()
         try:
@@ -556,7 +530,7 @@ class TallySyncApp:
                 from_str  = None
                 books_str = None
                 if co.starting_from:
-                    from_str  = str(co.starting_from).replace("-", "")[:8]
+                    from_str = str(co.starting_from).replace("-", "")[:8]
                 if hasattr(co, 'books_from') and co.books_from:
                     books_str = str(co.books_from).replace("-", "")[:8]
 
@@ -572,14 +546,13 @@ class TallySyncApp:
                     books_from        = books_str,
                     tally_host        = getattr(co, 'tally_host', 'localhost') or 'localhost',
                     tally_port        = int(getattr(co, 'tally_port', 9000) or 9000),
+                    tally_open        = False,
                 )
-                # Mark as not open in Tally until we check below
-                cs.tally_open = False
                 self.state.companies[name] = cs
         finally:
             db.close()
 
-        # ── Step 2: Fetch live Tally companies ────────────
+        # Fetch live Tally companies
         tally_companies = []
         try:
             from services.tally_connector import TallyConnector
@@ -593,7 +566,6 @@ class TallySyncApp:
             from logging_config import logger
             logger.warning(f"[App] Could not fetch Tally company list: {e}")
 
-        # ── Step 3: Merge Tally into state ────────────────
         tally_names = set()
         for tc in tally_companies:
             name = (tc.get("name") or "").strip()
@@ -601,41 +573,28 @@ class TallySyncApp:
                 continue
             tally_names.add(name)
 
-            # Normalize Tally starting_from (YYYYMMDD)
             raw_from  = tc.get("starting_from", "")
             raw_books = tc.get("books_from", "")
             from_str  = str(raw_from).replace("-", "")[:8]  if raw_from  else None
             books_str = str(raw_books).replace("-", "")[:8] if raw_books else None
 
             if name in self.state.companies:
-                # Already in DB — just mark as open in Tally
                 self.state.companies[name].tally_open = True
-                # Fill in books_from if not already set
                 if not self.state.companies[name].books_from and books_str:
                     self.state.companies[name].books_from = books_str
             else:
-                # New — exists only in Tally, not in DB
                 cs = CompanyState(
                     name          = name,
                     guid          = tc.get("guid", ""),
                     status        = CompanyStatus.NOT_CONFIGURED,
                     starting_from = from_str,
                     books_from    = books_str,
+                    tally_open    = True,
                 )
-                cs.tally_open = True
                 self.state.companies[name] = cs
-
-        # ── Step 4: Mark DB companies not currently open in Tally ─
-        for name, cs in self.state.companies.items():
-            if not hasattr(cs, 'tally_open'):
-                cs.tally_open = False
 
     def save_company_to_db(self, company_name: str, guid: str,
                            starting_from: str, books_from: str = None):
-        """
-        Insert or update a company record in the DB.
-        Called after the user fills in the Configure dialog.
-        """
         from sqlalchemy.orm import sessionmaker
         from database.models.company import Company
 
@@ -670,10 +629,9 @@ class TallySyncApp:
             db.close()
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Queue polling — safely update GUI from background threads
+    #  Queue polling
     # ─────────────────────────────────────────────────────────────────────────
     def _poll_queue(self):
-        """Called every 100ms to drain the queue and update the GUI."""
         try:
             while True:
                 msg = self._q.get_nowait()
@@ -689,58 +647,42 @@ class TallySyncApp:
         if event == "db_status":
             _, ok, detail = msg
             if ok:
-                self._db_status_lbl.configure(
-                    text=f"● DB: Connected",
-                    fg=Color.SUCCESS,
-                )
+                self._db_status_lbl.configure(text="● DB: Connected", fg=Color.SUCCESS)
             else:
-                self._db_status_lbl.configure(
-                    text=f"● DB: Error",
-                    fg=Color.DANGER,
-                )
-                messagebox.showerror(
-                    "Database Configuration Error",
-                    detail,
-                )
+                self._db_status_lbl.configure(text="● DB: Error", fg=Color.DANGER)
+                # Offer to reconfigure
+                if messagebox.askyesno(
+                    "Database Connection Error",
+                    f"{detail}\n\nWould you like to reconfigure the database connection?",
+                ):
+                    self.open_db_settings()
 
         elif event == "tally_status":
             _, connected = msg
             if connected:
-                self._tally_status_lbl.configure(
-                    text="● Tally: Online",
-                    fg=Color.SUCCESS,
-                )
+                self._tally_status_lbl.configure(text="● Tally: Online",  fg=Color.SUCCESS)
             else:
-                self._tally_status_lbl.configure(
-                    text="● Tally: Offline",
-                    fg=Color.DANGER,
-                )
+                self._tally_status_lbl.configure(text="● Tally: Offline", fg=Color.DANGER)
 
         elif event == "companies_loaded":
-            # Refresh the home page with the newly loaded companies
             home = self._frames.get("home")
             if home and hasattr(home, "refresh_companies"):
                 home.refresh_companies()
-
-            # Refresh the scheduler page so rows reflect current schedule config
-            # and next-run times are recalculated from the live APScheduler state.
-            sched_page = self._frames.get("scheduler")
-            if sched_page and hasattr(sched_page, "refresh_companies"):
-                sched_page.refresh_companies()
+            sched = self._frames.get("scheduler")
+            if sched and hasattr(sched, "refresh_companies"):
+                sched.refresh_companies()
 
         elif event == "error":
             _, msg_text = msg
             messagebox.showerror("Error", msg_text)
 
         elif event == "sync_log":
-            # Forward log lines to logs page
             _, line = msg
             logs_page = self._frames.get("logs")
             if logs_page and hasattr(logs_page, "append_log"):
                 logs_page.append_log(line)
 
         elif event == "company_progress":
-            # Forward to home page progress bars
             _, name, pct, label = msg
             self.state.set_company_progress(name, pct, label)
 
@@ -760,30 +702,16 @@ class TallySyncApp:
             _, company_name, err = msg
             self.state.set_company_status(company_name, CompanyStatus.SYNC_ERROR)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Public helper — post to queue from any thread
-    # ─────────────────────────────────────────────────────────────────────────
     def post(self, *args):
-        """Safe way for background threads to communicate with GUI."""
         self._q.put(args)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Shutdown
-    # ─────────────────────────────────────────────────────────────────────────
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Post-snapshot detection — show schedule prompt after first full sync
+    #  Post-snapshot celebration
     # ─────────────────────────────────────────────────────────────────────────
     def _on_sync_finished_app(self):
-        """Called via state event after any sync finishes (on main thread via emit)."""
         self._check_post_snapshot_companies()
 
     def _check_post_snapshot_companies(self):
-        """
-        After any sync completes, check if any company just had its initial
-        snapshot finish (is_initial_done True + last_sync_time just set).
-        If so, show PostSnapshotDialog offering to set up a schedule.
-        Only shown once per company (tracked via _snapshot_celebrated set).
-        """
         if not hasattr(self, "_snapshot_celebrated"):
             self._snapshot_celebrated: set = set()
 
@@ -799,27 +727,64 @@ class TallySyncApp:
             self._show_post_snapshot_dialog(co)
 
     def _show_post_snapshot_dialog(self, co):
-        """Show PostSnapshotDialog for a company and handle result."""
         from gui.components.initial_snapshot_dialog import PostSnapshotDialog
-
         dialog = PostSnapshotDialog(self.root, co)
         self.root.wait_window(dialog)
-
         if dialog.result == "schedule":
-            # Navigate to scheduler page with this company pre-selected
             self.state.selected_companies = [co.name]
             self.navigate("scheduler")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Open DB/Tally settings (from header ⚙ button or after DB error)
+    # ─────────────────────────────────────────────────────────────────────────
+    def open_db_settings(self):
+        """
+        Re-open the setup wizard so user can change DB or Tally config.
+        After saving, reconnects the DB engine with new credentials.
+        """
+        from gui.components.setup_wizard import SetupWizard
+
+        # Temporarily mark setup incomplete so wizard shows both steps
+        self._config.mark_setup_incomplete()
+
+        wizard = SetupWizard(self.root, self._config)
+        self.root.wait_window(wizard)
+
+        if wizard.completed:
+            # Re-apply new config to state
+            self._apply_config_to_state()
+
+            # Reconnect DB with new credentials
+            try:
+                if self.state.db_engine:
+                    self.state.db_engine.dispose()
+                db_cfg = self._config.get_db_config()
+                self.state.db_engine = self._create_engine(db_cfg)
+                self._db_status_lbl.configure(text="● DB: Connected", fg=Color.SUCCESS)
+
+                # Reload companies with new DB
+                self._load_companies_from_db(self.state.db_engine)
+                home = self._frames.get("home")
+                if home and hasattr(home, "refresh_companies"):
+                    home.refresh_companies()
+
+            except Exception as e:
+                messagebox.showerror("Reconnect Failed", str(e))
+        else:
+            # Wizard cancelled — restore setup_complete so app continues
+            self._config.mark_setup_complete()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Shutdown
+    # ─────────────────────────────────────────────────────────────────────────
     def _on_close(self):
         if self.state.sync_active:
             if not messagebox.askyesno(
                 "Sync in Progress",
-                "A sync is currently running.\n\n"
-                "Are you sure you want to quit? The sync will be interrupted.",
+                "A sync is currently running.\n\nAre you sure you want to quit?",
             ):
                 return
 
-        # Stop scheduler if running
         sched_ctrl = getattr(self, '_scheduler_controller', None)
         if sched_ctrl and hasattr(sched_ctrl, 'shutdown'):
             try:
@@ -830,196 +795,7 @@ class TallySyncApp:
         self.root.destroy()
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  DB Settings dialog (re-open from header ⚙ button)
-    # ─────────────────────────────────────────────────────────────────────────
-    def open_db_settings(self):
-        """
-        Open DB settings dialog.
-        Reads current values from .env (via _load_db_config),
-        shows the dialog, then writes changes back to .env.
-        """
-        import os
-
-        # Pre-fill from current .env (or fall back to defaults if missing)
-        defaults = {
-            "host": "localhost", "port": "3306",
-            "username": "root",  "password": "",
-            "database": "tally_db",
-        }
-        try:
-            loaded = self._load_db_config()
-            defaults.update(loaded)
-        except Exception:
-            pass   # .env missing or malformed — dialog opens with defaults
-
-        dialog = DBConfigDialog(self.root, defaults)
-        self.root.wait_window(dialog)
-
-        if dialog.result:
-            res = dialog.result
-            env_path = self._ENV_FILE
-
-            # Resolve absolute path the same way _load_db_config does
-            if not os.path.isabs(env_path):
-                alt = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), env_path
-                )
-                if os.path.exists(alt) or not os.path.exists(env_path):
-                    env_path = alt
-
-            lines = [
-                f"DB_USERNAME={res.get('username', 'root')}",
-                f"DB_PASSWORD={res.get('password', '')}",
-                f"DB_HOST={res.get('host', 'localhost')}",
-                f"DB_PORT={res.get('port', '3306')}",
-                f"DB_NAME={res.get('database', 'tally_db')}",
-            ]
-            with open(env_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n")
-
-            if messagebox.askyesno(
-                "Restart Required",
-                "DB settings saved.\n\nRestart the app for changes to take effect. Restart now?"
-            ):
-                self.root.destroy()
-
-    # ─────────────────────────────────────────────────────────────────────────
     #  Entry point
     # ─────────────────────────────────────────────────────────────────────────
     def run(self):
         self.root.mainloop()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  DB Config Dialog
-# ─────────────────────────────────────────────────────────────────────────────
-class DBConfigDialog(tk.Toplevel):
-    """
-    Modal dialog to collect MySQL connection details.
-    Sets self.result = dict on OK, or None on Cancel.
-    """
-
-    def __init__(self, parent, defaults: dict):
-        super().__init__(parent)
-        self.title("Database Connection Settings")
-        self.resizable(False, False)
-        self.grab_set()              # modal
-        self.result = None
-
-        self._vars = {}
-        self._build(defaults)
-
-        # Center over parent
-        self.update_idletasks()
-        pw = parent.winfo_rootx() + parent.winfo_width()  // 2
-        ph = parent.winfo_rooty() + parent.winfo_height() // 2
-        self.geometry(f"+{pw - 210}+{ph - 180}")
-
-    def _build(self, defaults: dict):
-        from gui.styles import Color, Font, Spacing
-
-        pad = tk.Frame(self, bg=Color.BG_CARD, padx=30, pady=24)
-        pad.pack(fill="both", expand=True)
-
-        tk.Label(
-            pad, text="MySQL / MariaDB Connection",
-            font=Font.HEADING_4, bg=Color.BG_CARD, fg=Color.TEXT_PRIMARY,
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 16))
-
-        fields = [
-            ("Host",     "host",     False),
-            ("Port",     "port",     False),
-            ("Username", "username", False),
-            ("Password", "password", True),
-            ("Database", "database", False),
-        ]
-
-        for i, (label, key, secret) in enumerate(fields, start=1):
-            tk.Label(
-                pad, text=f"{label}:",
-                font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
-                anchor="w", width=10,
-            ).grid(row=i, column=0, sticky="w", pady=4)
-
-            var = tk.StringVar(value=defaults.get(key, ""))
-            self._vars[key] = var
-
-            entry = tk.Entry(
-                pad, textvariable=var,
-                font=Font.BODY, width=26,
-                bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
-                relief="solid", bd=1,
-                show="●" if secret else "",
-            )
-            entry.grid(row=i, column=1, sticky="ew", pady=4, padx=(8, 0))
-
-        # Test connection feedback
-        self._feedback = tk.Label(
-            pad, text="", font=Font.BODY_SM,
-            bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
-        )
-        self._feedback.grid(row=len(fields)+1, column=0, columnspan=2,
-                            sticky="w", pady=(8, 0))
-
-        # Buttons
-        btn_row = tk.Frame(pad, bg=Color.BG_CARD)
-        btn_row.grid(row=len(fields)+2, column=0, columnspan=2,
-                     sticky="ew", pady=(16, 0))
-
-        tk.Button(
-            btn_row, text="Test Connection",
-            font=Font.BUTTON_SM, bg=Color.BG_ROOT, fg=Color.TEXT_PRIMARY,
-            relief="solid", bd=1, padx=10, pady=4, cursor="hand2",
-            command=self._on_test,
-        ).pack(side="left")
-
-        tk.Button(
-            btn_row, text="Cancel",
-            font=Font.BUTTON_SM, bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
-            relief="solid", bd=1, padx=10, pady=4, cursor="hand2",
-            command=self.destroy,
-        ).pack(side="right", padx=(8, 0))
-
-        tk.Button(
-            btn_row, text="Save & Connect",
-            font=Font.BUTTON_SM, bg=Color.PRIMARY, fg=Color.TEXT_WHITE,
-            relief="flat", bd=0, padx=14, pady=4, cursor="hand2",
-            command=self._on_save,
-        ).pack(side="right")
-
-        # Enter key submits
-        self.bind("<Return>", lambda e: self._on_save())
-        self.bind("<Escape>", lambda e: self.destroy())
-
-    def _collect(self) -> dict:
-        return {k: v.get().strip() for k, v in self._vars.items()}
-
-    def _on_test(self):
-        self._feedback.configure(text="Testing...", fg=Color.TEXT_MUTED if True else "")
-        self.update_idletasks()
-        try:
-            from gui.styles import Color
-            from database.db_connector import DatabaseConnector
-            cfg = self._collect()
-            conn = DatabaseConnector(
-                username=cfg["username"], password=cfg["password"],
-                host=cfg["host"],        port=int(cfg["port"]),
-                database=cfg["database"],
-            )
-            ok = conn.test_connection()
-            if ok:
-                self._feedback.configure(text="✓ Connection successful!", fg=Color.SUCCESS)
-            else:
-                self._feedback.configure(text="✗ Connection failed — check credentials.", fg=Color.DANGER)
-        except Exception as e:
-            from gui.styles import Color
-            self._feedback.configure(text=f"✗ {e}", fg=Color.DANGER)
-
-    def _on_save(self):
-        cfg = self._collect()
-        if not cfg.get("host") or not cfg.get("database"):
-            from gui.styles import Color
-            self._feedback.configure(text="Host and Database are required.", fg=Color.DANGER)
-            return
-        self.result = cfg
-        self.destroy()
