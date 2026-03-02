@@ -308,6 +308,15 @@ class SyncController:
             self._post("log",      company_name, f"✓ {company_name} sync complete", "SUCCESS")
             self._post("done",     company_name, True)
 
+            # Update in-memory CompanyState so the home page badge flips to
+            # "Sync Done" immediately — without needing a restart to re-read DB.
+            # is_initial_done is set True whenever a sync completes successfully,
+            # because sync_service already wrote is_initial_done=True to SyncState
+            # rows in the DB for every voucher type it processed.
+            co = self._state.get_company(company_name)
+            if co:
+                co.is_initial_done = True
+
             self._state.set_company_status(
                 company_name,
                 CompanyStatus.SYNC_DONE,

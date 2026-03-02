@@ -116,12 +116,17 @@ class DatabaseConnector:
         finally:
             session.close()
 
-    def execute_raw_sql(self, sql: str, params: Dict[str, Any] = None) -> Any:
-        """Execute raw SQL query"""
+    def execute_raw_sql(self, sql: str, params: Dict[str, Any] = None) -> list:
+        """Execute raw SQL query and return all results as a list.
+        
+        The session is closed after this call, so results are fetched eagerly
+        inside the session scope — never returns a dead cursor.
+        """
         try:
             with self.session_scope() as session:
                 result = session.execute(text(sql), params or {})
-                return result
+                # Fetch ALL rows while session is still open
+                return result.fetchall()
         except Exception as e:
             logger.error(f"Error executing raw SQL: {e}")
             raise

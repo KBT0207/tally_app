@@ -50,6 +50,25 @@ VOUCHER_WORKERS       = 2   # parallel threads for voucher sync within ONE compa
 # have verified it handles concurrent connections reliably.
 _TALLY_SEMAPHORE = threading.Semaphore(1)
 
+# Max seconds to wait for the semaphore before giving up (prevents deadlock
+# when Tally hangs indefinitely on a request).
+_TALLY_SEMAPHORE_TIMEOUT = 120
+
+
+def _tally_semaphore_acquire(voucher_type: str = "") -> bool:
+    """
+    Try to acquire _TALLY_SEMAPHORE within _TALLY_SEMAPHORE_TIMEOUT seconds.
+    Returns True on success, False on timeout.
+    """
+    acquired = _TALLY_SEMAPHORE.acquire(timeout=_TALLY_SEMAPHORE_TIMEOUT)
+    if not acquired:
+        logger.error(
+            f"[sync_service] Tally semaphore timeout after {_TALLY_SEMAPHORE_TIMEOUT}s"
+            + (f" [{voucher_type}]" if voucher_type else "")
+            + " — skipping to unblock other syncs"
+        )
+    return acquired
+
 # ── Per-company SyncState write lock ─────────────────────────────────────────
 # Prevents two threads (voucher workers within the same company) from updating
 # the same SyncState row simultaneously, which would cause a lost-update
@@ -234,16 +253,23 @@ def _sync_trial_balance(
     engine,
     from_date:    str,
     to_date:      str,
+    progress_cb=None,
 ):
     logger.info(f"[{company_name}] Syncing Trial Balance | {from_date} -> {to_date}")
     try:
+        if progress_cb:
+            progress_cb(0.0, "Fetching trial balance from Tally...")
         state          = get_sync_state(company_name, 'trial_balance', engine)
         saved_alter_id = state.last_alter_id if state else 0
 
-        with _TALLY_SEMAPHORE:
+        if not _tally_semaphore_acquire():
+            raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+        try:
             xml = tally.fetch_trial_balance(
                 company_name=company_name, from_date=from_date, to_date=to_date
             )
+        finally:
+            _TALLY_SEMAPHORE.release()
         if not xml:
             logger.warning(f"[{company_name}] No trial balance data from Tally")
             return
@@ -277,7 +303,7 @@ def _sync_trial_balance(
         logger.exception(f"[{company_name}] Trial Balance sync failed")
 
 
-def _sync_items(company_name: str, tally: TallyConnector, engine):
+def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=None):
     """
     Sync the StockItem master for *company_name*.
 
@@ -287,16 +313,22 @@ def _sync_items(company_name: str, tally: TallyConnector, engine):
     logger.info(f"[{company_name}] Syncing Items (StockItem master)")
     lock = _get_company_lock(company_name)
     try:
+        if progress_cb:
+            progress_cb(0.0, "Fetching items from Tally...")
         state           = get_sync_state(company_name, 'items', engine)
         is_initial_done = state.is_initial_done if state else False
         last_alter_id   = state.last_alter_id   if state else 0
 
         if is_initial_done:
             logger.info(f"[{company_name}][items] CDC | last_alter_id={last_alter_id}")
-            with _TALLY_SEMAPHORE:
+            if not _tally_semaphore_acquire():
+                raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+            try:
                 xml = tally.fetch_items_cdc(
                     company_name=company_name, last_alter_id=last_alter_id
                 )
+            finally:
+                _TALLY_SEMAPHORE.release()
             if not xml:
                 logger.info(f"[{company_name}][items] CDC: no new/changed items")
                 return
@@ -319,8 +351,12 @@ def _sync_items(company_name: str, tally: TallyConnector, engine):
             return
 
         logger.info(f"[{company_name}][items] SNAPSHOT — fetching all stock items")
-        with _TALLY_SEMAPHORE:
+        if not _tally_semaphore_acquire():
+            raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+        try:
             xml = tally.fetch_items(company_name=company_name)
+        finally:
+            _TALLY_SEMAPHORE.release()
         if not xml:
             logger.warning(f"[{company_name}][items] No item data from Tally")
             return
@@ -343,20 +379,26 @@ def _sync_items(company_name: str, tally: TallyConnector, engine):
         logger.exception(f"[{company_name}] Item sync failed")
 
 
-def _sync_ledgers(company_name: str, tally: TallyConnector, engine):
+def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=None):
     logger.info(f"[{company_name}] Syncing Ledgers")
     lock = _get_company_lock(company_name)
     try:
+        if progress_cb:
+            progress_cb(0.0, "Fetching ledgers from Tally...")
         state           = get_sync_state(company_name, 'ledger', engine)
         is_initial_done = state.is_initial_done if state else False
         last_alter_id   = state.last_alter_id   if state else 0
 
         if is_initial_done:
             logger.info(f"[{company_name}][ledger] CDC | last_alter_id={last_alter_id}")
-            with _TALLY_SEMAPHORE:
+            if not _tally_semaphore_acquire():
+                raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+            try:
                 xml = tally.fetch_ledger_cdc(
                     company_name=company_name, last_alter_id=last_alter_id
                 )
+            finally:
+                _TALLY_SEMAPHORE.release()
             if not xml:
                 logger.info(f"[{company_name}][ledger] CDC: no new/changed ledgers")
                 return
@@ -379,8 +421,12 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine):
             return
 
         logger.info(f"[{company_name}][ledger] SNAPSHOT — fetching all ledgers")
-        with _TALLY_SEMAPHORE:
+        if not _tally_semaphore_acquire():
+            raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+        try:
             xml = tally.fetch_ledgers(company_name=company_name)
+        finally:
+            _TALLY_SEMAPHORE.release()
         if not xml:
             logger.warning(f"[{company_name}][ledger] No ledger data from Tally")
             return
@@ -410,6 +456,7 @@ def _sync_voucher(
     engine,
     from_date:    str,
     to_date:      str,
+    progress_cb=None,
 ):
     voucher_type     = config['voucher_type']
     snapshot_fetch   = config['snapshot_fetch']
@@ -434,8 +481,12 @@ def _sync_voucher(
 
             t0       = datetime.now()
             fetch_fn = getattr(tally, cdc_fetch)
-            with _TALLY_SEMAPHORE:
+            if not _tally_semaphore_acquire():
+                raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+            try:
                 xml = fetch_fn(company_name=company_name, last_alter_id=last_alter_id)
+            finally:
+                _TALLY_SEMAPHORE.release()
             fetch_ms = int((datetime.now() - t0).total_seconds() * 1000)
 
             if not xml:
@@ -484,21 +535,35 @@ def _sync_voucher(
         chunks_done   = 0
         all_alter_ids = [last_alter_id] if last_alter_id > 0 else []
 
+        # Pre-calculate chunks for accurate progress reporting
+        _all_chunks = list(_generate_chunks(from_date, to_date))
+        total_chunks = max(len([c for c in _all_chunks
+            if not (last_synced_month and c[2] < last_synced_month)]), 1)
+
         for chunk_from, chunk_to, month_str in _generate_chunks(from_date, to_date):
 
-            if last_synced_month and month_str <= last_synced_month:
+            if last_synced_month and month_str < last_synced_month:
                 logger.debug(
                     f"[{company_name}][{voucher_type}] Skipping already-done chunk {month_str}"
                 )
                 continue
 
+            if progress_cb:
+                progress_cb(
+                    (chunks_done / max(total_chunks, 1)) * 100,
+                    f"Syncing {parser_type_name} — {month_str}",
+                )
+
             logger.info(
                 f"[{company_name}][{voucher_type}] Chunk {month_str} | {chunk_from} → {chunk_to}"
             )
 
-            with _TALLY_SEMAPHORE:
+            if not _tally_semaphore_acquire():
+                raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+            try:
                 xml = fetch_fn(company_name=company_name, from_date=chunk_from, to_date=chunk_to)
-
+            finally:
+                _TALLY_SEMAPHORE.release()
             if not xml:
                 logger.info(
                     f"[{company_name}][{voucher_type}] Chunk {month_str}: empty, advancing"

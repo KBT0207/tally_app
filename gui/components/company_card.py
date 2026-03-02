@@ -50,6 +50,7 @@ class CompanyCard(tk.Frame):
         self._prog_canvas  = None
         self._prog_bar     = None
         self._meta_lbl     = None
+        self._snap_badge   = None   # reference so update_snapshot() can swap it
         self._build()
         self._bind_hover()
 
@@ -142,6 +143,7 @@ class CompanyCard(tk.Frame):
                     padx=5, pady=1,
                 )
             snap_badge.pack(side="left", padx=(Spacing.SM, 0))
+            self._snap_badge = snap_badge          # ← store reference
             self._bg_frames.append(snap_badge)
 
         # ── Meta row ─────────────────────────────────────
@@ -316,6 +318,21 @@ class CompanyCard(tk.Frame):
     # ─────────────────────────────────────────────────────────────────────────
     def update_status(self, status: str):
         self._badge.set_status(status)
+
+    def update_snapshot(self, is_done: bool):
+        """Flip the snapshot badge between ✓ Snapshot and ⚠ No Snapshot in place."""
+        if not self._snap_badge:
+            return
+        if is_done:
+            self._snap_badge.configure(
+                text="✓ Snapshot",
+                bg=Color.SUCCESS_BG, fg=Color.SUCCESS_FG,
+            )
+        else:
+            self._snap_badge.configure(
+                text="⚠ No Snapshot",
+                bg=Color.WARNING_BG, fg=Color.WARNING_FG,
+            )
 
     def update_progress(self, pct: float, label: str = ""):
         if not self._prog_canvas:

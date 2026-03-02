@@ -9,6 +9,7 @@ Never import pages here — only data structures.
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+import threading
 
 
 # ─────────────────────────────────────────────
@@ -53,6 +54,7 @@ class CompanyState:
     progress_pct:      float                = 0.0
     progress_label:    str                  = ""
     error_message:     str                  = ""
+    syncing:           bool                 = False   # True only while THIS company is syncing
     # scheduler config
     schedule_enabled:  bool                 = False
     schedule_interval: str                  = "hourly"  # hourly | daily | minutes
@@ -123,6 +125,12 @@ class AppState:
     """
 
     def __init__(self):
+        # ── Thread safety ─────────────────────────────────
+        # Use RLock (re-entrant) so the same thread can acquire it multiple
+        # times without deadlocking (e.g. set_company_status calls emit which
+        # calls a listener that reads state again).
+        self._lock = threading.RLock()
+
         # ── Company data ──────────────────────────────────
         self.companies: dict[str, CompanyState] = {}   # keyed by company name
         self.selected_companies: list[str]      = []   # names of ticked companies
@@ -152,28 +160,56 @@ class AppState:
         self.tally_config: Optional[dict]       = None
 
         # ── Active sync tracking ──────────────────────────
-        self.sync_active:    bool               = False
-        self.sync_cancelled: bool               = False
+        self._sync_active:    bool              = False   # use property below
+        self._sync_cancelled: bool              = False   # use property below
 
         # ── Callbacks (pages register listeners here) ─────
         self._listeners: dict[str, list]        = {}
 
+    # ── Thread-safe sync flags ────────────────────────────────────────────────
+    @property
+    def sync_active(self) -> bool:
+        with self._lock:
+            return self._sync_active
+
+    @sync_active.setter
+    def sync_active(self, value: bool):
+        with self._lock:
+            self._sync_active = value
+
+    @property
+    def sync_cancelled(self) -> bool:
+        with self._lock:
+            return self._sync_cancelled
+
+    @sync_cancelled.setter
+    def sync_cancelled(self, value: bool):
+        with self._lock:
+            self._sync_cancelled = value
+
     # ── Event system ─────────────────────────────────────────────────────────
     def on(self, event: str, callback):
         """Register a listener for an event."""
-        self._listeners.setdefault(event, []).append(callback)
+        with self._lock:
+            self._listeners.setdefault(event, []).append(callback)
 
     def off(self, event: str, callback):
         """Remove a specific listener."""
-        if event in self._listeners:
-            try:
-                self._listeners[event].remove(callback)
-            except ValueError:
-                pass
+        with self._lock:
+            if event in self._listeners:
+                try:
+                    self._listeners[event].remove(callback)
+                except ValueError:
+                    pass
 
     def emit(self, event: str, **kwargs):
-        """Fire all listeners for an event (safe — catches exceptions)."""
-        for cb in self._listeners.get(event, []):
+        """Fire all listeners for an event (safe — catches exceptions).
+        Snapshot the listener list under lock so we don't hold the lock
+        during callback execution (avoids deadlocks with re-entrant calls).
+        """
+        with self._lock:
+            callbacks = list(self._listeners.get(event, []))
+        for cb in callbacks:
             try:
                 cb(**kwargs)
             except Exception as e:
@@ -181,43 +217,54 @@ class AppState:
 
     # ── Company helpers ───────────────────────────────────────────────────────
     def get_company(self, name: str) -> Optional[CompanyState]:
-        return self.companies.get(name)
+        with self._lock:
+            return self.companies.get(name)
 
     def set_company_status(self, name: str, status: str, **kwargs):
         """Update a company's status and optionally other fields, then emit event."""
-        if name in self.companies:
-            self.companies[name].status = status
-            for k, v in kwargs.items():
-                if hasattr(self.companies[name], k):
-                    setattr(self.companies[name], k, v)
-            self.emit("company_updated", name=name, company=self.companies[name])
+        with self._lock:
+            if name in self.companies:
+                self.companies[name].status = status
+                for k, v in kwargs.items():
+                    if hasattr(self.companies[name], k):
+                        setattr(self.companies[name], k, v)
+                company = self.companies[name]
+            else:
+                return
+        self.emit("company_updated", name=name, company=company)
 
     def set_company_progress(self, name: str, pct: float, label: str = ""):
         """Update sync progress for a company."""
-        if name in self.companies:
+        with self._lock:
+            if name not in self.companies:
+                return
             self.companies[name].progress_pct   = pct
             self.companies[name].progress_label = label
-            self.emit("company_progress", name=name, pct=pct, label=label)
+        self.emit("company_progress", name=name, pct=pct, label=label)
 
     def configured_companies(self) -> list[CompanyState]:
-        return [c for c in self.companies.values()
-                if c.status != CompanyStatus.NOT_CONFIGURED]
+        with self._lock:
+            return [c for c in self.companies.values()
+                    if c.status != CompanyStatus.NOT_CONFIGURED]
 
     def not_configured_companies(self) -> list[CompanyState]:
-        return [c for c in self.companies.values()
-                if c.status == CompanyStatus.NOT_CONFIGURED]
+        with self._lock:
+            return [c for c in self.companies.values()
+                    if c.status == CompanyStatus.NOT_CONFIGURED]
 
     def get_selected_company_states(self) -> list[CompanyState]:
-        return [self.companies[n] for n in self.selected_companies
-                if n in self.companies]
+        with self._lock:
+            return [self.companies[n] for n in self.selected_companies
+                    if n in self.companies]
 
     # ── Sync helpers ──────────────────────────────────────────────────────────
     def reset_sync_progress(self):
         """Clear progress on all companies before starting a new sync."""
-        for c in self.companies.values():
-            c.progress_pct   = 0.0
-            c.progress_label = ""
-            c.error_message  = ""
+        with self._lock:
+            for c in self.companies.values():
+                c.progress_pct   = 0.0
+                c.progress_label = ""
+                c.error_message  = ""
 
     def to_date_str(self) -> str:
         """Return sync_to_date or today as YYYYMMDD."""

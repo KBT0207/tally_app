@@ -34,11 +34,67 @@ Usage:
 
 import os
 import json
+import copy
 import shutil
 import logging
+import base64
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Secure password storage
+#  Priority: Windows Credential Store (keyring) → base64 obfuscation fallback
+#  The raw password is NEVER written to config.json.
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    import keyring
+    _HAS_KEYRING = True
+except ImportError:
+    _HAS_KEYRING = False
+
+_KEYRING_SERVICE = "TallySyncManager"
+_KEYRING_USERNAME = "db_password"
+_PASSWORD_PLACEHOLDER = "__keyring__"   # sentinel stored in config.json
+_B64_PREFIX = "b64:"                    # prefix for obfuscated fallback
+
+
+def _store_password(password: str) -> str:
+    """
+    Store password securely. Returns a token to put in config.json.
+    - keyring available  → stores in OS credential store, returns '__keyring__'
+    - keyring missing    → stores base64-obfuscated value inline, returns 'b64:<data>'
+    """
+    if _HAS_KEYRING:
+        try:
+            keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, password)
+            return _PASSWORD_PLACEHOLDER
+        except Exception as e:
+            logger.warning(f"[ConfigManager] keyring unavailable ({e}) — falling back to b64")
+    # Fallback: base64 obfuscation (not encryption, but not plain text)
+    return _B64_PREFIX + base64.b64encode(password.encode()).decode()
+
+
+def _load_password(token: str) -> str:
+    """Reverse of _store_password. Returns the plain password."""
+    if not token:
+        return ""
+    if token == _PASSWORD_PLACEHOLDER:
+        if _HAS_KEYRING:
+            try:
+                pwd = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+                return pwd or ""
+            except Exception as e:
+                logger.error(f"[ConfigManager] Could not read from keyring: {e}")
+                return ""
+        return ""
+    if token.startswith(_B64_PREFIX):
+        try:
+            return base64.b64decode(token[len(_B64_PREFIX):]).decode()
+        except Exception:
+            return ""
+    # Legacy: plain text password from old config — migrate it on next save
+    return token
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Constants
@@ -168,25 +224,36 @@ class ConfigManager:
         """
         Returns DB config dict with keys:
           host, port (int), username, password, database
+        Password is decoded from secure storage before being returned.
         Always returns a copy — modifying the return value won't affect stored config.
         """
-        return self._deep_copy(self._data.get("db", DEFAULT_CONFIG["db"]))
+        raw = self._deep_copy(self._data.get("db", DEFAULT_CONFIG["db"]))
+        # Decode the password token → plain password for use by callers
+        raw["password"] = _load_password(raw.get("password", ""))
+        return raw
 
     def save_db_config(self, db: dict):
         """
-        Save DB config.
+        Save DB config. Password is stored securely (keyring / b64),
+        never as plain text in config.json.
         Expected keys: host, port, username, password, database
-        port is coerced to int automatically.
         """
+        password = str(db.get("password", ""))
+        token    = _store_password(password)
+
         self._data["db"] = {
-            "host":     str(db.get("host",     "localhost")),
-            "port":     int(db.get("port",     3306)),
-            "username": str(db.get("username", "root")),
-            "password": str(db.get("password", "")),
-            "database": str(db.get("database", "tally_db")),
+            "host":          str(db.get("host",     "localhost")),
+            "port":          int(db.get("port",     3306)),
+            "username":      str(db.get("username", "root")),
+            "password":      token,   # ← token, NOT plain text
+            "database":      str(db.get("database", "tally_db")),
         }
         self._save()
-        logger.info(f"[ConfigManager] DB config saved: {db.get('host')}:{db.get('port')}/{db.get('database')}")
+        logger.info(
+            f"[ConfigManager] DB config saved: "
+            f"{db.get('host')}:{db.get('port')}/{db.get('database')} "
+            f"(password stored via {'keyring' if _HAS_KEYRING else 'b64'})"
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Tally config
@@ -267,8 +334,8 @@ class ConfigManager:
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
     def _deep_copy(data: dict) -> dict:
-        """Simple deep copy via JSON round-trip (avoids importing copy module)."""
-        return json.loads(json.dumps(data))
+        """Deep copy using copy.deepcopy — safe for all value types."""
+        return copy.deepcopy(data)
 
     @staticmethod
     def _deep_merge(base: dict, override: dict):

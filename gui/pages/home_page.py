@@ -562,8 +562,14 @@ class HomePage(tk.Frame):
     def _on_company_updated(self, name: str, company: CompanyState):
         def _do():
             if name in self._cards:
-                # Update badge only — no widget rebuild
-                self._cards[name].update_status(company.status)
+                card = self._cards[name]
+                # Update status badge
+                card.update_status(company.status)
+                # Update snapshot badge — this is the one that stayed stale
+                card.update_snapshot(company.is_initial_done)
+                # Update last-sync time in the meta row
+                if company.last_sync_time:
+                    card.update_sync_time(company.last_sync_time)
             self._update_summary()
         self.after(0, _do)
 

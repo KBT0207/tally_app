@@ -214,6 +214,24 @@ class ConfigureCompanyDialog(tk.Toplevel):
         starting_from = _yyyymmdd(d)
         books_from    = co.books_from or starting_from
 
+        # ── Detect start-date change on an already-synced company ────────────
+        # If the user moves the start date back and the company already has an
+        # initial snapshot, we must re-run the snapshot from the new date.
+        reset_initial = False
+        if co.is_initial_done and co.starting_from and starting_from != co.starting_from:
+            from tkinter import messagebox as mb
+            answer = mb.askyesno(
+                "Start Date Changed",
+                f"The sync start date has changed from "
+                f"{_fmt(d.__class__.fromisoformat(co.starting_from[:4]+'-'+co.starting_from[4:6]+'-'+co.starting_from[6:8]) if len(co.starting_from)==8 else d)} "
+                f"to {_fmt(d)}.\n\n"
+                f"The initial snapshot must be re-run from the new date to capture "
+                f"any missing historical data.\n\n"
+                f"Reset initial snapshot status? (Recommended: Yes)",
+                parent=self,
+            )
+            reset_initial = answer   # True → re-run snapshot; False → keep is_initial_done
+
         self._feedback.configure(text="Saving...", fg=Color.TEXT_MUTED)
         self.update_idletasks()
 
@@ -237,6 +255,10 @@ class ConfigureCompanyDialog(tk.Toplevel):
         co.books_from    = books_from
         co.tally_host    = host
         co.tally_port    = port
+
+        if reset_initial:
+            co.is_initial_done = False
+
         self._state.emit("company_updated", name=co.name, company=co)
 
         self.saved = True

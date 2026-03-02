@@ -72,8 +72,15 @@ def _run_scheduled_sync(registry_key: int, company_name: str):
 
     logger.info(f"[Scheduler] Triggered sync for: {company_name}")
 
+    # Check per-company flag first — don't block OTHER companies just because
+    # one manual sync is running somewhere else (Phase 2 fix carried forward)
+    co = state.companies.get(company_name)
+    if co and co.syncing:
+        logger.warning(f"[Scheduler] Skipping {company_name} — already syncing this company")
+        return
+
     if state.sync_active:
-        logger.warning(f"[Scheduler] Skipping {company_name} — sync already running")
+        logger.warning(f"[Scheduler] Skipping {company_name} — a manual sync is active")
         return
 
     from gui.controllers.sync_controller import SyncController
@@ -187,7 +194,21 @@ class SchedulerController:
         if self._scheduler and self._scheduler.running:
             self._scheduler.shutdown(wait=False)
             logger.info("[Scheduler] Shutdown complete")
+
+        # Remove this instance's key
         _REGISTRY.pop(self._registry_key, None)
+
+        # Sweep any other dead keys whose schedulers are no longer running.
+        # This prevents slow accumulation across dev restarts in the same process.
+        dead_keys = [
+            k for k, (st, _) in list(_REGISTRY.items())
+            if st is self._state  # same state object → orphaned from a prior instance
+        ]
+        for k in dead_keys:
+            _REGISTRY.pop(k, None)
+
+        if dead_keys:
+            logger.debug(f"[Scheduler] Swept {len(dead_keys)} orphaned registry key(s)")
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Job management

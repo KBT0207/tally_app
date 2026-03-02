@@ -366,7 +366,7 @@ def _upsert_inventory(rows, model_class, unique_fields, update_fields, engine):
         logger.exception(f"Error upserting {model_class.__tablename__}")
         raise
     finally:
-        db.close()
+        db.close()   # ← always close, even on exception
 
     return inserted, updated, unchanged, skipped
 

@@ -523,7 +523,10 @@ class TallySyncApp:
                     if times:
                         last_sync = max(times)
                     last_alter = max(s.last_alter_id for s in states)
-                    is_initial = all(s.is_initial_done for s in states)
+                    # is_initial_done: True only when at least one SyncState row exists
+                    # AND every row that exists has is_initial_done=True.
+                    # Using `all()` on an empty list returns True (wrong); we guard with `bool(states)`.
+                    is_initial = bool(states) and all(s.is_initial_done for s in states)
                     months     = [s.last_synced_month for s in states if s.last_synced_month]
                     last_month = max(months) if months else None
 
