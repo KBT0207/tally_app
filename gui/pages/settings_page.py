@@ -22,10 +22,11 @@ Sections:
 """
 
 import os
+import shutil
 import configparser
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 from datetime import datetime
 
 from gui.state          import AppState
@@ -159,6 +160,7 @@ class SettingsPage(tk.Frame):
         self._build_db_section(inner,    row=1)
         self._build_sync_section(inner,  row=2)
         self._build_app_section(inner,   row=3)
+        self._build_automation_section(inner, row=4)   # Phase 3
 
         # Sticky save bar
         self._build_save_bar()
@@ -475,6 +477,625 @@ class SettingsPage(tk.Frame):
             text="💡 Click any path to copy it to clipboard",
             font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
         ).pack(anchor="w", pady=(4, 0))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Section 5 — Automation  (Phase 3)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_automation_section(self, parent, row: int):
+        card = self._make_card(parent, row=row, title="🤖  Tally Automation  (PyAutoGUI)")
+
+        # ── Sub-section A: Tally exe path ────────────────────────────────────
+        tk.Label(
+            card, text="Tally Executable",
+            font=Font.LABEL_BOLD, bg=Color.BG_CARD, fg=Color.TEXT_PRIMARY,
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+        self._var("tally_exe_path", getattr(self.state, 'tally_exe_path', '') or '')
+
+        tk.Label(card, text="Tally.exe Path:",
+                 font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                 anchor="w", width=20).grid(row=1, column=0, sticky="w", pady=4)
+
+        exe_row = tk.Frame(card, bg=Color.BG_CARD)
+        exe_row.grid(row=1, column=1, columnspan=2, sticky="w", pady=4)
+
+        tk.Entry(
+            exe_row, textvariable=self._vars["tally_exe_path"],
+            font=Font.BODY, width=38,
+            bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+            relief="solid", bd=1,
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            exe_row, text="Browse…",
+            font=Font.BUTTON_SM,
+            bg=Color.PRIMARY_LIGHT, fg=Color.PRIMARY,
+            relief="solid", bd=1, padx=8, pady=3, cursor="hand2",
+            command=self._browse_tally_exe,
+        ).pack(side="left")
+
+        tk.Label(
+            card, text="e.g.  C:\\Program Files\\TallyPrime\\tally.exe",
+            font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED, anchor="w",
+        ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(0, 8))
+
+        # ── Separator ────────────────────────────────────────────────────────
+        tk.Frame(card, bg=Color.BORDER, height=1).grid(
+            row=3, column=0, columnspan=3, sticky="ew", pady=(4, 12))
+
+        # ── Sub-section B: PyAutoGUI Controls ────────────────────────────────
+        tk.Label(
+            card, text="PyAutoGUI Controls",
+            font=Font.LABEL_BOLD, bg=Color.BG_CARD, fg=Color.TEXT_PRIMARY,
+            anchor="w",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+        aut = getattr(self.state, 'automation', None)
+        self._var("automation_confidence",   str(getattr(aut, 'confidence',       0.80)))
+        self._var("automation_click_delay",  str(getattr(aut, 'click_delay_ms',   500)))
+        self._var("automation_timeout",      str(getattr(aut, 'wait_timeout_sec', 30)))
+        self._var("automation_retries",      str(getattr(aut, 'retry_attempts',   3)))
+
+        ctrl_rows = [
+            ("Confidence Threshold", "automation_confidence",
+             "0.50–1.00 — how closely screenshots must match. Start at 0.80."),
+            ("Click Delay  (ms)",    "automation_click_delay",
+             "Milliseconds between PyAutoGUI actions. Increase on slow PCs."),
+            ("Wait Timeout  (sec)",  "automation_timeout",
+             "Seconds to wait for a screen image before giving up."),
+            ("Retry Attempts",       "automation_retries",
+             "Times to retry a failed image search before marking error."),
+        ]
+
+        for i, (lbl, key, hint) in enumerate(ctrl_rows, start=5):
+            tk.Label(card, text=lbl,
+                     font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                     anchor="w", width=24,
+                     ).grid(row=i, column=0, sticky="w", pady=4)
+            tk.Entry(card, textvariable=self._vars[key],
+                     font=Font.BODY, width=8,
+                     bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+                     relief="solid", bd=1,
+                     ).grid(row=i, column=1, sticky="w", pady=4, padx=(Spacing.SM, 0))
+            tk.Label(card, text=hint,
+                     font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED, anchor="w",
+                     ).grid(row=i, column=2, sticky="w", padx=(Spacing.SM, 0))
+
+        # ── Separator ────────────────────────────────────────────────────────
+        tk.Frame(card, bg=Color.BORDER, height=1).grid(
+            row=9, column=0, columnspan=3, sticky="ew", pady=(8, 12))
+
+        # ── Sub-section C: Screen Images ─────────────────────────────────────
+        tk.Label(
+            card, text="Screen Images  (screenshots used for image recognition)",
+            font=Font.LABEL_BOLD, bg=Color.BG_CARD, fg=Color.TEXT_PRIMARY,
+            anchor="w",
+        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 4))
+
+        tk.Label(
+            card,
+            text=(
+                "If images don't match on this PC, use Browse to replace them with "
+                "fresh screenshots.\n"
+                "Use Test to verify each image is found on screen before running automation."
+            ),
+            font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+            anchor="w", justify="left",
+        ).grid(row=11, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        # Column headers
+        hdr = tk.Frame(card, bg=Color.BG_TABLE_HEADER)
+        hdr.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(0, 2))
+        for col_txt, col_w in [("Image Name", 24), ("File", 28), ("Actions", 20)]:
+            tk.Label(hdr, text=col_txt,
+                     font=Font.BODY_SM, bg=Color.BG_TABLE_HEADER,
+                     fg=Color.TEXT_SECONDARY, anchor="w",
+                     width=col_w).pack(side="left", padx=(8, 0), pady=4)
+
+        # Image rows — key matches state.tally_images dict
+        self._image_rows = {}   # key → {result_lbl, filename_var}
+        image_defs = [
+            ("gateway",      "Gateway Screen",          "Tally gateway / company list screen"),
+            ("search_box",   "Company Search Box",       "Search field in the company list"),
+            ("username",     "Username Field",           "Login prompt username input"),
+            ("password",     "Password Field",           "Login prompt password input"),
+            ("select_title", "Select Company Title",     "Header text of select company screen"),
+            ("change_path",  "Change Path Button",       "Button to change data directory"),
+            ("remote_tab",   "Remote Tab",               "Remote/TDS tab in Gateway"),
+            ("tds_field",    "TDS Server Field",         "TDS server IP input field"),
+        ]
+
+        tally_images = getattr(self.state, 'tally_images', {})
+
+        for r_idx, (key, label, tooltip) in enumerate(image_defs):
+            row_num = 13 + r_idx
+            bg = Color.BG_CARD if r_idx % 2 == 0 else Color.BG_TABLE_HEADER
+
+            row_f = tk.Frame(card, bg=bg)
+            row_f.grid(row=row_num, column=0, columnspan=3, sticky="ew", pady=1)
+            row_f.columnconfigure(1, weight=1)
+
+            # Label
+            tk.Label(row_f, text=label,
+                     font=Font.BODY, bg=bg, fg=Color.TEXT_PRIMARY,
+                     anchor="w", width=24,
+                     ).grid(row=0, column=0, sticky="w", padx=(8, 0), pady=6)
+
+            # Filename display
+            current_filename = tally_images.get(key, f"tally_{key}.png")
+            fname_var = tk.StringVar(value=current_filename)
+
+            tk.Label(row_f, textvariable=fname_var,
+                     font=Font.MONO_SM, bg=bg, fg=Color.TEXT_SECONDARY,
+                     anchor="w", width=30,
+                     ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+            # Buttons
+            btn_f = tk.Frame(row_f, bg=bg)
+            btn_f.grid(row=0, column=2, sticky="e", padx=(0, 8))
+
+            tk.Button(
+                btn_f, text="Browse",
+                font=Font.BUTTON_SM,
+                bg=Color.PRIMARY_LIGHT, fg=Color.PRIMARY,
+                relief="solid", bd=1, padx=8, pady=2, cursor="hand2",
+                command=lambda k=key, fv=fname_var: self._browse_image(k, fv),
+            ).pack(side="left", padx=(0, 4))
+
+            result_lbl = tk.Label(
+                btn_f, text="",
+                font=Font.BODY_SM, bg=bg, fg=Color.TEXT_MUTED, width=22, anchor="w",
+            )
+            result_lbl.pack(side="left")
+
+            tk.Button(
+                btn_f, text="Test",
+                font=Font.BUTTON_SM,
+                bg=Color.BG_ROOT, fg=Color.TEXT_PRIMARY,
+                relief="solid", bd=1, padx=8, pady=2, cursor="hand2",
+                command=lambda k=key, rl=result_lbl: self._test_image(k, rl),
+            ).pack(side="left", padx=(4, 0))
+
+            self._image_rows[key] = {"result_lbl": result_lbl, "filename_var": fname_var}
+
+        # ── Test All + Save buttons ───────────────────────────────────────────
+        end_row = 13 + len(image_defs)
+
+        action_row = tk.Frame(card, bg=Color.BG_CARD)
+        action_row.grid(row=end_row, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+        tk.Button(
+            action_row, text="⚡  Test All Images",
+            font=Font.BUTTON_SM,
+            bg=Color.SUCCESS_BG, fg=Color.SUCCESS_FG,
+            relief="flat", bd=0, padx=Spacing.LG, pady=5,
+            cursor="hand2",
+            command=self._test_all_images,
+        ).pack(side="left", padx=(0, Spacing.SM))
+
+        self._test_all_lbl = tk.Label(
+            action_row, text="",
+            font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+        )
+        self._test_all_lbl.pack(side="left", padx=(Spacing.SM, 0))
+
+        tk.Button(
+            action_row, text="✓  Save Automation Settings",
+            font=Font.BUTTON_SM,
+            bg=Color.PRIMARY, fg=Color.TEXT_WHITE,
+            relief="flat", bd=0, padx=Spacing.LG, pady=5,
+            cursor="hand2",
+            command=self._save_automation,
+        ).pack(side="right")
+
+        self._automation_save_lbl = tk.Label(
+            card, text="",
+            font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+        )
+        self._automation_save_lbl.grid(
+            row=end_row + 1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Automation helpers
+    # ─────────────────────────────────────────────────────────────────────────
+    def _browse_tally_exe(self):
+        path = filedialog.askopenfilename(
+            title="Select Tally.exe",
+            filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
+            parent=self,
+        )
+        if path:
+            self._vars["tally_exe_path"].set(os.path.normpath(path))
+
+    def _browse_image(self, key: str, fname_var: tk.StringVar):
+        """Let user pick a PNG → copy to assets/ → update filename in state + DB."""
+        path = filedialog.askopenfilename(
+            title=f"Select screenshot for: {key}",
+            filetypes=[("PNG Images", "*.png"), ("All images", "*.png *.jpg *.bmp")],
+            parent=self,
+        )
+        if not path:
+            return
+
+        # Copy to assets folder
+        assets_dir = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))), "assets")
+        os.makedirs(assets_dir, exist_ok=True)
+
+        # Use a consistent naming: tally_<key>.png
+        dest_name = f"tally_{key}.png"
+        dest_path = os.path.join(assets_dir, dest_name)
+
+        try:
+            shutil.copy2(path, dest_path)
+        except Exception as e:
+            messagebox.showerror("Copy Failed", f"Could not copy image:\n{e}")
+            return
+
+        # Update UI
+        fname_var.set(dest_name)
+
+        # Update state
+        if not hasattr(self.state, 'tally_images') or self.state.tally_images is None:
+            self.state.tally_images = {}
+        self.state.tally_images[key] = dest_name
+
+        # Persist to DB
+        self._save_image_to_db(key, dest_name)
+
+        row_data = self._image_rows.get(key)
+        if row_data:
+            row_data["result_lbl"].configure(
+                text="✓ Replaced", fg=Color.SUCCESS)
+            self.after(3000, lambda: row_data["result_lbl"].configure(text=""))
+
+    def _save_image_to_db(self, key: str, filename: str):
+        """Persist a single image filename change to tally_settings table."""
+        engine = self.state.db_engine
+        if not engine:
+            return
+        col_map = {
+            "gateway":      "image_gateway",
+            "search_box":   "image_search_box",
+            "username":     "image_username",
+            "password":     "image_password",
+            "select_title": "image_select_title",
+            "change_path":  "image_change_path",
+            "remote_tab":   "image_remote_tab",
+            "tds_field":    "image_tds_field",
+        }
+        col = col_map.get(key)
+        if not col:
+            return
+        try:
+            from sqlalchemy.orm import sessionmaker
+            from database.models.tally_settings import TallySettings
+            Session = sessionmaker(bind=engine)
+            db = Session()
+            try:
+                ts = db.query(TallySettings).filter_by(id=1).first()
+                if not ts:
+                    ts = TallySettings(id=1)
+                    db.add(ts)
+                setattr(ts, col, filename)
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            from logging_config import logger
+            logger.error(f"[Settings] Failed to save image to DB: {e}")
+
+    def _test_image(self, key: str, result_lbl: tk.Label):
+        """
+        Test image matching with a 20-second wait loop.
+
+        Flow:
+          1. Show countdown in result label (so user can switch to Tally)
+          2. Minimize app window after 3s countdown
+          3. Try locateOnScreen every second for up to 20 seconds
+          4. If found → show overlay + restore app
+          5. If not found in 20s → show error with confidence hint
+        """
+        try:
+            import pyautogui
+        except ImportError:
+            result_lbl.configure(text="✗ pyautogui not installed", fg=Color.DANGER)
+            return
+
+        images     = getattr(self.state, 'tally_images', {})
+        filename   = images.get(key, f"tally_{key}.png")
+        assets_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "assets",
+        )
+        img_path = os.path.join(assets_dir, filename)
+
+        if not os.path.exists(img_path):
+            result_lbl.configure(text="✗ File missing — use Browse to add it", fg=Color.DANGER)
+            return
+
+        confidence = float(
+            self._vars.get("automation_confidence", tk.StringVar(value="0.80")).get() or 0.80
+        )
+        root = self.winfo_toplevel()
+
+        # ── Phase 1: 3s countdown so user can navigate to Tally ─────────────
+        COUNTDOWN = 3
+        WAIT_SECS = 20
+
+        def _tick(remaining):
+            """Countdown on main thread before minimizing."""
+            if remaining > 0:
+                result_lbl.configure(
+                    text=f"⏳ Switch to Tally… {remaining}s",
+                    fg=Color.WARNING_FG if hasattr(Color, "WARNING_FG") else Color.TEXT_MUTED,
+                )
+                self.after(1000, lambda: _tick(remaining - 1))
+            else:
+                result_lbl.configure(text="🔍 Searching (20s)…", fg=Color.TEXT_MUTED)
+                # Minimize after countdown finishes
+                try:
+                    root.iconify()
+                except Exception:
+                    pass
+                threading.Thread(target=_search_worker, daemon=True).start()
+
+        def _search_worker():
+            """Background: try locateOnScreen every second for WAIT_SECS."""
+            import time
+            time.sleep(0.4)   # let minimize animation complete
+
+            loc      = None
+            deadline = time.time() + WAIT_SECS
+
+            while time.time() < deadline:
+                try:
+                    loc = pyautogui.locateOnScreen(
+                        img_path, confidence=confidence, grayscale=True
+                    )
+                    if loc:
+                        break
+                except Exception:
+                    pass
+                # Update countdown label every second
+                remaining = max(0, int(deadline - time.time()))
+                root.after(0, lambda r=remaining: result_lbl.configure(
+                    text=f"🔍 Searching… {r}s left", fg=Color.TEXT_MUTED
+                ))
+                time.sleep(1)
+
+            # Restore app
+            root.after(0, root.deiconify)
+
+            if loc:
+                x = int(loc.left)
+                y = int(loc.top)
+                w = int(loc.width)
+                h = int(loc.height)
+
+                def _show_found():
+                    result_lbl.configure(text=f"✓ Found at ({x}, {y})", fg=Color.SUCCESS)
+                    try:
+                        from gui.components.image_test_overlay import ImageTestOverlay
+                        ImageTestOverlay(root, x, y, w, h, duration_ms=3000)
+                    except Exception:
+                        pass
+                    self.after(5000, lambda: result_lbl.configure(text=""))
+
+                root.after(400, _show_found)
+
+            else:
+                lower_conf = max(0.50, round(confidence - 0.10, 2))
+
+                def _show_not_found():
+                    result_lbl.configure(
+                        text=f"✗ Not found — try confidence {lower_conf:.2f}",
+                        fg=Color.DANGER,
+                    )
+                    self.after(8000, lambda: result_lbl.configure(text=""))
+
+                root.after(400, _show_not_found)
+
+        # Start the countdown on the main thread
+        _tick(COUNTDOWN)
+
+
+    def _test_all_images(self):
+        """Test all 8 images sequentially, show summary when done."""
+        try:
+            import pyautogui
+        except ImportError:
+            self._test_all_lbl.configure(
+                text="✗ pyautogui not installed — pip install pyautogui",
+                fg=Color.DANGER)
+            return
+
+        keys = list(self._image_rows.keys())
+        total = len(keys)
+
+        self._test_all_lbl.configure(
+            text=f"Testing 1/{total}…", fg=Color.TEXT_MUTED)
+        self.update_idletasks()
+
+        results = {}   # key → bool
+
+        def run_all():
+            import time
+            root = self.winfo_toplevel()
+
+            try:
+                root.iconify()
+            except Exception:
+                pass
+            time.sleep(0.6)
+
+            confidence = float(self._vars.get(
+                "automation_confidence", tk.StringVar(value="0.80")).get() or 0.80)
+
+            assets_dir = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)))), "assets")
+
+            images = getattr(self.state, 'tally_images', {})
+
+            for idx, key in enumerate(keys):
+                root.after(0, lambda i=idx: self._test_all_lbl.configure(
+                    text=f"Testing {i+1}/{total}…", fg=Color.TEXT_MUTED))
+
+                filename = images.get(key, f"tally_{key}.png")
+                img_path = os.path.join(assets_dir, filename)
+
+                found = False
+                if os.path.exists(img_path):
+                    try:
+                        loc = pyautogui.locateOnScreen(
+                            img_path, confidence=confidence, grayscale=True
+                        )
+                        found = loc is not None
+                    except Exception:
+                        found = False
+
+                results[key] = found
+
+                # Update individual row result label
+                row_data = self._image_rows.get(key)
+                if row_data:
+                    rl = row_data["result_lbl"]
+                    if found:
+                        root.after(0, lambda l=rl: l.configure(
+                            text="✓ Found", fg=Color.SUCCESS))
+                    else:
+                        root.after(0, lambda l=rl: l.configure(
+                            text="✗ Not found", fg=Color.DANGER))
+
+                time.sleep(0.3)
+
+            try:
+                root.after(0, root.deiconify)
+            except Exception:
+                pass
+
+            found_count = sum(1 for v in results.values() if v)
+            miss_count  = total - found_count
+
+            def show_summary():
+                if miss_count == 0:
+                    self._test_all_lbl.configure(
+                        text=f"✓ All {total} images found on screen",
+                        fg=Color.SUCCESS)
+                else:
+                    self._test_all_lbl.configure(
+                        text=f"{found_count}/{total} found — {miss_count} need attention",
+                        fg=Color.WARNING_FG if hasattr(Color, "WARNING_FG") else Color.DANGER)
+
+            root.after(700, show_summary)
+
+        threading.Thread(target=run_all, daemon=True).start()
+
+    def _save_automation(self):
+        """Validate and persist automation settings (controls + exe path + images) to DB."""
+        errors = []
+
+        conf_str = self._vars.get("automation_confidence", tk.StringVar(value="0.80")).get().strip()
+        try:
+            conf = float(conf_str)
+            if not (0.5 <= conf <= 1.0):
+                errors.append("Confidence must be between 0.50 and 1.00")
+        except ValueError:
+            errors.append("Confidence must be a decimal number (e.g. 0.80)")
+
+        for key, label in [
+            ("automation_click_delay", "Click Delay"),
+            ("automation_timeout",     "Wait Timeout"),
+            ("automation_retries",     "Retry Attempts"),
+        ]:
+            val = self._vars.get(key, tk.StringVar()).get().strip()
+            if val and not val.isdigit():
+                errors.append(f"{label} must be a whole number")
+
+        if errors:
+            messagebox.showerror("Validation Error", "\n".join(errors))
+            return
+
+        engine = self.state.db_engine
+        if not engine:
+            self._automation_save_lbl.configure(
+                text="✗ No DB connection — cannot save", fg=Color.DANGER)
+            return
+
+        try:
+            from sqlalchemy.orm import sessionmaker
+            from database.models.tally_settings      import TallySettings
+            from database.models.automation_settings import AutomationSettings
+            from gui.state import AutomationConfig
+
+            Session = sessionmaker(bind=engine)
+            db = Session()
+            try:
+                # ── Save TallySettings ────────────────────────────────────────
+                ts = db.query(TallySettings).filter_by(id=1).first()
+                if not ts:
+                    ts = TallySettings(id=1)
+                    db.add(ts)
+
+                ts.exe_path = self._vars["tally_exe_path"].get().strip() or None
+
+                # Save all image filenames
+                images = getattr(self.state, 'tally_images', {})
+                col_map = {
+                    "gateway":      "image_gateway",
+                    "search_box":   "image_search_box",
+                    "username":     "image_username",
+                    "password":     "image_password",
+                    "select_title": "image_select_title",
+                    "change_path":  "image_change_path",
+                    "remote_tab":   "image_remote_tab",
+                    "tds_field":    "image_tds_field",
+                }
+                for k, col in col_map.items():
+                    row_data = self._image_rows.get(k)
+                    if row_data:
+                        fname = row_data["filename_var"].get().strip()
+                        if fname:
+                            setattr(ts, col, fname)
+                            images[k] = fname
+
+                # ── Save AutomationSettings ───────────────────────────────────
+                aut = db.query(AutomationSettings).filter_by(id=1).first()
+                if not aut:
+                    aut = AutomationSettings(id=1)
+                    db.add(aut)
+
+                aut.confidence       = float(self._vars["automation_confidence"].get() or 0.80)
+                aut.click_delay_ms   = int(self._vars["automation_click_delay"].get()  or 500)
+                aut.wait_timeout_sec = int(self._vars["automation_timeout"].get()       or 30)
+                aut.retry_attempts   = int(self._vars["automation_retries"].get()       or 3)
+
+                db.commit()
+
+                # ── Update live AppState ──────────────────────────────────────
+                self.state.tally_exe_path = ts.exe_path or ""
+                self.state.tally_images   = images
+                self.state.automation     = AutomationConfig(
+                    confidence       = aut.confidence,
+                    click_delay_ms   = aut.click_delay_ms,
+                    wait_timeout_sec = aut.wait_timeout_sec,
+                    retry_attempts   = aut.retry_attempts,
+                )
+
+                self._automation_save_lbl.configure(
+                    text=f"✓ Saved at {datetime.now().strftime('%H:%M:%S')}",
+                    fg=Color.SUCCESS)
+                self.after(4000, lambda: self._automation_save_lbl.configure(text=""))
+
+            finally:
+                db.close()
+
+        except Exception as e:
+            from logging_config import logger
+            logger.error(f"[Settings] Failed to save automation settings: {e}")
+            self._automation_save_lbl.configure(
+                text=f"✗ Save failed: {str(e)[:60]}", fg=Color.DANGER)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Save bar
@@ -964,3 +1585,21 @@ class SettingsPage(tk.Frame):
             for entry in self._db_entries.values():
                 entry.configure(state="readonly", bg=Color.BG_TABLE_HEADER)
         self._db_status_lbl.configure(text="")
+
+        # ── Phase 3: Reload automation settings ──────────────────────────────
+        self._vars["tally_exe_path"].set(
+            getattr(self.state, 'tally_exe_path', '') or '')
+
+        aut = getattr(self.state, 'automation', None)
+        if aut:
+            self._vars["automation_confidence"].set(str(getattr(aut, 'confidence',       0.80)))
+            self._vars["automation_click_delay"].set(str(getattr(aut, 'click_delay_ms',  500)))
+            self._vars["automation_timeout"].set(str(getattr(aut, 'wait_timeout_sec',    30)))
+            self._vars["automation_retries"].set(str(getattr(aut, 'retry_attempts',      3)))
+
+        # Reload image filenames from live state
+        images = getattr(self.state, 'tally_images', {})
+        for key, row_data in self._image_rows.items():
+            current = images.get(key, f"tally_{key}.png")
+            row_data["filename_var"].set(current)
+            row_data["result_lbl"].configure(text="")

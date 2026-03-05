@@ -38,7 +38,12 @@ class CompanyController:
     def load_scheduler_config(self):
         """
         Read company_scheduler_config table and apply to matching CompanyState
-        objects in state.companies. Safe to call even if table is empty.
+        objects in state.companies.
+
+        Loads ALL fields including last_sync_time so the scheduler page
+        can show "Last sync" even when Tally is completely closed.
+        Previously last_sync_time was only held in memory — lost on restart
+        and blank whenever Tally was not running.
         """
         engine = self._state.db_engine
         if not engine:
@@ -57,6 +62,12 @@ class CompanyController:
                     co.schedule_interval = row.interval or "hourly"
                     co.schedule_value    = int(row.value  or 1)
                     co.schedule_time     = row.time       or "09:00"
+
+                    # Load last_sync_time from DB so it shows even when Tally is closed.
+                    # This field is written by SyncController after every successful sync.
+                    if hasattr(row, 'last_sync_time') and row.last_sync_time:
+                        co.last_sync_time = row.last_sync_time
+
             logger.info(f"[CompanyController] Loaded scheduler config for {len(rows)} companies")
         except Exception as e:
             logger.error(f"[CompanyController] Failed to load scheduler config: {e}")
@@ -100,31 +111,46 @@ class CompanyController:
     #  Internal upsert helper
     # ─────────────────────────────────────────────────────────────────────────
     def _upsert(self, engine, name: str, co: CompanyState):
+        """
+        Upsert company scheduler config into DB.
+        Saves last_sync_time so it persists across app restarts and
+        is visible on the scheduler page even when Tally is closed.
+        """
         Model   = _get_model()
         Session = sessionmaker(bind=engine)
         db      = Session()
         try:
+            # Build values dict — only include last_sync_time if it exists
+            values = dict(
+                company_name = name,
+                enabled      = co.schedule_enabled,
+                interval     = co.schedule_interval,
+                value        = co.schedule_value,
+                time         = co.schedule_time,
+                updated_at   = datetime.utcnow(),
+            )
+            update_vals = dict(
+                enabled    = co.schedule_enabled,
+                interval   = co.schedule_interval,
+                value      = co.schedule_value,
+                time       = co.schedule_time,
+                updated_at = datetime.utcnow(),
+            )
+
+            # Include last_sync_time if available on this CompanyState
+            last_sync = getattr(co, 'last_sync_time', None)
+            if last_sync:
+                values['last_sync_time']     = last_sync
+                update_vals['last_sync_time'] = last_sync
+
             stmt = (
                 mysql_insert(Model)
-                .values(
-                    company_name = name,
-                    enabled      = co.schedule_enabled,
-                    interval     = co.schedule_interval,
-                    value        = co.schedule_value,
-                    time         = co.schedule_time,
-                    updated_at   = datetime.utcnow(),
-                )
-                .on_duplicate_key_update(
-                    enabled    = co.schedule_enabled,
-                    interval   = co.schedule_interval,
-                    value      = co.schedule_value,
-                    time       = co.schedule_time,
-                    updated_at = datetime.utcnow(),
-                )
+                .values(**values)
+                .on_duplicate_key_update(**update_vals)
             )
             db.execute(stmt)
             db.commit()
-            logger.debug(f"[CompanyController] Upserted scheduler config for: {name}")
+            logger.debug(f"[CompanyController] Upserted config for: {name}")
         except Exception as e:
             db.rollback()
             logger.error(f"[CompanyController] Failed to save config for {name}: {e}")

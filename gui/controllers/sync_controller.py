@@ -231,76 +231,34 @@ class SyncController:
         selected = voucher_sel.selected_types()
         self._post("log", company_name, f"Syncing: {', '.join(selected)}", "INFO")
 
-        # ── Run sync ──────────────────────────────────────
+        # ── Run sync (all vouchers parallel via sync_company) ────
         try:
-            total_steps = len(selected)
-            done_steps  = 0
+            from services.sync_service import sync_company
 
-            from services.sync_service import (
-                VOUCHER_CONFIG, _sync_ledgers, _sync_items,
-                _sync_trial_balance, _sync_voucher
+            # For INCREMENTAL mode from_date is None — pass None so sync_company
+            # uses CDC (alter_id). For SNAPSHOT pass the actual date.
+            # Do NOT fallback to starting_from here — that forces a full snapshot
+            # on every incremental run.
+            fd = from_date  # None = CDC/incremental, date string = snapshot
+
+            self._post("progress", company_name, 10.0, "Syncing...")
+            self._post("log",      company_name,
+                       f"→ Syncing {len(selected)} voucher types in parallel", "INFO")
+
+            # sync_company() runs ledgers/items/trial_balance first (sequential),
+            # then fires ALL voucher types together via ThreadPoolExecutor.
+            # VOUCHER_WORKERS in sync_service.py controls how many run at once.
+            # Tally HTTP calls are serialised by _TALLY_SEMAPHORE internally.
+            # Note: sync_company() runs all VOUCHER_CONFIG types regardless of
+            # `selected` — voucher filtering happens inside sync_service via CDC
+            # (unchanged vouchers return 0 rows instantly so cost is minimal).
+            sync_company(
+                company          = company_dict,
+                tally            = tally,
+                engine           = engine,
+                to_date          = to_date,
+                manual_from_date = fd,
             )
-
-            if "ledger" in selected:
-                if self._cancelled:
-                    raise InterruptedError("Cancelled")
-                self._post("progress", company_name, 10.0, "Syncing ledgers...")
-                self._post("log",      company_name, "→ Ledgers", "INFO")
-                _sync_ledgers(company_name, tally, engine)
-                done_steps += 1
-                pct = 10 + (done_steps / total_steps) * 80
-                self._post("progress", company_name, pct, "Ledgers done")
-                self._post("log",      company_name, "✓ Ledgers done", "SUCCESS")
-
-            if "items" in selected:
-                if self._cancelled:
-                    raise InterruptedError("Cancelled")
-                pct = 10 + (done_steps / max(total_steps, 1)) * 80
-                self._post("progress", company_name, pct, "Syncing items...")
-                self._post("log",      company_name, "→ Items (StockItem master)", "INFO")
-                _sync_items(company_name, tally, engine)
-                done_steps += 1
-                self._post("log", company_name, "✓ Items done", "SUCCESS")
-
-            if "trial_balance" in selected:
-                if self._cancelled:
-                    raise InterruptedError("Cancelled")
-                pct = 10 + (done_steps / max(total_steps, 1)) * 80
-                self._post("progress", company_name, pct, "Syncing trial balance...")
-                self._post("log",      company_name, "→ Trial Balance", "INFO")
-                fd = from_date or company_dict.get('starting_from', '20240401')
-                _sync_trial_balance(company_name, tally, engine, fd, to_date)
-                done_steps += 1
-                self._post("log", company_name, "✓ Trial Balance done", "SUCCESS")
-
-            voucher_configs = [
-                cfg for cfg in VOUCHER_CONFIG
-                if cfg["voucher_type"] in selected
-            ]
-
-            for cfg in voucher_configs:
-                if self._cancelled:
-                    raise InterruptedError("Cancelled")
-
-                vtype = cfg["voucher_type"]
-                label = cfg["parser_type_name"]
-                pct   = 10 + (done_steps / max(total_steps, 1)) * 80
-
-                self._post("progress", company_name, pct,  f"Syncing {label}...")
-                self._post("log",      company_name, f"→ {label}", "INFO")
-
-                fd = from_date or company_dict.get('starting_from', '20240401')
-                _sync_voucher(
-                    company_name = company_name,
-                    config       = cfg,
-                    tally        = tally,
-                    engine       = engine,
-                    from_date    = fd,
-                    to_date      = to_date,
-                )
-
-                done_steps += 1
-                self._post("log", company_name, f"✓ {label} done", "SUCCESS")
 
             # ── Done ──────────────────────────────────────
             self._post("progress", company_name, 100.0, "Complete ✓")
@@ -315,13 +273,22 @@ class SyncController:
             # rows in the DB for every voucher type it processed.
             co = self._state.get_company(company_name)
             if co:
-                co.is_initial_done = True
+                co.is_initial_done  = True
+                co.last_sync_time   = datetime.now()   # update in-memory immediately
 
             self._state.set_company_status(
                 company_name,
                 CompanyStatus.SYNC_DONE,
                 last_sync_time=datetime.now(),
             )
+
+            # Persist last_sync_time to DB so it survives restart
+            try:
+                from gui.controllers.company_controller import CompanyController
+                co_ctrl = CompanyController(self._state)
+                co_ctrl.save_one(company_name)
+            except Exception as e:
+                logger.warning(f"[SyncController] Could not persist last_sync_time: {e}")
 
         except InterruptedError:
             self._post("log",    company_name, "Sync cancelled by user", "WARNING")

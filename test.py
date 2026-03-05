@@ -12,70 +12,10 @@
 #     to_date = datetime.now().strftime("%Y%m%d")
 
 #     # Define the XML with a Dynamic Collection and your specific columns
-#     xml_data = f"""<ENVELOPE>
-#     <HEADER>
-#         <VERSION>1</VERSION>
-#         <TALLYREQUEST>Export</TALLYREQUEST>
-#         <TYPE>Collection</TYPE>
-#         <ID>IncrementalSalesVouchers</ID>
-#     </HEADER>
-#     <BODY>
-#         <DESC>
-#             <STATICVARIABLES>
-#                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-#                 <SVCURRENTCOMPANY>{COMPANY}</SVCURRENTCOMPANY>
-#                 <SVFROMDATE>{from_date}</SVFROMDATE>
-#                 <SVTODATE>{to_date}</SVTODATE>
-#             </STATICVARIABLES>
-#             <TDL>
-#                 <TDLMESSAGE>
-#                     <COLLECTION NAME="IncrementalSalesVouchers">
-#                         <TYPE>Voucher</TYPE>
-#                         <CHILDREEOF>$$VchTypeSales</CHILDREEOF>
-#                         <FILTER>AlterIdFilter</FILTER>
-                        
-#                         <FETCH>GUID</FETCH>
-#                         <FETCH>ALTERID</FETCH>
-#                         <FETCH>MASTERID</FETCH>
-#                         <FETCH>VOUCHERNUMBER</FETCH>
-#                         <FETCH>VOUCHERTYPENAME</FETCH>
-#                         <FETCH>DATE</FETCH>
-#                         <FETCH>PARTYNAME</FETCH>
-#                         <FETCH>REFERENCE</FETCH>
-#                         <FETCH>NARRATION</FETCH>
-#                         <FETCH>PARTYGSTIN</FETCH>
-#                         <FETCH>IRNACKNO</FETCH>
-#                         <FETCH>TEMPGSTEWAYBILLNUMBER</FETCH>
-#                         <FETCH>ISDELETED</FETCH>
+#     xml_data = f"""
+# 
 
-#                         <!-- Ledger Entry Fields -->
-#                         <FETCH>ALLLEDGERENTRIES.LEDGERNAME</FETCH>
-#                         <FETCH>ALLLEDGERENTRIES.AMOUNT</FETCH>
-
-#                         <!-- Inventory Entry Fields -->
-#                         <FETCH>ALLINVENTORYENTRIES.STOCKITEMNAME</FETCH>
-#                         <FETCH>ALLINVENTORYENTRIES.ACTUALQTY</FETCH>
-#                         <FETCH>ALLINVENTORYENTRIES.BILLEDQTY</FETCH>
-#                         <FETCH>ALLINVENTORYENTRIES.RATE</FETCH>
-#                         <FETCH>ALLINVENTORYENTRIES.AMOUNT</FETCH>
-#                         <FETCH>ALLINVENTORYENTRIES.DISCOUNT</FETCH>
-
-#                         <!-- Batch Allocation Fields -->
-#                         <FETCH>ALLINVENTORYENTRIES.BATCHALLOCATIONS.BATCHNAME</FETCH>
-#                         <FETCH>ALLINVENTORYENTRIES.BATCHALLOCATIONS.MFDON</FETCH>
-#                         <FETCH>ALLINVENTORYENTRIES.BATCHALLOCATIONS.EXPIRYPERIOD</FETCH>
-
-#                         <!-- Accounting Allocation Fields -->
-#                         <FETCH>ALLINVENTORYENTRIES.ACCOUNTINGALLOCATIONS.GSTHSNSACCODE</FETCH>
-#                     </COLLECTION>
-#                     <SYSTEM TYPE="Formulae" NAME="AlterIdFilter">
-#                         $ALTERID > {last_alter_id}
-#                     </SYSTEM>
-#                 </TDLMESSAGE>
-#             </TDL>
-#         </DESC>
-#     </BODY>
-# </ENVELOPE>"""
+# """
 
 #     try:
 #         response = requests.post(

@@ -12,8 +12,9 @@ On Save: calls app.save_company_to_db(), updates CompanyState status.
 """
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 from datetime import datetime, date
+import os
 
 from gui.styles import Color, Font, Spacing
 from gui.state  import CompanyState, CompanyStatus
@@ -59,7 +60,7 @@ class ConfigureCompanyDialog(tk.Toplevel):
         self.update_idletasks()
         pw = parent.winfo_rootx() + parent.winfo_width()  // 2
         ph = parent.winfo_rooty() + parent.winfo_height() // 2
-        w, h = 460, 400
+        w, h = 500, 640
         self.geometry(f"{w}x{h}+{pw - w//2}+{ph - h//2}")
 
         self.bind("<Return>", lambda e: self._on_save())
@@ -152,17 +153,73 @@ class ConfigureCompanyDialog(tk.Toplevel):
             relief="solid", bd=1,
         ).pack(side="left", padx=(4, 0))
 
+        # ── Tally Credentials ─────────────────────────────
+        self._add_section_label(pad, row=8, text="Tally Credentials  (leave blank if not required)")
+
+        cred_frame = tk.Frame(pad, bg=Color.BG_CARD)
+        cred_frame.grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        tk.Label(cred_frame, text="Username:", font=Font.BODY, bg=Color.BG_CARD,
+                 fg=Color.TEXT_SECONDARY, width=9, anchor="w").pack(side="left")
+        self._username_var = tk.StringVar(value=getattr(co, 'tally_username', '') or '')
+        tk.Entry(
+            cred_frame, textvariable=self._username_var,
+            font=Font.BODY, width=18,
+            bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+            relief="solid", bd=1,
+        ).pack(side="left", padx=(4, 16))
+
+        tk.Label(cred_frame, text="Password:", font=Font.BODY, bg=Color.BG_CARD,
+                 fg=Color.TEXT_SECONDARY, width=9, anchor="w").pack(side="left")
+        self._password_var = tk.StringVar(value=getattr(co, 'tally_password', '') or '')
+        tk.Entry(
+            cred_frame, textvariable=self._password_var,
+            font=Font.BODY, width=18,
+            bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+            relief="solid", bd=1,
+        ).pack(side="left", padx=(4, 0))
+
+        # ── Tally Data Location ───────────────────────────
+        self._add_section_label(pad, row=10, text="Tally Data Location")
+
+        # Radio buttons: Local / Remote / TDS
+        self._type_var = tk.StringVar(value=getattr(co, 'company_type', 'local') or 'local')
+
+        type_row = tk.Frame(pad, bg=Color.BG_CARD)
+        type_row.grid(row=11, column=0, columnspan=2, sticky="w", pady=(4, 6))
+
+        for val, label in [("local", "Local"), ("remote", "Remote (Drive)"), ("tds", "TDS Server")]:
+            tk.Radiobutton(
+                type_row, text=label,
+                variable=self._type_var, value=val,
+                font=Font.BODY, bg=Color.BG_CARD,
+                activebackground=Color.BG_CARD,
+                fg=Color.TEXT_PRIMARY,
+                command=self._on_type_change,
+            ).pack(side="left", padx=(0, 16))
+
+        # ── Dynamic fields frame (swaps based on radio) ───
+        self._loc_frame = tk.Frame(pad, bg=Color.BG_CARD)
+        self._loc_frame.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+
+        # Pre-read existing values
+        self._data_path_var  = tk.StringVar(value=getattr(co, 'data_path',   '') or '')
+        self._tds_path_var   = tk.StringVar(value=getattr(co, 'tds_path',    '') or '')
+        self._drive_var      = tk.StringVar(value=getattr(co, 'drive_letter', '') or '')
+
+        self._build_loc_fields()   # render correct fields for current type
+
         # ── Feedback label ────────────────────────────────
         self._feedback = tk.Label(
             pad, text="",
             font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.DANGER,
-            wraplength=380, justify="left",
+            wraplength=420, justify="left",
         )
-        self._feedback.grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self._feedback.grid(row=13, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         # ── Buttons ───────────────────────────────────────
         btn_row = tk.Frame(pad, bg=Color.BG_CARD)
-        btn_row.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        btn_row.grid(row=14, column=0, columnspan=2, sticky="ew", pady=(16, 0))
         btn_row.columnconfigure(0, weight=1)
 
         tk.Button(
@@ -178,6 +235,133 @@ class ConfigureCompanyDialog(tk.Toplevel):
             relief="flat", bd=0, padx=16, pady=5, cursor="hand2",
             command=self._on_save,
         ).pack(side="right")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    def _on_type_change(self):
+        """Rebuild location fields when user switches Local/Remote/TDS."""
+        for w in self._loc_frame.winfo_children():
+            w.destroy()
+        self._build_loc_fields()
+
+    def _build_loc_fields(self):
+        """Render the correct input fields inside _loc_frame based on _type_var."""
+        f   = self._loc_frame
+        typ = self._type_var.get()
+
+        if typ == "local":
+            # Single path row with Browse button
+            tk.Label(f, text="Data Path:", font=Font.BODY,
+                     bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                     width=10, anchor="w").grid(row=0, column=0, sticky="w")
+
+            tk.Entry(
+                f, textvariable=self._data_path_var,
+                font=Font.BODY, width=30,
+                bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+                relief="solid", bd=1,
+            ).grid(row=0, column=1, sticky="w", padx=(4, 6))
+
+            tk.Button(
+                f, text="Browse…",
+                font=Font.BUTTON_SM,
+                bg=Color.PRIMARY_LIGHT, fg=Color.PRIMARY,
+                relief="solid", bd=1, padx=8, pady=3, cursor="hand2",
+                command=self._browse_data_path,
+            ).grid(row=0, column=2, sticky="w")
+
+            tk.Label(
+                f, text="e.g.  C:\\TallyData\\CompanyA",
+                font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+            ).grid(row=1, column=1, columnspan=2, sticky="w", pady=(2, 0))
+
+        elif typ == "remote":
+            # Drive letter + path
+            tk.Label(f, text="Drive:", font=Font.BODY,
+                     bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                     width=10, anchor="w").grid(row=0, column=0, sticky="w")
+
+            tk.Entry(
+                f, textvariable=self._drive_var,
+                font=Font.BODY, width=5,
+                bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+                relief="solid", bd=1,
+            ).grid(row=0, column=1, sticky="w", padx=(4, 0))
+
+            tk.Label(
+                f, text="e.g.  Z:",
+                font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+            ).grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+            tk.Label(f, text="Data Path:", font=Font.BODY,
+                     bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                     width=10, anchor="w").grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+            tk.Entry(
+                f, textvariable=self._data_path_var,
+                font=Font.BODY, width=30,
+                bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+                relief="solid", bd=1,
+            ).grid(row=1, column=1, sticky="w", padx=(4, 6), pady=(6, 0))
+
+            tk.Button(
+                f, text="Browse…",
+                font=Font.BUTTON_SM,
+                bg=Color.PRIMARY_LIGHT, fg=Color.PRIMARY,
+                relief="solid", bd=1, padx=8, pady=3, cursor="hand2",
+                command=self._browse_data_path,
+            ).grid(row=1, column=2, sticky="w", pady=(6, 0))
+
+            tk.Label(
+                f, text="e.g.  \\\\SERVER\\TallyData\\CompanyB",
+                font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+            ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(2, 0))
+
+        elif typ == "tds":
+            # TDS server IP + path
+            tk.Label(f, text="Server IP:", font=Font.BODY,
+                     bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                     width=10, anchor="w").grid(row=0, column=0, sticky="w")
+
+            tk.Entry(
+                f, textvariable=self._tds_path_var,
+                font=Font.BODY, width=20,
+                bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+                relief="solid", bd=1,
+            ).grid(row=0, column=1, sticky="w", padx=(4, 0))
+
+            tk.Label(
+                f, text="e.g.  192.168.1.10",
+                font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+            ).grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+            tk.Label(f, text="Data Path:", font=Font.BODY,
+                     bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                     width=10, anchor="w").grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+            tk.Entry(
+                f, textvariable=self._data_path_var,
+                font=Font.BODY, width=30,
+                bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+                relief="solid", bd=1,
+            ).grid(row=1, column=1, sticky="w", padx=(4, 6), pady=(6, 0))
+
+            tk.Button(
+                f, text="Browse…",
+                font=Font.BUTTON_SM,
+                bg=Color.PRIMARY_LIGHT, fg=Color.PRIMARY,
+                relief="solid", bd=1, padx=8, pady=3, cursor="hand2",
+                command=self._browse_data_path,
+            ).grid(row=1, column=2, sticky="w", pady=(6, 0))
+
+    def _browse_data_path(self):
+        """Open folder browser and set data_path_var."""
+        folder = filedialog.askdirectory(
+            title="Select Tally Data Folder",
+            parent=self,
+        )
+        if folder:
+            # Normalize to OS path separators
+            self._data_path_var.set(os.path.normpath(folder))
 
     # ─────────────────────────────────────────────────────────────────────────
     def _add_section_label(self, parent, row: int, text: str):
@@ -213,6 +397,12 @@ class ConfigureCompanyDialog(tk.Toplevel):
         host          = self._host_var.get().strip() or "localhost"
         starting_from = _yyyymmdd(d)
         books_from    = co.books_from or starting_from
+        username      = self._username_var.get().strip()
+        password      = self._password_var.get().strip()
+        company_type  = self._type_var.get()
+        data_path     = self._data_path_var.get().strip()
+        tds_path      = self._tds_path_var.get().strip()
+        drive_letter  = self._drive_var.get().strip()
 
         # ── Detect start-date change on an already-synced company ────────────
         # If the user moves the start date back and the company already has an
@@ -237,10 +427,16 @@ class ConfigureCompanyDialog(tk.Toplevel):
 
         # Save to DB
         ok, detail = self._app.save_company_to_db(
-            company_name  = co.name,
-            guid          = co.guid or "",
-            starting_from = starting_from,
-            books_from    = books_from,
+            company_name   = co.name,
+            guid           = co.guid or "",
+            starting_from  = starting_from,
+            books_from     = books_from,
+            tally_username = username,
+            tally_password = password,
+            company_type   = company_type,
+            data_path      = data_path,
+            tds_path       = tds_path,
+            drive_letter   = drive_letter,
         )
 
         if not ok:
@@ -250,11 +446,17 @@ class ConfigureCompanyDialog(tk.Toplevel):
             return
 
         # Update in-memory state
-        co.status        = CompanyStatus.CONFIGURED
-        co.starting_from = starting_from
-        co.books_from    = books_from
-        co.tally_host    = host
-        co.tally_port    = port
+        co.status         = CompanyStatus.CONFIGURED
+        co.starting_from  = starting_from
+        co.books_from     = books_from
+        co.tally_host     = host
+        co.tally_port     = port
+        co.tally_username = username
+        co.tally_password = password
+        co.company_type   = company_type
+        co.data_path      = data_path
+        co.tds_path       = tds_path
+        co.drive_letter   = drive_letter
 
         if reset_initial:
             co.is_initial_done = False

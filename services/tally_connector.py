@@ -72,6 +72,21 @@ class TallyConnector:
             logger.error(f'Cannot connect to Tally: {e}', exc_info=True)
             return False
 
+    def ping(self) -> bool:
+        """
+        Quick connectivity check — used by setup wizard and settings page.
+        Returns True if Tally responds, False otherwise.
+        Does NOT update self.status — non-destructive.
+        Uses a short 8s timeout so the UI doesn't freeze.
+        """
+        try:
+            response = self.session.post(
+                url=self.url, headers=self.header, timeout=8
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
     # ── XML template management ───────────────────────────────────────────────
 
     @classmethod

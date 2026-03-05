@@ -559,25 +559,21 @@ class SchedulerPage(tk.Frame):
             self._no_sched_lbl.pack(fill="both", expand=True)
             return
 
-        # Only show CONFIGURED companies — unconfigured ones cannot be scheduled
+        # Show ALL companies from state (loaded from DB at startup).
+        # We do NOT filter by status here because status depends on Tally being
+        # open and responding via XML. If Tally is closed, every company shows
+        # as NOT_CONFIGURED even though they are fully configured in the DB.
+        # The scheduler works independently of Tally being open — schedules
+        # are stored in DB and APScheduler fires jobs regardless of Tally state.
         companies = sorted(
-            [c for c in self.state.companies.values()
-             if c.status != CompanyStatus.NOT_CONFIGURED],
+            list(self.state.companies.values()),
             key=lambda c: (0 if c.schedule_enabled else 1, c.name.lower())
         )
 
         if not companies:
-            total = len(self.state.companies)
-            if total == 0:
-                msg = "No companies loaded.\nGo to Companies page and click ⟳ Refresh."
-            else:
-                msg = (
-                    f"{total} company/companies found but none are configured yet.\n\n"
-                    "Go to the Companies page, click ⚙ Configure on each company,\n"
-                    "then return here to set up a schedule."
-                )
             tk.Label(
-                self._list_frame, text=msg,
+                self._list_frame,
+                text="No companies loaded.\nGo to Companies page and click ⟳ Refresh.",
                 font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
                 pady=40, justify="center",
             ).pack(fill="both", expand=True)
@@ -643,7 +639,12 @@ class SchedulerPage(tk.Frame):
         self._render_rows()
 
     def _on_run_now(self, company_name: str):
-        """Trigger an immediate manual sync for this company."""
+        """
+        Trigger an immediate manual sync for this company via SyncQueueController.
+
+        Phase 2: Goes through the FIFO queue → TallyLauncher → SyncController.
+        Falls back to navigate("sync") if SyncQueueController is unavailable.
+        """
         co = self.state.get_company(company_name)
         if not co or co.status == CompanyStatus.NOT_CONFIGURED:
             messagebox.showwarning(
@@ -652,33 +653,53 @@ class SchedulerPage(tk.Frame):
                 "Go to the Companies page and click ⚙ Configure first.",
             )
             return
+
+        # Try Phase 2 path: enqueue through SyncQueueController
+        sync_q = getattr(self.app, '_sync_queue_controller', None)
+        if sync_q is not None:
+            sync_q.enqueue(company_name)
+            messagebox.showinfo(
+                "Queued",
+                f"'{company_name}' has been added to the sync queue.\n\n"
+                "Tally will open automatically and sync will begin shortly.\n"
+                "Check the Logs page for progress.",
+            )
+            return
+
+        # Fallback: navigate to manual sync page (Phase 1 style)
         if self.state.sync_active:
             messagebox.showwarning("Sync Running", "A sync is already in progress.")
             return
         self.state.selected_companies = [company_name]
         self.navigate("sync")
 
+
     # ─────────────────────────────────────────────────────────────────────────
     #  Init controllers (lazy — wait for app to create scheduler)
     # ─────────────────────────────────────────────────────────────────────────
     def _init_controllers(self):
-        if self._sched_ctrl is not None:
-            return  # already done
+        """
+        Wire up scheduler and company controllers.
 
-        from gui.controllers.company_controller   import CompanyController
-        from gui.controllers.scheduler_controller import SchedulerController
+        Phase 2: app.py already starts SchedulerController in _startup_worker.
+        We reuse that instance instead of creating a duplicate — a second
+        APScheduler instance on the same DB jobstore causes job duplication.
+        """
+        from gui.controllers.company_controller import CompanyController
 
-        self._co_ctrl    = CompanyController(self.state)
-        self._sched_ctrl = SchedulerController(self.state, self.app._q)
+        self._co_ctrl = CompanyController(self.state)
 
-        # Load saved config → state
-        self._co_ctrl.load_scheduler_config()
+        # ── Reuse the already-running scheduler from app.py ───────────────
+        existing = getattr(self.app, '_scheduler_controller', None)
+        if existing is not None:
+            self._sched_ctrl = existing
+            return
 
-        # Start APScheduler
-        self._sched_ctrl.start()
+        # ── Fallback: app hasn't started its scheduler yet (first visit) ──
+        # This path runs only on very first on_show() before startup completes.
+        # We set sched_ctrl to None and retry next time on_show() is called.
+        self._sched_ctrl = None
 
-        # Give app a reference for clean shutdown
-        self.app._scheduler_controller = self._sched_ctrl
 
     def _update_scheduler_status(self):
         if self._sched_ctrl and self._sched_ctrl.is_running():
@@ -732,7 +753,13 @@ class SchedulerPage(tk.Frame):
     #  Lifecycle
     # ─────────────────────────────────────────────────────────────────────────
     def on_show(self):
+        # Always call — retries until app._scheduler_controller is available
         self._init_controllers()
+        # If sched_ctrl just became available, re-init once more to wire it
+        if self._sched_ctrl is None:
+            existing = getattr(self.app, '_scheduler_controller', None)
+            if existing is not None:
+                self._sched_ctrl = existing
         self._update_scheduler_status()
         self._render_rows()
         self._start_next_run_ticker()   # idempotent — safe to call each time

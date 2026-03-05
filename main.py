@@ -1,10 +1,3 @@
-"""
-run_gui.py
-==========
-Entry point — run this to launch the Tally Sync Manager desktop app.
-
-    python run_gui.py
-"""
 import sys
 import os
 

@@ -456,16 +456,50 @@ class TallySyncApp:
             from logging_config import logger
             logger.warning(f"[App] Could not load scheduler config: {e}")
 
+        # ── Step 3b: Load TallySettings + AutomationSettings ─────────────
+        try:
+            self._load_automation_settings(engine)
+        except Exception as e:
+            from logging_config import logger
+            logger.warning(f"[App] Could not load automation settings: {e}")
+
         self._q.put(("companies_loaded", None))
 
-        # ── Step 4: Start APScheduler ─────────────────────
+        # ── Step 4: Start APScheduler FIRST (with no sync queue yet) ─────────
+        # Jobs may fire immediately from persisted DB jobs — that's fine,
+        # they'll use the fallback path until set_sync_queue() is called below.
         try:
             from gui.controllers.scheduler_controller import SchedulerController
-            self._scheduler_controller = SchedulerController(self.state, self._q)
+            self._scheduler_controller = SchedulerController(
+                self.state, self._q,
+                sync_queue_ctrl = None,   # set below after SyncQueueController starts
+            )
             self._scheduler_controller.start()
+            from logging_config import logger
+            logger.info("[App] SchedulerController started ✓")
         except Exception as e:
             from logging_config import logger
             logger.warning(f"[App] Could not start scheduler: {e}")
+            self._scheduler_controller = None
+
+        # ── Step 5: Start SyncQueueController ────────────────────────────────
+        # Start AFTER scheduler so the module singleton already exists.
+        # Then immediately register it so all future jobs use the queue.
+        try:
+            from gui.controllers.sync_queue_controller import SyncQueueController
+            self._sync_queue_controller = SyncQueueController(self.state, self._q)
+            self._sync_queue_controller.start()
+            from logging_config import logger
+            logger.info("[App] SyncQueueController started ✓")
+
+            # Wire into scheduler — from this point all jobs go through the queue
+            if self._scheduler_controller:
+                self._scheduler_controller.set_sync_queue(self._sync_queue_controller)
+
+        except Exception as e:
+            from logging_config import logger
+            logger.warning(f"[App] Could not start SyncQueueController: {e}")
+            self._sync_queue_controller = None
 
         # ── Step 5: Ping Tally ────────────────────────────
         try:
@@ -496,6 +530,63 @@ class TallySyncApp:
         connector.create_database_if_not_exists()
         connector.create_tables()
         return connector.get_engine()
+
+    def _load_automation_settings(self, engine):
+        """
+        Load TallySettings (exe path + image names) and AutomationSettings
+        (confidence, delays, timeouts) from DB into AppState.
+        Creates default rows if they don't exist yet.
+        """
+        from sqlalchemy.orm import sessionmaker
+        from database.models.tally_settings      import TallySettings
+        from database.models.automation_settings import AutomationSettings
+        from gui.state import AutomationConfig
+
+        Session = sessionmaker(bind=engine)
+        db      = Session()
+        try:
+            # ── TallySettings ─────────────────────────────
+            ts = db.query(TallySettings).filter_by(id=1).first()
+            if not ts:
+                ts = TallySettings(id=1)
+                db.add(ts)
+                db.commit()
+            self.state.tally_exe_path = ts.exe_path or ""
+
+            # Store full image map on state for Phase 2 TallyLauncher
+            self.state.tally_images = {
+                "gateway":      ts.image_gateway      or "tally_gateway_screen.png",
+                "search_box":   ts.image_search_box   or "tally_company_search_box.png",
+                "username":     ts.image_username     or "tally_username_field.png",
+                "password":     ts.image_password     or "tally_password_field.png",
+                "select_title": ts.image_select_title or "tally_select_company_title.png",
+                "change_path":  ts.image_change_path  or "tally_change_path_btn.png",
+                "remote_tab":   ts.image_remote_tab   or "tally_remote_tab.png",
+                "tds_field":    ts.image_tds_field    or "tally_tds_field.png",
+            }
+
+            # ── AutomationSettings ────────────────────────
+            aut = db.query(AutomationSettings).filter_by(id=1).first()
+            if not aut:
+                aut = AutomationSettings(id=1)
+                db.add(aut)
+                db.commit()
+
+            self.state.automation = AutomationConfig(
+                confidence       = float(aut.confidence       or 0.80),
+                click_delay_ms   = int(aut.click_delay_ms     or 500),
+                wait_timeout_sec = int(aut.wait_timeout_sec   or 30),
+                retry_attempts   = int(aut.retry_attempts     or 3),
+            )
+
+            from logging_config import logger
+            logger.info("[App] Automation settings loaded from DB")
+
+        except Exception as e:
+            from logging_config import logger
+            logger.error(f"[App] Failed to load automation settings: {e}")
+        finally:
+            db.close()
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Load companies (unchanged from original)
@@ -550,6 +641,12 @@ class TallySyncApp:
                     tally_host        = getattr(co, 'tally_host', 'localhost') or 'localhost',
                     tally_port        = int(getattr(co, 'tally_port', 9000) or 9000),
                     tally_open        = False,
+                    tally_username    = getattr(co, 'tally_username', '') or '',
+                    tally_password    = getattr(co, 'tally_password', '') or '',
+                    company_type      = getattr(co, 'company_type',  'local') or 'local',
+                    data_path         = getattr(co, 'data_path',     '') or '',
+                    tds_path          = getattr(co, 'tds_path',      '') or '',
+                    drive_letter      = getattr(co, 'drive_letter',  '') or '',
                 )
                 self.state.companies[name] = cs
         finally:
@@ -597,7 +694,10 @@ class TallySyncApp:
                 self.state.companies[name] = cs
 
     def save_company_to_db(self, company_name: str, guid: str,
-                           starting_from: str, books_from: str = None):
+                           starting_from: str, books_from: str = None,
+                           tally_username: str = "", tally_password: str = "",
+                           company_type: str = "local", data_path: str = "",
+                           tds_path: str = "", drive_letter: str = ""):
         from sqlalchemy.orm import sessionmaker
         from database.models.company import Company
 
@@ -610,15 +710,27 @@ class TallySyncApp:
         try:
             existing = db.query(Company).filter_by(name=company_name).first()
             if existing:
-                existing.guid          = guid
-                existing.starting_from = starting_from
+                existing.guid           = guid
+                existing.starting_from  = starting_from
+                existing.tally_username = tally_username
+                existing.tally_password = tally_password
+                existing.company_type   = company_type
+                existing.data_path      = data_path or None
+                existing.tds_path       = tds_path  or None
+                existing.drive_letter   = drive_letter or None
                 if books_from:
                     existing.books_from = books_from
             else:
                 co = Company(
-                    name          = company_name,
-                    guid          = guid,
-                    starting_from = starting_from,
+                    name           = company_name,
+                    guid           = guid,
+                    starting_from  = starting_from,
+                    tally_username = tally_username,
+                    tally_password = tally_password,
+                    company_type   = company_type,
+                    data_path      = data_path   or None,
+                    tds_path       = tds_path    or None,
+                    drive_letter   = drive_letter or None,
                 )
                 if books_from and hasattr(Company, 'books_from'):
                     co.books_from = books_from
@@ -704,6 +816,31 @@ class TallySyncApp:
         elif event == "scheduler_job_error":
             _, company_name, err = msg
             self.state.set_company_status(company_name, CompanyStatus.SYNC_ERROR)
+
+        # ── Phase 2: SyncQueueController messages ──────────────────────────
+        elif event == "sync_queue_done":
+            _, company_name, success = msg
+            self.state.emit("scheduler_updated", company=company_name)
+
+        elif event == "sync_queue_log":
+            _, company_name, text, level = msg
+            logs_page = self._frames.get("logs")
+            if logs_page and hasattr(logs_page, "append_log"):
+                logs_page.append_log(f"[{company_name}] {text}")
+
+        elif event == "sync_queue_progress":
+            _, company_name, pct, label = msg
+            self.state.set_company_progress(company_name, pct, label)
+
+        elif event == "sync_queue_started":
+            _, company_name = msg
+            self.state.set_company_status(company_name, CompanyStatus.SYNCING)
+
+        elif event == "queue_updated":
+            # Queue state changed — refresh home page company list
+            home = self._frames.get("home")
+            if home and hasattr(home, "refresh_companies"):
+                home.refresh_companies()
 
     def post(self, *args):
         self._q.put(args)
@@ -792,6 +929,13 @@ class TallySyncApp:
         if sched_ctrl and hasattr(sched_ctrl, 'shutdown'):
             try:
                 sched_ctrl.shutdown()
+            except Exception:
+                pass
+
+        sync_q_ctrl = getattr(self, '_sync_queue_controller', None)
+        if sync_q_ctrl and hasattr(sync_q_ctrl, 'shutdown'):
+            try:
+                sync_q_ctrl.shutdown()
             except Exception:
                 pass
 

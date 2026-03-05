@@ -50,6 +50,13 @@ class CompanyState:
     tally_host:        str                  = "localhost"
     tally_port:        int                  = 9000
     tally_open:        bool                 = False  # ← FIXED: was missing, caused pill to never show
+    tally_username:    str                  = ""
+    tally_password:    str                  = ""
+    # ── Per-company Tally data location (Phase 1) ─────────────────────────────
+    company_type:      str                  = "local"   # local | remote | tds
+    data_path:         str                  = ""        # C:\TallyData\CompanyA
+    tds_path:          str                  = ""        # 192.168.1.10
+    drive_letter:      str                  = ""        # Z:
     # runtime progress (not persisted)
     progress_pct:      float                = 0.0
     progress_label:    str                  = ""
@@ -116,6 +123,18 @@ class TallyConnectionState:
 
 
 # ─────────────────────────────────────────────
+#  Tally automation config (Phase 1)
+#  Loaded from DB → AppState.automation at startup
+# ─────────────────────────────────────────────
+@dataclass
+class AutomationConfig:
+    confidence:       float = 0.80
+    click_delay_ms:   int   = 500
+    wait_timeout_sec: int   = 30
+    retry_attempts:   int   = 3
+
+
+# ─────────────────────────────────────────────
 #  Central AppState
 # ─────────────────────────────────────────────
 class AppState:
@@ -158,6 +177,24 @@ class AppState:
         # Shape: {"host": str, "port": int}
         # Used by: TallyConnector default, per-company override falls back here
         self.tally_config: Optional[dict]       = None
+
+        # ── Phase 1: Tally exe path + automation settings ─────────────────
+        # tally_exe_path: full path to Tally.exe — loaded from tally_settings table
+        self.tally_exe_path: str                = ""
+        # automation: PyAutoGUI runtime controls — loaded from automation_settings table
+        self.automation: AutomationConfig       = AutomationConfig()
+        # tally_images: image filename map — loaded from tally_settings table
+        # Key = short name (e.g. "gateway"), value = filename in assets/ folder
+        self.tally_images: dict                 = {
+            "gateway":      "tally_gateway_screen.png",
+            "search_box":   "tally_company_search_box.png",
+            "username":     "tally_username_field.png",
+            "password":     "tally_password_field.png",
+            "select_title": "tally_select_company_title.png",
+            "change_path":  "tally_change_path_btn.png",
+            "remote_tab":   "tally_remote_tab.png",
+            "tds_field":    "tally_tds_field.png",
+        }
 
         # ── Active sync tracking ──────────────────────────
         self._sync_active:    bool              = False   # use property below
