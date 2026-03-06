@@ -36,6 +36,7 @@ from gui.styles import (
     NAV_ITEMS, APP_TITLE, APP_VERSION,
     BOOTSTRAP_THEME, STATUS_STYLE,
 )
+from gui.tray_manager import TrayManager
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +76,20 @@ class TallySyncApp:
         # Listen for sync_finished to detect post-snapshot completion
         self.state.on("sync_finished", self._on_sync_finished_app)
         self._snapshot_celebrated: set = set()
+
+        # ── Phase 1: System Tray ──────────────────────────────────────────────
+        # TrayManager intercepts ✖ close → hides to tray instead of quitting.
+        # If pystray is not installed, tray is silently skipped and ✖ closes
+        # the app normally (same as before).
+        self._syncs_paused = False
+        self._tray = TrayManager(
+            root             = self.root,
+            state            = self.state,
+            on_open          = self._show_window,
+            on_pause_toggle  = self._toggle_pause,
+            on_exit          = self._quit_app,
+        )
+        self._tray.start()
 
         # ── Start background startup sequence ─────────────────
         self._start_startup_sequence()
@@ -501,6 +516,30 @@ class TallySyncApp:
             logger.warning(f"[App] Could not start SyncQueueController: {e}")
             self._sync_queue_controller = None
 
+        # ── Step 5c: Notify GUI that scheduler is fully ready ─────────────────
+        # This fires AFTER scheduler + queue are both started so the scheduler
+        # page can wire up _sched_ctrl and show correct status + next_run times.
+        # Previously only "companies_loaded" was fired (before scheduler started)
+        # which caused the page to always show "Not running" on first open.
+        self._q.put(("scheduler_ready", None))
+
+        # ── Step 5b: Phase 2 — Check for missed syncs ────────────────────────
+        # Runs after both scheduler and queue are ready.
+        # Any company whose last_sync_time is older than its schedule interval
+        # gets enqueued immediately so it catches up on startup.
+        if self._sync_queue_controller:
+            try:
+                from gui.controllers.missed_sync_checker import MissedSyncChecker
+                checker = MissedSyncChecker(
+                    state                 = self.state,
+                    sync_queue_controller = self._sync_queue_controller,
+                    app_queue             = self._q,
+                )
+                checker.check_and_enqueue()
+            except Exception as e:
+                from logging_config import logger
+                logger.warning(f"[App] Missed sync check failed: {e}")
+
         # ── Step 5: Ping Tally ────────────────────────────
         try:
             from services.tally_connector import TallyConnector
@@ -786,6 +825,18 @@ class TallySyncApp:
             sched = self._frames.get("scheduler")
             if sched and hasattr(sched, "refresh_companies"):
                 sched.refresh_companies()
+            # Update tray tooltip with new company count
+            if hasattr(self, '_tray'):
+                self._tray.update_tooltip()
+
+        # ── Scheduler fully ready — fire AFTER scheduler + queue both started ──
+        # This is the correct moment to wire up the scheduler page because
+        # _sched_ctrl is now available. "companies_loaded" fires too early
+        # (before scheduler starts) which caused "Not running" on first open.
+        elif event == "scheduler_ready":
+            sched = self._frames.get("scheduler")
+            if sched and hasattr(sched, "on_scheduler_ready"):
+                sched.on_scheduler_ready()
 
         elif event == "error":
             _, msg_text = msg
@@ -841,9 +892,221 @@ class TallySyncApp:
             home = self._frames.get("home")
             if home and hasattr(home, "refresh_companies"):
                 home.refresh_companies()
+            # Also refresh queue status strip on scheduler page
+            sched = self._frames.get("scheduler")
+            if sched and hasattr(sched, "refresh_queue_status"):
+                sched.refresh_queue_status()
+
+        # ── Phase 2: Missed sync catch-up notification ─────────────────────────
+        elif event == "missed_syncs_found":
+            _, company_names = msg
+            self._show_missed_sync_banner(company_names)
+
+        # ── Phase 1 Fix 2: Round overrun notification ──────────────────────────
+        elif event == "sync_overrun_detected":
+            _, companies, elapsed_min, interval_min, suggested_min = msg
+            self._show_overrun_banner(companies, elapsed_min, interval_min, suggested_min)
 
     def post(self, *args):
         self._q.put(args)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Phase 2 — Missed sync notification banner
+    # ─────────────────────────────────────────────────────────────────────────
+    def _show_missed_sync_banner(self, company_names: list):
+        """
+        Show a non-blocking notification banner at the top of the main window
+        when missed syncs are detected on startup.
+
+        The banner auto-dismisses after 8 seconds or when the user clicks ✖.
+        It does NOT block the UI — it's a thin strip above the content area.
+
+        Example:
+            ⚠  2 scheduled syncs were missed while the app was closed —
+               running them now:  CompanyA, CompanyB          [✖ Dismiss]
+        """
+        if not company_names:
+            return
+
+        count     = len(company_names)
+        names_str = ",  ".join(company_names)
+        msg_text  = (
+            f"⚠  {count} scheduled sync{'s' if count > 1 else ''} missed while "
+            f"app was closed — running now:  {names_str}"
+        )
+
+        from gui.styles import Color, Font, Spacing
+        import tkinter as tk
+
+        # Banner frame — insert above content_frame
+        banner = tk.Frame(
+            self.main_frame,
+            bg     = Color.WARNING_BG,
+            relief = "flat",
+            bd     = 0,
+        )
+        # Place it between header (row 0) and content (row 1)
+        # by temporarily re-gridding content_frame to row 2
+        self.content_frame.grid(row=2, column=0, sticky="nsew")
+        self.main_frame.rowconfigure(1, weight=0)
+        self.main_frame.rowconfigure(2, weight=1)
+        banner.grid(row=1, column=0, sticky="ew")
+
+        # Separator line at top
+        tk.Frame(banner, bg=Color.WARNING_FG, height=1).pack(fill="x")
+
+        inner = tk.Frame(banner, bg=Color.WARNING_BG, padx=Spacing.LG, pady=Spacing.SM)
+        inner.pack(fill="x")
+        inner.columnconfigure(0, weight=1)
+
+        tk.Label(
+            inner,
+            text      = msg_text,
+            font      = Font.BODY_SM,
+            bg        = Color.WARNING_BG,
+            fg        = Color.WARNING_FG,
+            anchor    = "w",
+            wraplength= 800,
+            justify   = "left",
+        ).grid(row=0, column=0, sticky="w")
+
+        def _dismiss():
+            try:
+                banner.destroy()
+                # Restore content_frame to row 1
+                self.content_frame.grid(row=1, column=0, sticky="nsew")
+                self.main_frame.rowconfigure(1, weight=1)
+                self.main_frame.rowconfigure(2, weight=0)
+            except Exception:
+                pass
+
+        tk.Button(
+            inner,
+            text    = "✖  Dismiss",
+            font    = Font.BODY_SM,
+            bg      = Color.WARNING_BG,
+            fg      = Color.WARNING_FG,
+            relief  = "flat",
+            bd      = 0,
+            cursor  = "hand2",
+            command = _dismiss,
+        ).grid(row=0, column=1, sticky="e", padx=(Spacing.LG, 0))
+
+        # Separator line at bottom
+        tk.Frame(banner, bg=Color.BORDER, height=1).pack(fill="x")
+
+        # Auto-dismiss after 8 seconds
+        self.root.after(8000, _dismiss)
+
+        from logging_config import logger
+        logger.info(f"[App] Missed sync banner shown for: {company_names}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Phase 1 Fix 2 — Overrun notification banner
+    # ─────────────────────────────────────────────────────────────────────────
+    def _show_overrun_banner(
+        self,
+        companies:    list,
+        elapsed_min:  float,
+        interval_min: float,
+        suggested_min: int,
+    ):
+        """
+        Shown when a sync round takes longer than the scheduled interval.
+
+        Example:
+          ⚠  Sync round took 75 min but interval is 60 min (overrun: 15 min).
+             Consider increasing your interval to at least 90 min.
+                                                        [Go to Scheduler] [✖]
+        Auto-dismisses after 12 seconds. Clicking "Go to Scheduler" navigates
+        to the scheduler page so the user can fix their interval.
+        """
+        import tkinter as tk
+        from gui.styles import Color, Font, Spacing
+
+        overrun_min = elapsed_min - interval_min
+        msg_text = (
+            f"⚠  Sync round took {elapsed_min:.0f} min "
+            f"but interval is {interval_min:.0f} min "
+            f"(overrun: {overrun_min:.0f} min).  "
+            f"Consider increasing your interval to at least {suggested_min} min."
+        )
+
+        banner = tk.Frame(
+            self.main_frame,
+            bg     = Color.WARNING_BG,
+            relief = "flat",
+            bd     = 0,
+        )
+        self.content_frame.grid(row=2, column=0, sticky="nsew")
+        self.main_frame.rowconfigure(1, weight=0)
+        self.main_frame.rowconfigure(2, weight=1)
+        banner.grid(row=1, column=0, sticky="ew")
+
+        tk.Frame(banner, bg=Color.WARNING_FG, height=1).pack(fill="x")
+
+        inner = tk.Frame(banner, bg=Color.WARNING_BG, padx=Spacing.LG, pady=Spacing.SM)
+        inner.pack(fill="x")
+        inner.columnconfigure(0, weight=1)
+
+        tk.Label(
+            inner,
+            text       = msg_text,
+            font       = Font.BODY_SM,
+            bg         = Color.WARNING_BG,
+            fg         = Color.WARNING_FG,
+            anchor     = "w",
+            wraplength = 750,
+            justify    = "left",
+        ).grid(row=0, column=0, sticky="w")
+
+        btn_frame = tk.Frame(inner, bg=Color.WARNING_BG)
+        btn_frame.grid(row=0, column=1, sticky="e", padx=(Spacing.LG, 0))
+
+        def _dismiss():
+            try:
+                banner.destroy()
+                self.content_frame.grid(row=1, column=0, sticky="nsew")
+                self.main_frame.rowconfigure(1, weight=1)
+                self.main_frame.rowconfigure(2, weight=0)
+            except Exception:
+                pass
+
+        tk.Button(
+            btn_frame,
+            text    = "⚙ Fix Schedule",
+            font    = Font.BODY_SM,
+            bg      = Color.WARNING_FG,
+            fg      = Color.BG_CARD,
+            relief  = "flat",
+            bd      = 0,
+            padx    = 8,
+            cursor  = "hand2",
+            command = lambda: [_dismiss(), self.navigate("scheduler")],
+        ).pack(side="left", padx=(0, Spacing.SM))
+
+        tk.Button(
+            btn_frame,
+            text    = "✖",
+            font    = Font.BODY_SM,
+            bg      = Color.WARNING_BG,
+            fg      = Color.WARNING_FG,
+            relief  = "flat",
+            bd      = 0,
+            cursor  = "hand2",
+            command = _dismiss,
+        ).pack(side="left")
+
+        tk.Frame(banner, bg=Color.BORDER, height=1).pack(fill="x")
+
+        # Auto-dismiss after 12 seconds (longer than missed sync — more important)
+        self.root.after(12_000, _dismiss)
+
+        from logging_config import logger
+        logger.info(
+            f"[App] Overrun banner shown — "
+            f"{elapsed_min:.0f}min round vs {interval_min:.0f}min interval"
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Post-snapshot celebration
@@ -915,16 +1178,47 @@ class TallySyncApp:
             self._config.mark_setup_complete()
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Shutdown
+    #  Phase 1 — Tray helpers
     # ─────────────────────────────────────────────────────────────────────────
-    def _on_close(self):
-        if self.state.sync_active:
-            if not messagebox.askyesno(
-                "Sync in Progress",
-                "A sync is currently running.\n\nAre you sure you want to quit?",
-            ):
-                return
+    def _show_window(self):
+        """Bring the main window back from the tray."""
+        self._tray.show_window()
 
+    def _toggle_pause(self) -> bool:
+        """
+        Pause or resume all scheduled syncs.
+        Returns new paused state (True = paused).
+        Called from tray menu — runs on main thread via root.after().
+        """
+        self._syncs_paused = not self._syncs_paused
+
+        sched = getattr(self, '_scheduler_controller', None)
+        if sched:
+            try:
+                if self._syncs_paused:
+                    sched.pause_all()
+                else:
+                    sched.resume_all()
+            except Exception:
+                pass
+
+        status = "paused" if self._syncs_paused else "resumed"
+        from logging_config import logger
+        logger.info(f"[App] Scheduled syncs {status} via tray")
+
+        # Refresh tray tooltip
+        self._tray.update_tooltip()
+        return self._syncs_paused
+
+    def _quit_app(self):
+        """
+        Truly exit — called from tray 'Exit TallySync' menu item.
+        Shuts down scheduler + queue then destroys the window.
+        """
+        self._do_shutdown()
+
+    def _do_shutdown(self):
+        """Shared shutdown logic used by both tray exit and direct close."""
         sched_ctrl = getattr(self, '_scheduler_controller', None)
         if sched_ctrl and hasattr(sched_ctrl, 'shutdown'):
             try:
@@ -939,7 +1233,42 @@ class TallySyncApp:
             except Exception:
                 pass
 
+        self._tray.stop()
         self.root.destroy()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Shutdown — ✖ button now hides to tray instead of closing
+    # ─────────────────────────────────────────────────────────────────────────
+    def _on_close(self):
+        """
+        Called when user clicks ✖ on the main window.
+
+        Phase 1 behaviour:
+          - If tray is available → hide window, keep running in tray
+          - If tray is NOT available (pystray not installed) → ask and quit
+        """
+        if not self._tray.available:
+            # No tray — fall back to original close behaviour
+            if self.state.sync_active:
+                if not messagebox.askyesno(
+                    "Sync in Progress",
+                    "A sync is currently running.\n\nAre you sure you want to quit?",
+                ):
+                    return
+            self._do_shutdown()
+            return
+
+        # Tray is available — check if sync is active first
+        if self.state.sync_active:
+            if not messagebox.askyesno(
+                "Sync in Progress",
+                "A sync is currently running.\n\n"
+                "Hide to tray and let it finish in the background?",
+            ):
+                return
+
+        # Hide to tray — scheduler and queue keep running
+        self._tray.hide_to_tray()
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Entry point

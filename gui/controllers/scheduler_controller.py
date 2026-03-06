@@ -213,19 +213,31 @@ class SchedulerController:
             self._scheduler = BackgroundScheduler(
                 jobstores    = jobstores if jobstores else None,
                 job_defaults = {
-                    # coalesce=True: if 10 runs were missed while app was closed,
-                    # fire only ONE catch-up run — not all 10 at once.
-                    "coalesce":           True,
+                    # coalesce=True: if multiple runs were missed while app was closed,
+                    # fire only ONE catch-up run — not all of them at once.
+                    "coalesce":      True,
 
                     # max_instances=1: never run same company twice at same time.
-                    "max_instances":      1,
+                    "max_instances": 1,
 
-                    # misfire_grace_time: how old a missed job can be and still fire.
-                    # Every-1-minute schedule + app closed for 2 hours = 120 missed.
-                    # With coalesce=True only 1 fires, but we still want a short window.
-                    # 60 seconds = only fire if missed by less than 1 minute.
-                    # This prevents a stale catch-up sync firing hours later.
-                    "misfire_grace_time": 60,
+                    # ── misfire_grace_time = 1 second ────────────────────────
+                    # MissedSyncChecker is the SOLE owner of catch-up logic.
+                    # We do NOT want APScheduler to also fire a catch-up run
+                    # when the app reopens after being closed — that would cause
+                    # the same company to be enqueued twice:
+                    #   1. APScheduler fires coalesced missed job  (unwanted)
+                    #   2. MissedSyncChecker enqueues it           (correct)
+                    #
+                    # Setting misfire_grace_time=1 means: if a job was missed
+                    # by more than 1 second, APScheduler discards it silently
+                    # and just recalculates next_run from now + interval.
+                    # MissedSyncChecker then handles the one catch-up run.
+                    #
+                    # Result: app closed 10 min, every-1-min job →
+                    #   APScheduler: skips all 10 missed runs ✓
+                    #   MissedSyncChecker: enqueues exactly 1 catch-up ✓
+                    #   Next APScheduler run: now + 1 min (clean schedule) ✓
+                    "misfire_grace_time": 1,
                 },
                 timezone="Asia/Kolkata",
             )
@@ -379,30 +391,35 @@ class SchedulerController:
     # ─────────────────────────────────────────────────────────────────────────
     #  Sync all enabled jobs on startup
     # ─────────────────────────────────────────────────────────────────────────
+
+    # Gap between companies that share the same interval — prevents all 6
+    # jobs firing at the exact same millisecond and piling into the queue.
+    STAGGER_SECONDS = 10
+
     def _sync_all_jobs(self):
         """
         Load scheduler config from DB, then register APScheduler jobs.
 
-        STARTUP SAFETY:
-          When the app reopens after being closed, we DO NOT want jobs
-          to fire immediately. Example:
-            - App closed at 10:00, every-1-minute job was last run at 09:59
-            - App reopens at 11:30
-            - Without protection: job fires instantly at 11:30:00 → Tally
-              gets hit before the app has finished loading
-            - With startup_delay=30s: first run is 11:30:30 → app is ready
+        AUTO-STAGGER:
+          Companies that share the same interval key are spread out by
+          STAGGER_SECONDS (10s) each so they never all fire simultaneously.
 
-          We force every job's next_run_time to be:
-            now + startup_delay (30 seconds)
-          by passing jitter or by rescheduling with add_date_job.
-          The simplest reliable way: call add_or_update_job() which always
-          creates a fresh IntervalTrigger — APScheduler starts counting
-          from NOW, so first fire is interval_seconds from now.
-          For every-1-minute: first run = now + 60s. Safe.
+          Example — 6 companies, all "every 1 hour":
+            CompanyA  → start_date = base + 0s   → fires at 10:00:00
+            CompanyB  → start_date = base + 10s  → fires at 10:00:10
+            CompanyC  → start_date = base + 20s  → fires at 10:00:20
+            CompanyD  → start_date = base + 30s  → fires at 10:00:30
+            CompanyE  → start_date = base + 40s  → fires at 10:00:40
+            CompanyF  → start_date = base + 50s  → fires at 10:00:50
 
-        ORDER MATTERS:
-          1. load_scheduler_config() reads DB → sets schedule_enabled etc.
-          2. Then add_or_update_job() — otherwise schedule_enabled=False for all.
+          After the first fire, each company repeats on its own independent
+          interval — so they stay staggered every hour automatically.
+
+          Companies with DIFFERENT intervals are NOT staggered against each
+          other — only companies sharing the exact same interval key.
+
+          Daily (CronTrigger) jobs are not staggered — APScheduler fires
+          them at the configured wall-clock time and they don't pile up.
         """
         try:
             from gui.controllers.company_controller import CompanyController
@@ -412,59 +429,140 @@ class SchedulerController:
         except Exception as e:
             logger.error(f"[Scheduler] Failed to load scheduler config from DB: {e}")
 
-        registered = 0
-        for name, co in self._state.companies.items():
-            if co.schedule_enabled:
-                self._add_job_with_startup_delay(name, co)
-                registered += 1
+        # ── Group enabled companies by their interval key ─────────────────────
+        # interval key = (interval_type, value)  e.g. ("hourly", 1) or ("minutes", 5)
+        # Daily jobs are excluded from stagger — handled by CronTrigger directly.
+        import collections
+        interval_groups: dict = collections.defaultdict(list)
 
-        logger.info(f"[Scheduler] Registered {registered} job(s). "
-                    f"First run in ~{self.STARTUP_DELAY_SECONDS}s (startup delay).")
+        enabled_companies = [
+            (name, co)
+            for name, co in self._state.companies.items()
+            if co.schedule_enabled
+        ]
+
+        for name, co in enabled_companies:
+            if co.schedule_interval == "daily":
+                # Daily: no stagger needed — register immediately
+                self.add_or_update_job(name)
+            else:
+                key = (co.schedule_interval, co.schedule_value)
+                interval_groups[key].append((name, co))
+
+        # ── Register interval jobs with stagger ───────────────────────────────
+        total_registered = 0
+        for interval_key, group in interval_groups.items():
+            group_sorted = sorted(group, key=lambda x: x[0].lower())  # alphabetical
+
+            for position, (name, co) in enumerate(group_sorted):
+                stagger_offset = position * self.STAGGER_SECONDS
+                self._add_job_with_startup_delay(name, co, stagger_offset)
+                total_registered += 1
+
+                if len(group_sorted) > 1:
+                    logger.info(
+                        f"[Scheduler] '{name}' stagger offset: +{stagger_offset}s "
+                        f"(position {position + 1}/{len(group_sorted)} "
+                        f"in group {interval_key})"
+                    )
+
+        # Count daily jobs too
+        daily_count = sum(
+            1 for _, co in enabled_companies
+            if co.schedule_interval == "daily"
+        )
+        total_registered += daily_count
+
+        logger.info(
+            f"[Scheduler] Registered {total_registered} job(s) "
+            f"({len(interval_groups)} interval group(s), "
+            f"{daily_count} daily). "
+            f"Stagger: {self.STAGGER_SECONDS}s between companies "
+            f"sharing the same interval."
+        )
 
     # Delay before first job fires after app opens — gives app time to fully load
     STARTUP_DELAY_SECONDS = 30
 
-    def _add_job_with_startup_delay(self, company_name: str, co):
+    def _add_job_with_startup_delay(self, company_name: str, co,
+                                     stagger_offset: int = 0):
         """
-        Register job so it fires (interval) seconds AFTER the startup delay.
-        This means:
-          - Every-1-min job  → first fire at app_open + 30s + 60s  = 90s
-          - Every-1-hour job → first fire at app_open + 30s + 3600s = ~1hr
-        After the first fire, normal interval continues.
+        Register job so next_run_time is calculated correctly after restart.
 
-        Why not just add_or_update_job()?
-          add_or_update_job uses IntervalTrigger which starts from NOW.
-          For a 1-minute interval that is fine — first fire is 60s away.
-          But for a daily CronTrigger, APScheduler calculates the next
-          matching wall-clock time (e.g. 09:00 tomorrow) which is correct.
-          So we only need special handling for interval-type jobs where
-          the missed catch-up could fire too soon.
+        stagger_offset: extra seconds added on top of startup delay so
+          companies sharing the same interval fire at different times.
+          E.g. position 0 → +0s, position 1 → +10s, position 2 → +20s ...
+
+        Respects last_sync_time:
+          1. If last_sync_time exists → compute ideal_next = last_sync + interval
+          2. If ideal_next is in future → use it + stagger_offset
+          3. If ideal_next is in past (missed) → use now + startup_delay + stagger_offset
+             MissedSyncChecker handles the one catch-up run independently.
         """
         if not HAS_APSCHEDULER or not self._scheduler:
             return
 
+        import datetime as _dt
+        from apscheduler.triggers.interval import IntervalTrigger as _IT
+        from apscheduler.triggers.cron     import CronTrigger     as _CT
+
         job_id  = _slug(company_name)
+        now     = _dt.datetime.now()
         trigger = self._build_trigger(co)
 
-        # For CronTrigger (daily): APScheduler always fires at the correct
-        # wall-clock time — no catch-up risk. Register normally.
-        from apscheduler.triggers.cron import CronTrigger as _CT
+        # ── Daily (CronTrigger): no stagger needed ────────────────────────────
         if isinstance(trigger, _CT):
             self.add_or_update_job(company_name)
             return
 
-        # For IntervalTrigger (minutes/hourly): add a one-time startup delay.
-        # We do this by setting start_date = now + startup_delay on the trigger.
-        import datetime as _dt
-        from apscheduler.triggers.interval import IntervalTrigger as _IT
-
-        # Rebuild trigger with start_date so first fire is delayed
+        # ── Interval-based (minutes / hourly) ────────────────────────────────
         if co.schedule_interval == "minutes":
             interval_seconds = max(1, co.schedule_value) * 60
         else:  # hourly
             interval_seconds = max(1, co.schedule_value) * 3600
 
-        start_date = _dt.datetime.now() + _dt.timedelta(seconds=self.STARTUP_DELAY_SECONDS)
+        interval_delta = _dt.timedelta(seconds=interval_seconds)
+
+        # Compute ideal next_run from last_sync_time
+        last_sync  = getattr(co, 'last_sync_time', None)
+        ideal_next = None
+
+        if last_sync:
+            if hasattr(last_sync, 'tzinfo') and last_sync.tzinfo is not None:
+                last_sync = last_sync.replace(tzinfo=None)
+            ideal_next = last_sync + interval_delta
+
+        # Minimum start = now + startup_delay + stagger_offset
+        min_start = now + _dt.timedelta(
+            seconds = self.STARTUP_DELAY_SECONDS + stagger_offset
+        )
+
+        if ideal_next and ideal_next > min_start:
+            # Future next run — preserve it, but still add stagger offset
+            # so companies in the same group don't all fire at the exact
+            # same wall-clock time even when their last_sync times were similar.
+            start_date = ideal_next + _dt.timedelta(seconds=stagger_offset)
+            logger.info(
+                f"[Scheduler] '{company_name}' — next run preserved "
+                f"(+{stagger_offset}s stagger): "
+                f"{start_date.strftime('%d %b %Y %H:%M:%S')}"
+            )
+        else:
+            # Missed or no last_sync — use startup delay + stagger
+            start_date = min_start
+            if ideal_next:
+                logger.info(
+                    f"[Scheduler] '{company_name}' — missed, "
+                    f"next run: {start_date.strftime('%H:%M:%S')} "
+                    f"(+{stagger_offset}s stagger)"
+                )
+            else:
+                logger.info(
+                    f"[Scheduler] '{company_name}' — no last sync, "
+                    f"first run: {start_date.strftime('%H:%M:%S')} "
+                    f"(+{stagger_offset}s stagger)"
+                )
+
         delayed_trigger = _IT(
             seconds    = interval_seconds,
             start_date = start_date,
@@ -482,7 +580,9 @@ class SchedulerController:
                 )
                 logger.info(
                     f"[Scheduler] Job '{company_name}' registered — "
-                    f"first run in {self.STARTUP_DELAY_SECONDS + interval_seconds}s"
+                    f"start_date: {start_date.strftime('%d %b %Y %H:%M:%S')}"
                 )
             except Exception as e:
-                logger.error(f"[Scheduler] Failed to register job for '{company_name}': {e}")
+                logger.error(
+                    f"[Scheduler] Failed to register job for '{company_name}': {e}"
+                )
