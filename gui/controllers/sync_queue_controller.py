@@ -532,10 +532,34 @@ class SyncQueueController:
             def _delayed_retry(name=company_name):
                 time.sleep(RETRY_DELAY_SEC)
                 logger.info(f"[SyncQueue] Re-enqueuing '{name}' after retry delay")
-                # Direct queue inject — bypasses Round Gate (intentional for retries)
+
                 with self._lock:
-                    if name not in self.queued_companies and name != self.current_company:
-                        self.queued_companies.append(name)
+                    # Guard: skip if already running or already waiting
+                    if name == self.current_company or name in self.queued_companies:
+                        logger.warning(
+                            f"[SyncQueue] Retry for '{name}' skipped — "
+                            f"already in queue or running"
+                        )
+                        return
+
+                    # Re-activate round gate if it closed during the 60s delay.
+                    # This can happen when all other companies finished while
+                    # this company was waiting to retry — the round gate reset
+                    # to False. We reactivate it so the scheduler can't
+                    # accidentally add a duplicate during the retry.
+                    if not self._round_active:
+                        self._round_active   = True
+                        self._round_start    = time.time()
+                        self._round_company_list = []
+                        logger.info(
+                            f"[SyncQueue] Round gate re-activated for retry: '{name}'"
+                        )
+
+                    # Ensure company is tracked in round_companies
+                    # so Rule 1 Check 3 blocks any scheduler duplicate
+                    self._round_companies.add(name)
+                    self.queued_companies.append(name)
+
                 self._queue.put(name)
                 self._app_q.put(("queue_updated", None))
 

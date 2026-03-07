@@ -347,6 +347,37 @@ class CompanyCard(tk.Frame):
         if self._meta_lbl:
             self._meta_lbl.configure(text=f"Last sync: {self._fmt_sync_time(dt)}")
 
+    def update_queue_state(self, current_company: str, queued: list):
+        """
+        Update the card's meta label to show live queue position.
+        Called from home_page on every 'queue_updated' event.
+
+        Shows:
+          • "⟳ Syncing now..."   — if this company is currently running
+          • "⏳ Queue position N" — if this company is waiting
+          • Restores last_sync_time display when queue is idle
+        """
+        if not self._meta_lbl:
+            return
+        name = self.company.name
+        if name == current_company:
+            self._meta_lbl.configure(
+                text="⟳ Syncing now...",
+                fg=Color.PRIMARY,
+            )
+        elif name in queued:
+            pos = queued.index(name) + 1
+            self._meta_lbl.configure(
+                text=f"⏳ Queue position {pos}",
+                fg=Color.INFO_FG,
+            )
+        else:
+            # Not in queue — restore normal last_sync_time display
+            self._meta_lbl.configure(
+                text=f"Last sync: {self._fmt_sync_time(self.company.last_sync_time)}",
+                fg=Color.TEXT_SECONDARY,
+            )
+
     def set_selected(self, value: bool):
         # NOT_CONFIGURED companies are never selectable — skip silently
         if self.company.status == "Not Configured":

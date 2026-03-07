@@ -326,6 +326,37 @@ class SchedulerController:
         except Exception:
             pass
 
+    def pause_all(self):
+        """
+        Pause ALL scheduled jobs at once.
+        Called from tray menu → app.py._toggle_pause() → here.
+        Uses APScheduler's scheduler-level pause (not per-job).
+        All jobs stay registered — they just won't fire until resume_all().
+        """
+        if not self._scheduler:
+            logger.warning("[Scheduler] pause_all() called but scheduler not running")
+            return
+        try:
+            self._scheduler.pause()
+            logger.info("[Scheduler] All jobs paused ✓")
+        except Exception as e:
+            logger.error(f"[Scheduler] pause_all() failed: {e}")
+
+    def resume_all(self):
+        """
+        Resume ALL scheduled jobs at once.
+        Called from tray menu → app.py._toggle_pause() → here.
+        Jobs fire again on their normal schedule from this point forward.
+        """
+        if not self._scheduler:
+            logger.warning("[Scheduler] resume_all() called but scheduler not running")
+            return
+        try:
+            self._scheduler.resume()
+            logger.info("[Scheduler] All jobs resumed ✓")
+        except Exception as e:
+            logger.error(f"[Scheduler] resume_all() failed: {e}")
+
     def get_next_run(self, company_name: str) -> Optional[datetime]:
         if not self._scheduler:
             return None

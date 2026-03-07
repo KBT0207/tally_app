@@ -418,8 +418,7 @@ class TallyLauncher:
                 win.restore()
                 time.sleep(0.5)
             win.activate()
-            time.sleep(0.8)
-            time.sleep(0.5)
+            time.sleep(0.8)   # single settle time — removed duplicate 0.5s (was 1.3s total)
             return True, "focused"
         except Exception as e:
             return False, str(e)
@@ -518,17 +517,32 @@ class TallyLauncher:
         """Convert to str and type. char_interval kept for compatibility."""
         self._paste_text(text)
 
+    def _automation(self):
+        """
+        Safe accessor for state.automation.
+        Returns the AutomationConfig object if it exists, or None.
+        state.automation may be None if DB load failed on startup
+        (e.g. first-run with no DB, or DB connection error) — all callers
+        must use this instead of accessing state.automation directly to avoid
+        AttributeError crashes during Tally launch.
+        """
+        return getattr(self._state, 'automation', None)
+
     def _confidence(self) -> float:
-        return float(getattr(self._state.automation, 'confidence', 0.80))
+        aut = self._automation()
+        return float(getattr(aut, 'confidence', 0.80)) if aut else 0.80
 
     def _click_delay(self) -> float:
-        return float(getattr(self._state.automation, 'click_delay_ms', 500)) / 1000.0
+        aut = self._automation()
+        return float(getattr(aut, 'click_delay_ms', 500)) / 1000.0 if aut else 0.5
 
     def _timeout(self) -> int:
-        return int(getattr(self._state.automation, 'wait_timeout_sec', 30))
+        aut = self._automation()
+        return int(getattr(aut, 'wait_timeout_sec', 30)) if aut else 30
 
     def _retry_count(self) -> int:
-        return int(getattr(self._state.automation, 'retry_attempts', 3))
+        aut = self._automation()
+        return int(getattr(aut, 'retry_attempts', 3)) if aut else 3
 
     def _img(self, key: str) -> str:
         images = getattr(self._state, 'tally_images', {})

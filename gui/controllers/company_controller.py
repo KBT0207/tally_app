@@ -163,40 +163,71 @@ class CompanyController:
     @staticmethod
     def next_run_label(
         co: CompanyState,
-        scheduler_controller=None,   # pass SchedulerController instance if available
+        scheduler_controller=None,    # pass SchedulerController instance if available
+        sync_queue_controller=None,   # pass SyncQueueController instance if available
     ) -> str:
         """
         Return a human-readable 'Next run: ...' string for the scheduler UI.
 
-        Phase 2: If scheduler_controller is provided, reads the TRUE next_run_time
-        from the live APScheduler job. This is accurate because APScheduler tracks
-        the actual scheduled fire time, not just "now + interval".
+        Round-aware (Phase 2 + Queue fix):
+          If a round is currently active AND this company is in it —
+          either running now, waiting, or already done this round —
+          show a contextual status instead of the APScheduler next_run_time.
+          This prevents showing a stale "10:45" when the company is actually
+          mid-round or already finished its round slot.
 
-        Falls back to an estimated computed time if:
-          - scheduler_controller is None (APScheduler not running)
-          - job not found (company not scheduled yet)
+          Priority order:
+            1. Company is running right now       → "⟳ Syncing now..."
+            2. Company is waiting in queue        → "⏳ Queued — position N"
+            3. Company already ran this round     → "✓ Synced this round"
+            4. APScheduler next_run_time          → "15 Mar 2026  10:45"
+            5. Estimated fallback                 → "15 Mar 2026  10:45 (est.)"
         """
         if not co.schedule_enabled:
             return "—"
+
+        # ── Round-aware status (highest priority) ─────────────────────────────
+        if sync_queue_controller is not None:
+            try:
+                current = sync_queue_controller.current_company
+                waiting = list(sync_queue_controller.queued_companies)
+                round_active = sync_queue_controller.round_active
+                round_cos    = sync_queue_controller.round_companies
+
+                # Currently syncing right now
+                if co.name == current:
+                    return "⟳ Syncing now..."
+
+                # Waiting in queue — show position
+                if co.name in waiting:
+                    pos = waiting.index(co.name) + 1
+                    return f"⏳ Queued — position {pos}"
+
+                # Already ran this round — round not done yet
+                if round_active and co.name in round_cos:
+                    return "✓ Synced this round"
+
+            except Exception as e:
+                logger.debug(
+                    f"[CompanyController] Could not read queue state: {e}"
+                )
 
         # ── Primary: read from live APScheduler job ───────────────────────────
         if scheduler_controller is not None:
             try:
                 next_run = scheduler_controller.get_next_run(co.name)
                 if next_run is not None:
-                    # APScheduler returns timezone-aware datetime — convert to local naive
                     try:
-                        # Strip timezone for display
                         next_local = next_run.replace(tzinfo=None)
                     except Exception:
                         next_local = next_run
                     return next_local.strftime("%d %b %Y  %H:%M")
             except Exception as e:
-                logger.debug(f"[CompanyController] Could not get next_run from scheduler: {e}")
+                logger.debug(
+                    f"[CompanyController] Could not get next_run from scheduler: {e}"
+                )
 
         # ── Fallback: estimate from current time + interval ───────────────────
-        # Used when APScheduler is unavailable (no APScheduler installed,
-        # scheduler not started yet, or job not yet registered)
         return CompanyController._estimate_next_run(co)
 
     @staticmethod

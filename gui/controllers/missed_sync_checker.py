@@ -105,14 +105,23 @@ class MissedSyncChecker:
                 )
                 continue
 
-            # ── Skip if already running or already in queue ───────────────
-            # This is the final guard against double-enqueue in case
-            # something else (e.g. APScheduler) already picked it up.
+            # ── Skip if already running, queued, or in active round ───────
+            # Three-state guard — mirrors the same checks in enqueue().
+            # Even though MissedSyncChecker now runs BEFORE the scheduler
+            # starts (correct startup order), this guard stays as a safety
+            # net in case the order ever changes or a retry is in progress.
             if name == self._queue.current_company:
                 logger.debug(f"[MissedSync] '{name}' already syncing — skipping")
                 continue
             if name in self._queue.queued_companies:
                 logger.debug(f"[MissedSync] '{name}' already in queue — skipping")
+                continue
+            # New: check Round Gate — if a round is active and this company
+            # already ran (e.g. a retry fired it), don't double-enqueue.
+            if self._queue.round_active and name in self._queue.round_companies:
+                logger.debug(
+                    f"[MissedSync] '{name}' already in active round — skipping"
+                )
                 continue
 
             # ── Check if this company was missed ─────────────────────────

@@ -55,7 +55,8 @@ class ScheduleRow(tk.Frame):
         controller,          # SchedulerController
         co_ctrl,             # CompanyController
         on_run_now,          # callback(name)
-        state:      AppState = None,   # NEW — live state reference
+        state:      AppState = None,   # live state reference
+        app         = None,            # TallySyncApp — for sync_queue_controller access
         **kwargs,
     ):
         super().__init__(parent, bg=Color.BG_CARD, **kwargs)
@@ -64,6 +65,7 @@ class ScheduleRow(tk.Frame):
         self._sched_ctrl = controller
         self._co_ctrl    = co_ctrl
         self._on_run_now = on_run_now
+        self._page_app   = app            # used by _meta_text for round-aware label
         self._editing    = False
         self._build()
 
@@ -472,12 +474,26 @@ class ScheduleRow(tk.Frame):
             elif co.schedule_interval == "daily":
                 parts.append(f"Daily at {co.schedule_time}")
 
-            # ── FIX 3: Next run — strip timezone before strftime ─────────────
-            # APScheduler returns timezone-aware datetimes (e.g. Asia/Kolkata).
-            # Calling .strftime() directly on a tz-aware datetime can silently
-            # shift the displayed time on some systems.
-            # Fix: always convert to local naive datetime before formatting.
-            if self._sched_ctrl:
+            # Get sync_queue_controller for round-aware status display
+            sync_q = getattr(self._page_app, '_sync_queue_controller', None) \
+                     if hasattr(self, '_page_app') else None
+
+            # ── Round-aware next run label ────────────────────────────────
+            # If a round is active, show live queue status instead of
+            # APScheduler next_run_time (which would be stale/misleading).
+            from gui.controllers.company_controller import CompanyController
+            round_label = CompanyController.next_run_label(
+                co,
+                scheduler_controller  = self._sched_ctrl,
+                sync_queue_controller = sync_q,
+            )
+
+            # If round_label is a live status (Syncing/Queued/Done this round)
+            # show it directly. Otherwise show with APScheduler countdown.
+            live_statuses = ("⟳ Syncing now...", "⏳ Queued", "✓ Synced this round")
+            if any(round_label.startswith(s) for s in live_statuses):
+                parts.append(round_label)
+            elif self._sched_ctrl:
                 nrt = self._sched_ctrl.get_next_run(co.name)
                 if nrt:
                     try:
@@ -490,11 +506,9 @@ class ScheduleRow(tk.Frame):
                         f"  ({countdown})"
                     )
                 else:
-                    from gui.controllers.company_controller import CompanyController
-                    parts.append(f"Next run: {CompanyController.next_run_label(co)}")
+                    parts.append(f"Next run: {round_label}")
             else:
-                # Scheduler not wired yet — show estimated time so row isn't blank
-                from gui.controllers.company_controller import CompanyController
+                # Scheduler not wired yet — show estimated time
                 est = CompanyController._estimate_next_run(co)
                 if est != "—":
                     parts.append(f"Next run: ~{est} (est.)")
@@ -728,6 +742,7 @@ class SchedulerPage(tk.Frame):
                 co_ctrl     = self._co_ctrl,
                 on_run_now  = self._on_run_now,
                 state       = self.state,
+                app         = self.app,
             )
             bg = Color.BG_TABLE_ODD if i % 2 == 0 else Color.BG_TABLE_EVEN
             row.configure(bg=bg)
@@ -825,6 +840,19 @@ class SchedulerPage(tk.Frame):
                     f"Position:       {pos} of {total}\n"
                     f"Estimated wait: ~{wait_min} min\n\n"
                     "Check the Logs page for progress.",
+                )
+                return
+
+            # ── Check if already ran this round (Round Gate) ──────────────
+            # If round is active and this company already ran, enqueue()
+            # would silently skip it — show a clear message instead.
+            if sync_q.round_active and company_name in sync_q.round_companies:
+                messagebox.showinfo(
+                    "Already Synced This Round",
+                    f"'{company_name}' has already synced in the current round.\n\n"
+                    f"The round is still in progress for other companies.\n"
+                    f"It will be available again when the round completes.\n\n"
+                    "Check the Logs page to see which companies are running.",
                 )
                 return
 
@@ -1030,13 +1058,14 @@ class SchedulerPage(tk.Frame):
 
         if current:
             parts.append(f"● Syncing: {current}")
-            # Track done companies — all enabled minus current and waiting
-            all_enabled = [
-                name for name, co in self.state.companies.items()
-                if co.schedule_enabled
-            ]
+
+            # ── Fixed: use round_companies to determine truly Done ────────
+            # Old logic used (all_enabled - current - waiting) which wrongly
+            # showed companies that hadn't synced yet as "Done".
+            # New logic: Done = ran in this round AND not running AND not waiting.
+            round_cos = sync_q.round_companies   # set of companies in current round
             done = [
-                n for n in all_enabled
+                n for n in round_cos
                 if n != current and n not in waiting
             ]
             self._last_done_companies = done

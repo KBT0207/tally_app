@@ -419,6 +419,13 @@ class TallySyncApp:
     def navigate(self, page_key: str):
         if page_key not in self._frames:
             return
+
+        # Notify the current page it's being hidden (e.g. logs stops tail polling)
+        if self._active_page and self._active_page != page_key:
+            prev = self._frames.get(self._active_page)
+            if prev and hasattr(prev, "on_hide"):
+                prev.on_hide()
+
         self._frames[page_key].tkraise()
         self._active_page = page_key
 
@@ -446,10 +453,32 @@ class TallySyncApp:
         """
         Background startup after setup wizard completes.
         Config is already validated at this point — just connect and load.
+
+        ── Correct startup order ──────────────────────────────────────────────
+        Step 1  Connect to database
+        Step 2  Load companies from DB
+        Step 3  Load scheduler config from DB
+        Step 4  Load TallySettings + AutomationSettings
+        Step 5  Notify GUI — companies ready (home + scheduler pages refresh)
+        Step 6  Start SyncQueueController  ← MUST be before scheduler
+        Step 7  Run MissedSyncChecker      ← MUST be before scheduler starts
+                                             so missed companies enter the queue
+                                             BEFORE APScheduler fires any jobs.
+                                             If scheduler starts first, it fires
+                                             jobs that set _round_active=True,
+                                             and MissedSyncChecker's enqueue()
+                                             calls get silently skipped by Rule 1.
+        Step 8  Start SchedulerController  ← LAST — APScheduler only fires
+                                             after missed syncs are queued.
+        Step 9  Notify GUI — scheduler ready (scheduler page wires up controller)
+        Step 10 Ping Tally
+        ──────────────────────────────────────────────────────────────────────
         """
-        # ── Step 1: Connect to database ──────────────────
+        from logging_config import logger
+
+        # ── Step 1: Connect to database ───────────────────────────────────────
         try:
-            db_cfg = self._config.get_db_config()    # ← ConfigManager, not .env
+            db_cfg = self._config.get_db_config()
             engine = self._create_engine(db_cfg)
             self.state.db_engine = engine
             self._q.put(("db_status", True, "Connected"))
@@ -457,76 +486,48 @@ class TallySyncApp:
             self._q.put(("db_status", False, str(e)))
             return
 
-        # ── Step 2: Load companies from DB ───────────────
+        # ── Step 2: Load companies from DB ────────────────────────────────────
         try:
             self._load_companies_from_db(engine)
         except Exception as e:
             self._q.put(("error", f"Failed to load companies: {e}"))
 
-        # ── Step 3: Load scheduler config from DB ────────
+        # ── Step 3: Load scheduler config from DB ─────────────────────────────
         try:
             from gui.controllers.company_controller import CompanyController
             CompanyController(self.state).load_scheduler_config()
         except Exception as e:
-            from logging_config import logger
             logger.warning(f"[App] Could not load scheduler config: {e}")
 
-        # ── Step 3b: Load TallySettings + AutomationSettings ─────────────
+        # ── Step 4: Load TallySettings + AutomationSettings ───────────────────
         try:
             self._load_automation_settings(engine)
         except Exception as e:
-            from logging_config import logger
             logger.warning(f"[App] Could not load automation settings: {e}")
 
+        # ── Step 5: Notify GUI — companies ready ──────────────────────────────
         self._q.put(("companies_loaded", None))
 
-        # ── Step 4: Start APScheduler FIRST (with no sync queue yet) ─────────
-        # Jobs may fire immediately from persisted DB jobs — that's fine,
-        # they'll use the fallback path until set_sync_queue() is called below.
-        try:
-            from gui.controllers.scheduler_controller import SchedulerController
-            self._scheduler_controller = SchedulerController(
-                self.state, self._q,
-                sync_queue_ctrl = None,   # set below after SyncQueueController starts
-            )
-            self._scheduler_controller.start()
-            from logging_config import logger
-            logger.info("[App] SchedulerController started ✓")
-        except Exception as e:
-            from logging_config import logger
-            logger.warning(f"[App] Could not start scheduler: {e}")
-            self._scheduler_controller = None
-
-        # ── Step 5: Start SyncQueueController ────────────────────────────────
-        # Start AFTER scheduler so the module singleton already exists.
-        # Then immediately register it so all future jobs use the queue.
+        # ── Step 6: Start SyncQueueController ────────────────────────────────
+        # Must start BEFORE scheduler so missed syncs can be queued
+        # BEFORE APScheduler fires any jobs.
         try:
             from gui.controllers.sync_queue_controller import SyncQueueController
             self._sync_queue_controller = SyncQueueController(self.state, self._q)
             self._sync_queue_controller.start()
-            from logging_config import logger
             logger.info("[App] SyncQueueController started ✓")
-
-            # Wire into scheduler — from this point all jobs go through the queue
-            if self._scheduler_controller:
-                self._scheduler_controller.set_sync_queue(self._sync_queue_controller)
-
         except Exception as e:
-            from logging_config import logger
             logger.warning(f"[App] Could not start SyncQueueController: {e}")
             self._sync_queue_controller = None
 
-        # ── Step 5c: Notify GUI that scheduler is fully ready ─────────────────
-        # This fires AFTER scheduler + queue are both started so the scheduler
-        # page can wire up _sched_ctrl and show correct status + next_run times.
-        # Previously only "companies_loaded" was fired (before scheduler started)
-        # which caused the page to always show "Not running" on first open.
-        self._q.put(("scheduler_ready", None))
-
-        # ── Step 5b: Phase 2 — Check for missed syncs ────────────────────────
-        # Runs after both scheduler and queue are ready.
-        # Any company whose last_sync_time is older than its schedule interval
-        # gets enqueued immediately so it catches up on startup.
+        # ── Step 7: Run MissedSyncChecker ────────────────────────────────────
+        # CRITICAL: Must run BEFORE SchedulerController.start().
+        # Reason: APScheduler.start() may immediately fire persisted jobs,
+        # which call enqueue() and set _round_active=True. If MissedSyncChecker
+        # runs after that, its enqueue() calls are blocked by Rule 1 Check 3
+        # (_round_active=True + company in _round_companies → skip).
+        # Running it here guarantees missed companies are queued first,
+        # and APScheduler fires AFTER they are already in the round.
         if self._sync_queue_controller:
             try:
                 from gui.controllers.missed_sync_checker import MissedSyncChecker
@@ -536,11 +537,35 @@ class TallySyncApp:
                     app_queue             = self._q,
                 )
                 checker.check_and_enqueue()
+                logger.info("[App] MissedSyncChecker completed ✓")
             except Exception as e:
-                from logging_config import logger
                 logger.warning(f"[App] Missed sync check failed: {e}")
 
-        # ── Step 5: Ping Tally ────────────────────────────
+        # ── Step 8: Start SchedulerController ────────────────────────────────
+        # Starts LAST so APScheduler jobs fire only after:
+        #   - SyncQueueController is running and ready
+        #   - Missed syncs are already in the queue
+        # Wire SyncQueueController in immediately so all jobs use the queue.
+        try:
+            from gui.controllers.scheduler_controller import SchedulerController
+            self._scheduler_controller = SchedulerController(
+                self.state, self._q,
+                sync_queue_ctrl = self._sync_queue_controller,
+            )
+            self._scheduler_controller.start()
+            logger.info("[App] SchedulerController started ✓")
+        except Exception as e:
+            logger.warning(f"[App] Could not start scheduler: {e}")
+            self._scheduler_controller = None
+
+        # ── Step 9: Notify GUI — scheduler fully ready ────────────────────────
+        # Fires AFTER both SyncQueueController and SchedulerController started.
+        # Scheduler page uses this event to wire up _sched_ctrl and show
+        # correct status + next_run times. "companies_loaded" (Step 5) fires
+        # too early — before the scheduler starts — so we need this second event.
+        self._q.put(("scheduler_ready", None))
+
+        # ── Step 10: Ping Tally ───────────────────────────────────────────────
         try:
             from services.tally_connector import TallyConnector
             tally     = TallyConnector(
@@ -888,10 +913,12 @@ class TallySyncApp:
             self.state.set_company_status(company_name, CompanyStatus.SYNCING)
 
         elif event == "queue_updated":
-            # Queue state changed — refresh home page company list
+            # Queue state changed — update card queue labels (lightweight, no rebuild)
             home = self._frames.get("home")
-            if home and hasattr(home, "refresh_companies"):
-                home.refresh_companies()
+            if home and hasattr(home, "_refresh_cards_queue_state"):
+                home.after(0, home._refresh_cards_queue_state)
+            elif home and hasattr(home, "refresh_companies"):
+                home.refresh_companies()   # fallback
             # Also refresh queue status strip on scheduler page
             sched = self._frames.get("scheduler")
             if sched and hasattr(sched, "refresh_queue_status"):

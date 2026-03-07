@@ -522,8 +522,20 @@ class LogsPage(tk.Frame):
     #  Lifecycle
     # ─────────────────────────────────────────────────────────────────────────
     def on_show(self):
+        # Resume tail polling when the logs page becomes visible
         if self._tail_after_id is None:
             self._tail_log_files()
+
+    def on_hide(self):
+        """
+        Called when the user navigates away from the Logs page.
+        Cancels the 2s file-tail polling loop so it doesn't run in the
+        background consuming CPU while the page is not visible.
+        The next on_show() will restart it immediately.
+        """
+        if self._tail_after_id is not None:
+            self.after_cancel(self._tail_after_id)
+            self._tail_after_id = None
 
         if self._active_tab in ("main", "error"):
             current_path = self._log_filename(self._active_tab)

@@ -468,6 +468,27 @@ class HomePage(tk.Frame):
         if not self.state.selected_companies:
             messagebox.showwarning("No Selection", "Please select at least one company.")
             return
+
+        # ── Block manual sync if SyncQueueController round is active ─────────
+        # Starting SyncController while the queue is running would launch TWO
+        # Tally automation sessions simultaneously — PyAutoGUI would fight itself,
+        # clicking on both screens at once and corrupting both syncs.
+        sync_q = getattr(self.app, '_sync_queue_controller', None)
+        if sync_q and not sync_q.is_idle:
+            current = sync_q.current_company or "?"
+            waiting = list(sync_q.queued_companies)
+            detail  = f"Currently syncing: {current}"
+            if waiting:
+                detail += f"\nWaiting: {', '.join(waiting)}"
+            messagebox.showwarning(
+                "Scheduled Sync in Progress",
+                f"A scheduled sync round is currently running.\n\n"
+                f"{detail}\n\n"
+                "Please wait for the round to finish, then run a manual sync.\n"
+                "You can monitor progress on the Scheduler page.",
+            )
+            return
+
         if self.state.sync_active:
             messagebox.showwarning("Sync Running", "A sync is already in progress.")
             return
@@ -502,6 +523,18 @@ class HomePage(tk.Frame):
         self.navigate("sync")
 
     def _on_single_sync(self, name: str):
+        # ── Block manual sync if SyncQueueController round is active ─────────
+        sync_q = getattr(self.app, '_sync_queue_controller', None)
+        if sync_q and not sync_q.is_idle:
+            current = sync_q.current_company or "?"
+            messagebox.showwarning(
+                "Scheduled Sync in Progress",
+                f"A scheduled sync is currently running ({current}).\n\n"
+                "Please wait for it to finish before starting a manual sync.\n"
+                "Check the Scheduler page for progress.",
+            )
+            return
+
         if self.state.sync_active:
             messagebox.showwarning("Sync Running", "A sync is already in progress.")
             return
@@ -509,7 +542,6 @@ class HomePage(tk.Frame):
         co = self.state.get_company(name)
         if not co:
             return
-
         self.state.selected_companies = [name]
         for n, card in self._cards.items():
             card.set_selected(n == name)
@@ -586,7 +618,22 @@ class HomePage(tk.Frame):
             # Reset progress bars in place
             for card in self._cards.values():
                 card.update_progress(0.0, "")
+            # Also clear queue state labels (round just ended)
+            self._refresh_cards_queue_state()
         self.after(0, _do)
+
+    def _refresh_cards_queue_state(self):
+        """
+        Update all visible card meta labels to show live queue position.
+        Called on every queue_updated event from app.py and on sync_finished.
+        """
+        sync_q = getattr(self.app, '_sync_queue_controller', None)
+        if sync_q is None:
+            return
+        current = sync_q.current_company
+        waiting = list(sync_q.queued_companies)
+        for card in self._cards.values():
+            card.update_queue_state(current, waiting)
 
     # ─────────────────────────────────────────────────────────────────────────
     def on_show(self):

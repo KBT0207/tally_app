@@ -38,7 +38,12 @@ from database.database_processor import (
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
 SNAPSHOT_CHUNK_MONTHS = 3   # months fetched per Tally API call during snapshot
-VOUCHER_WORKERS       = 2   # parallel threads for voucher sync within ONE company
+VOUCHER_WORKERS       = 1   # parallel threads for voucher sync within ONE company
+# NOTE: Tally Prime is single-user — ALL HTTP requests go through _TALLY_SEMAPHORE
+# which is a Semaphore(1). Extra threads beyond 1 just wait on the semaphore and
+# gain zero throughput benefit. DB writes between requests ARE fast but the Tally
+# fetch dominates (seconds vs milliseconds). Setting this to 2+ only wastes RAM.
+# Raise ONLY if on Tally Server (multi-user) AND you've verified concurrent connections.
 
 # ── Global Tally request semaphore ───────────────────────────────────────────
 # Tally Prime is single-user/single-connection — even when multiple companies
