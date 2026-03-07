@@ -62,27 +62,21 @@ class TallyLauncher:
 
         try:
 
+            # ── Always close Tally first if running ───────────────────────
+            # Simple and bulletproof: never try to reuse an open Tally.
+            # Always kill → wait → launch fresh → select company.
+            # This prevents the "second Tally window" bug where
+            # _get_all_open_companies() returns empty/wrong and we
+            # end up with old Tally still open + new one launching.
             if self._is_tally_running():
-                logger.info("[TallyLauncher] Tally running — checking open companies...")
-                open_companies = self._get_all_open_companies()
-                target = company_name.strip().lower()
-                open_lower = [n.strip().lower() for n in open_companies]
-
-                if target in open_lower and len(open_companies) == 1:
-                    # Company is already open in Tally.
-                    # XML already confirmed it's responsive (we just called _get_all_open_companies).
-                    # No need to wait for gateway image — skip straight to ready.
-                    logger.info(
-                        f"[TallyLauncher] '{company_name}' already open and Tally responding via XML ✓ — skipping gateway wait"
-                    )
-                    return True, "ready"
-
-                logger.info(f"[TallyLauncher] Need to switch. Open: {open_companies} → killing Tally")
+                logger.info(
+                    f"[TallyLauncher] Tally already running — closing before opening '{company_name}'..."
+                )
                 ok, msg = self._kill_tally()
                 if not ok:
-                    return False, f"Could not kill Tally: {msg}"
+                    return False, f"Could not close existing Tally: {msg}"
                 self._wait_for_tally_exit()
-
+                logger.info("[TallyLauncher] Existing Tally closed ✓")
             else:
                 logger.info("[TallyLauncher] Tally not running")
 
@@ -121,13 +115,47 @@ class TallyLauncher:
             logger.exception(f"[TallyLauncher] Unexpected error for '{company_name}'")
             return False, str(e)
 
+    def close_tally(self) -> Tuple[bool, str]:
+        """
+        Close Tally if it is currently running.
+        Called automatically after each company sync completes.
+        Safe to call even if Tally is already closed — returns (True, 'not_running').
+        """
+        if not self._is_tally_running():
+            logger.info("[TallyLauncher] close_tally: Tally not running — nothing to close")
+            return True, "not_running"
+
+        logger.info("[TallyLauncher] close_tally: Closing Tally after sync...")
+        ok, msg = self._kill_tally()
+        if ok:
+            self._wait_for_tally_exit()
+            logger.info("[TallyLauncher] close_tally: Tally closed ✓")
+        else:
+            logger.warning(f"[TallyLauncher] close_tally: Could not close Tally: {msg}")
+        return ok, msg
+
     def _is_tally_running(self) -> bool:
+        # Primary: use psutil if available
         if HAS_PSUTIL:
-            return any(
-                'tally' in (p.info.get('name') or '').lower()
-                for p in psutil.process_iter(['name'])
-                if p.is_running()
+            try:
+                return any(
+                    'tally' in (p.info.get('name') or '').lower()
+                    for p in psutil.process_iter(['name'])
+                    if p.is_running()
+                )
+            except Exception:
+                pass
+
+        # Fallback: use tasklist (Windows) — works without psutil
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq tally.exe", "/NH"],
+                capture_output=True, text=True,
             )
+            return "tally.exe" in result.stdout.lower()
+        except Exception:
+            pass
+
         return False
 
     def _kill_tally(self) -> Tuple[bool, str]:
@@ -137,8 +165,20 @@ class TallyLauncher:
                 ["taskkill", "/F", "/IM", "tally.exe", "/T"],
                 capture_output=True, text=True,
             )
-            logger.info("[TallyLauncher] Tally killed ✓")
-            return True, "killed"
+            # taskkill exit code 0 = success, 128 = process not found (also fine)
+            if result.returncode in (0, 128):
+                logger.info("[TallyLauncher] Tally killed ✓")
+                return True, "killed"
+            # Check output text as secondary confirmation
+            out = (result.stdout + result.stderr).lower()
+            if "success" in out or "not found" in out or "no tasks" in out:
+                logger.info("[TallyLauncher] Tally killed ✓ (via output check)")
+                return True, "killed"
+            logger.warning(
+                f"[TallyLauncher] taskkill returned code {result.returncode}: "
+                f"{result.stdout.strip()} {result.stderr.strip()}"
+            )
+            return True, "killed"   # continue anyway — Tally may already be gone
         except Exception as e:
             return False, str(e)
 

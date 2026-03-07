@@ -98,7 +98,7 @@ from logging_config import logger
 # ─────────────────────────────────────────────────────────────────────────────
 MAX_RETRIES         = 2    # Max retry attempts per company per round
 RETRY_DELAY_SEC     = 60   # Seconds to wait before re-enqueuing a failed company
-TIMEOUT_NO_MSG_SEC  = 300  # 5 min max silence in _run_sync before forcing exit
+TIMEOUT_NO_MSG_SEC  = 10800  # 3 hours — enough for large initial snapshots
 CLEANUP_SLEEP_SEC   = 3    # Seconds to pause between companies (Tally settle time)
 
 
@@ -637,7 +637,16 @@ class SyncQueueController:
             return False   # RULE 3: skip, do not block queue
 
         # ── Phase B: XML Sync ─────────────────────────────────────────────
-        return self._run_sync(company_name)
+        result = self._run_sync(company_name)
+
+        # ── Phase C: Close Tally ──────────────────────────────────────────
+        try:
+            from services.tally_launcher import TallyLauncher
+            TallyLauncher(self._state).close_tally()
+        except Exception as e:
+            logger.warning(f"[SyncQueue] Could not close Tally after '{company_name}': {e}")
+
+        return result
 
     def _run_sync(self, company_name: str) -> bool:
         """
