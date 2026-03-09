@@ -23,6 +23,13 @@ from gui.state          import AppState, AutomationConfig
 from gui.styles         import Color, Font, Spacing
 from gui.config_manager import ConfigManager
 
+# PIL for image thumbnails in settings — optional, gracefully skipped if not installed
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 
 # ── The 5 images tally_launcher.py actually uses ──────────────────────────────
 IMAGE_DEFS = [
@@ -640,7 +647,7 @@ class SettingsPage(tk.Frame):
         # Column headers
         hdr = tk.Frame(card, bg=Color.BG_TABLE_HEADER)
         hdr.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0, 2))
-        for text, width in [("Image", 22), ("File", 30), ("Status", 28)]:
+        for text, width in [("Image", 28), ("File", 32), ("", 24)]:
             tk.Label(hdr, text=text,
                      font=Font.BODY_SM, bg=Color.BG_TABLE_HEADER,
                      fg=Color.TEXT_SECONDARY, anchor="w", width=width,
@@ -648,44 +655,62 @@ class SettingsPage(tk.Frame):
 
         # One row per image
         tally_images = getattr(self.state, 'tally_images', {}) or {}
+        # Keep references to PhotoImage objects so they aren't garbage collected
+        self._thumbnails = {}
 
         for idx, (key, label, desc) in enumerate(IMAGE_DEFS):
             bg = Color.BG_CARD if idx % 2 == 0 else Color.BG_TABLE_HEADER
 
             row_f = tk.Frame(card, bg=bg)
-            row_f.grid(row=2 + idx, column=0, columnspan=4, sticky="ew", pady=1)
-            row_f.columnconfigure(1, weight=1)
+            row_f.grid(row=2 + idx, column=0, columnspan=5, sticky="ew", pady=1)
+            row_f.columnconfigure(1, minsize=200)
+            row_f.columnconfigure(2, minsize=220)
+            row_f.columnconfigure(3, weight=1)
 
-            # Label + description stacked
-            left = tk.Frame(row_f, bg=bg, width=180)
-            left.grid(row=0, column=0, sticky="nw", padx=(8, 0), pady=6)
-            left.pack_propagate(False)
+            # Column 0 — thumbnail preview (60x40)
+            current = tally_images.get(key, DEFAULT_FILENAMES.get(key, f"tally_{key}.png"))
+            img_path_now = os.path.join(self._assets_dir(), current)
+            thumb = self._load_thumbnail(img_path_now)
+            self._thumbnails[key] = thumb   # keep reference
+
+            thumb_lbl = tk.Label(
+                row_f,
+                image=thumb if thumb else None,
+                text="" if thumb else "No\npreview",
+                font=Font.BODY_SM, bg=bg, fg=Color.TEXT_MUTED,
+                width=62, height=42,
+                relief="solid", bd=1,
+            )
+            thumb_lbl.grid(row=0, column=0, padx=(8, 6), pady=6, sticky="w")
+
+            # Column 1 — Label + description
+            left = tk.Frame(row_f, bg=bg)
+            left.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=6)
 
             tk.Label(left, text=label,
                      font=Font.BODY, bg=bg, fg=Color.TEXT_PRIMARY,
                      anchor="w").pack(anchor="w")
             tk.Label(left, text=desc,
                      font=Font.BODY_SM, bg=bg, fg=Color.TEXT_MUTED,
-                     anchor="w", wraplength=175, justify="left").pack(anchor="w")
+                     anchor="w", wraplength=195, justify="left").pack(anchor="w")
 
-            # Filename
-            current = tally_images.get(key, DEFAULT_FILENAMES.get(key, f"tally_{key}.png"))
+            # Column 2 — Filename
             fname_var = tk.StringVar(value=current)
 
             tk.Label(row_f, textvariable=fname_var,
                      font=Font.MONO_SM, bg=bg, fg=Color.TEXT_SECONDARY,
-                     anchor="w", width=28,
-                     ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+                     anchor="w",
+                     ).grid(row=0, column=2, sticky="w", padx=(8, 0))
 
-            # Browse + Test buttons + result label
+            # Column 3 — Browse + Test + result
             btn_f = tk.Frame(row_f, bg=bg)
-            btn_f.grid(row=0, column=2, sticky="e", padx=(0, 8))
+            btn_f.grid(row=0, column=3, sticky="w", padx=(8, 8))
 
             tk.Button(
                 btn_f, text="Browse",
                 font=Font.BUTTON_SM, bg=Color.PRIMARY_LIGHT, fg=Color.PRIMARY,
                 relief="solid", bd=1, padx=10, pady=3, cursor="hand2",
-                command=lambda k=key, fv=fname_var: self._browse_image(k, fv),
+                command=lambda k=key, fv=fname_var, tl=thumb_lbl: self._browse_image(k, fv, tl),
             ).pack(side="left", padx=(0, 6))
 
             tk.Button(
@@ -693,18 +718,19 @@ class SettingsPage(tk.Frame):
                 font=Font.BUTTON_SM, bg=Color.BG_ROOT, fg=Color.TEXT_PRIMARY,
                 relief="solid", bd=1, padx=10, pady=3, cursor="hand2",
                 command=lambda k=key: self._test_image(k),
-            ).pack(side="left", padx=(0, 8))
+            ).pack(side="left", padx=(0, 10))
 
             result_lbl = tk.Label(
                 btn_f, text="",
                 font=Font.BODY_SM, bg=bg, fg=Color.TEXT_MUTED,
-                width=22, anchor="w",
+                anchor="w",
             )
             result_lbl.pack(side="left")
 
             self._image_rows[key] = {
                 "filename_var": fname_var,
                 "result_lbl":   result_lbl,
+                "thumb_lbl":    thumb_lbl,
             }
 
         # Test All + status
@@ -728,8 +754,8 @@ class SettingsPage(tk.Frame):
         )
         self._test_all_lbl.pack(side="left")
 
-    def _browse_image(self, key, fname_var):
-        """Pick a PNG, copy to assets/, save to DB, update state."""
+    def _browse_image(self, key, fname_var, thumb_lbl=None):
+        """Pick a PNG, copy to assets/, save to DB, update state and refresh thumbnail."""
         path = filedialog.askopenfilename(
             title=f"Select image for: {key}",
             filetypes=[("PNG Images", "*.png"), ("All images", "*.png *.jpg *.bmp")],
@@ -758,9 +784,18 @@ class SettingsPage(tk.Frame):
 
         self._save_image_to_db(key, dest_name)
 
+        # Refresh thumbnail preview
+        if thumb_lbl:
+            new_thumb = self._load_thumbnail(dest_path)
+            if new_thumb:
+                self._thumbnails[key] = new_thumb
+                thumb_lbl.configure(image=new_thumb, text="")
+            else:
+                thumb_lbl.configure(image="", text="No\npreview")
+
         row = self._image_rows.get(key)
         if row:
-            row["result_lbl"].configure(text="✓ Replaced", fg=Color.SUCCESS)
+            row["result_lbl"].configure(text="Replaced", fg=Color.SUCCESS)
             self.after(3000, lambda: row["result_lbl"].configure(text=""))
 
     def _save_image_to_db(self, key, filename):
@@ -799,12 +834,14 @@ class SettingsPage(tk.Frame):
 
     def _test_image(self, key):
         """
-        3s countdown → minimize app → search screen 20s → show red box if found.
+        Click Test -> sleep 5s (user switches to Tally) -> search screen
+        at confidence 0.90 / 0.80 / 0.70 -> show result with red box overlay.
+        No minimize, no countdown -- simple and reliable.
         """
         try:
             import pyautogui
         except ImportError:
-            self._set_result(key, "✗ pyautogui not installed", Color.DANGER)
+            self._set_result(key, "x pyautogui not installed", Color.DANGER)
             return
 
         row = self._image_rows.get(key)
@@ -815,50 +852,34 @@ class SettingsPage(tk.Frame):
         img_path = os.path.join(self._assets_dir(), filename)
 
         if not os.path.exists(img_path):
-            self._set_result(key, "✗ File missing — use Browse", Color.DANGER)
+            self._set_result(key, "x File missing -- use Browse", Color.DANGER)
             return
 
-        confidence = self._get_confidence()
-        root       = self.winfo_toplevel()
-
-        def countdown(n):
-            if n > 0:
-                self._set_result(key, f"⏳ Switch to Tally… {n}s", Color.TEXT_MUTED)
-                self.after(1000, lambda: countdown(n - 1))
-            else:
-                self._set_result(key, "🔍 Searching…", Color.TEXT_MUTED)
-                try:
-                    root.iconify()
-                except Exception:
-                    pass
-                threading.Thread(target=search, daemon=True).start()
+        root = self.winfo_toplevel()
+        self._set_result(key, "Searching in 5s -- open Tally now...", Color.TEXT_MUTED)
 
         def search():
             import time
-            time.sleep(0.4)
-            loc      = None
-            end_time = time.time() + 20
+            time.sleep(5)   # user has 5 seconds to switch to Tally
 
-            while time.time() < end_time:
+            loc       = None
+            used_conf = 0.90
+
+            for conf in [0.90, 0.80, 0.70]:
                 try:
-                    loc = pyautogui.locateOnScreen(
-                        img_path, confidence=confidence, grayscale=True)
+                    loc = pyautogui.locateOnScreen(img_path, confidence=conf, grayscale=True)
                     if loc:
+                        used_conf = conf
                         break
                 except Exception:
                     pass
-                remaining = max(0, int(end_time - time.time()))
-                root.after(0, lambda r=remaining: self._set_result(
-                    key, f"🔍 Searching… {r}s", Color.TEXT_MUTED))
-                time.sleep(1)
-
-            root.after(0, root.deiconify)
 
             if loc:
                 x, y, w, h = int(loc.left), int(loc.top), int(loc.width), int(loc.height)
 
                 def found():
-                    self._set_result(key, f"✓ Found at ({x}, {y})", Color.SUCCESS)
+                    conf_note = f" (conf {used_conf})" if used_conf < 0.90 else ""
+                    self._set_result(key, f"Found at ({x}, {y}){conf_note}", Color.SUCCESS)
                     try:
                         from gui.components.image_test_overlay import ImageTestOverlay
                         ImageTestOverlay(root, x, y, w, h, duration_ms=3000)
@@ -866,18 +887,17 @@ class SettingsPage(tk.Frame):
                         pass
                     self.after(5000, lambda: self._set_result(key, "", Color.TEXT_MUTED))
 
-                root.after(400, found)
-            else:
-                lower = max(0.50, round(confidence - 0.10, 2))
+                root.after(0, found)
 
+            else:
                 def not_found():
                     self._set_result(
-                        key, f"✗ Not found — try confidence {lower:.2f}", Color.DANGER)
+                        key, "Not found -- retake screenshot with Browse", Color.DANGER)
                     self.after(8000, lambda: self._set_result(key, "", Color.TEXT_MUTED))
 
-                root.after(400, not_found)
+                root.after(0, not_found)
 
-        countdown(3)
+        threading.Thread(target=search, daemon=True).start()
 
     def _test_all_images(self):
         """Test all 5 images — minimize app, test each, show summary."""
@@ -916,11 +936,13 @@ class SettingsPage(tk.Frame):
 
                 found = False
                 if os.path.exists(img_path):
-                    try:
-                        found = pyautogui.locateOnScreen(
-                            img_path, confidence=confidence, grayscale=True) is not None
-                    except Exception:
-                        found = False
+                    for conf in [0.90, 0.80, 0.70]:
+                        try:
+                            if pyautogui.locateOnScreen(img_path, confidence=conf, grayscale=True):
+                                found = True
+                                break
+                        except Exception:
+                            pass
 
                 results[key] = found
                 color = Color.SUCCESS if found else Color.DANGER
@@ -1009,6 +1031,17 @@ class SettingsPage(tk.Frame):
     #  HELPERS
     # ──────────────────────────────────────────────
 
+    def _load_thumbnail(self, img_path, size=(60, 40)):
+        """Load a PNG as a small Tkinter PhotoImage thumbnail. Returns None if unavailable."""
+        if not HAS_PIL:
+            return None
+        try:
+            img = Image.open(img_path)
+            img.thumbnail(size, Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+
     def _assets_dir(self):
         return os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -1080,9 +1113,20 @@ class SettingsPage(tk.Frame):
             self._v["timeout"].set(str(getattr(aut, 'wait_timeout_sec',    30)))
         self._automation_status_lbl.configure(text="")
 
-        # Image filenames
+        # Image filenames + refresh thumbnails
         images = getattr(self.state, 'tally_images', {}) or {}
         for key, row in self._image_rows.items():
-            row["filename_var"].set(
-                images.get(key, DEFAULT_FILENAMES.get(key, f"tally_{key}.png")))
+            fname = images.get(key, DEFAULT_FILENAMES.get(key, f"tally_{key}.png"))
+            row["filename_var"].set(fname)
             row["result_lbl"].configure(text="")
+
+            # Refresh thumbnail in case file changed on disk
+            thumb_lbl = row.get("thumb_lbl")
+            if thumb_lbl:
+                img_path = os.path.join(self._assets_dir(), fname)
+                new_thumb = self._load_thumbnail(img_path)
+                if new_thumb:
+                    self._thumbnails[key] = new_thumb
+                    thumb_lbl.configure(image=new_thumb, text="")
+                else:
+                    thumb_lbl.configure(image="", text="No\npreview")
