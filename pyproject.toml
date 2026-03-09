@@ -7,19 +7,28 @@ requires-python = ">=3.13"
 dependencies = [
     "apscheduler>=3.11.2",
     "cryptography>=46.0.5",
-    "customtkinter>=5.2.2",
     "defusedxml>=0.7.1",
+    "keyring>=25.0.0",
     "lxml>=6.0.2",
     "marshmallow>=4.2.2",
+    "opencv-python>=4.10.0",
     "openpyxl>=3.1.5",
     "pandas>=3.0.1",
     "pillow>=12.1.1",
+    "psutil>=6.0.0",
     "pyautogui>=0.9.54",
+    "pygetwindow>=0.0.9",
     "pymysql>=1.1.2",
+    "pyproject-toml>=0.0.10",
+    "pystray>=0.19.5",
     "python-dotenv==1.0.0",
     "requests>=2.32.5",
-    "rq>=2.7.0",
     "sqlalchemy>=2.0.47",
-    "xlwings>=0.33.20",
+    "tkcalendar>=1.6.1",
     "xmltodict>=1.0.4",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.19.0",
 ]

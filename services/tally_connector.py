@@ -1,4 +1,6 @@
 import re
+import sys
+import os
 import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -9,6 +11,18 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from logging_config import logger
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  EXE-safe resource path  (dev: relative to project root, EXE: _MEIPASS)
+# ─────────────────────────────────────────────────────────────────────────────
+def _resource_path(relative: str) -> str:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = sys._MEIPASS  # type: ignore[attr-defined]
+    else:
+        # services/tally_connector.py  →  one folder up = project root
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative.replace("/", os.sep))
 
 
 class TallyConnector:
@@ -212,7 +226,7 @@ class TallyConnector:
             logger.info(f'[{company_name}] Fetching {data_type}')
 
             xml_payload = self._prepare_xml_request(
-                template_path, company_name, from_date, to_date, alter_id
+                _resource_path(template_path), company_name, from_date, to_date, alter_id
             )
 
             if from_date and to_date:
@@ -299,7 +313,7 @@ class TallyConnector:
 
     def fetch_all_companies(self, debug: bool = False) -> list:
         try:
-            tree        = ET.parse('utils/company.xml')
+            tree        = ET.parse(_resource_path('utils/company.xml'))
             xml_payload = ET.tostring(tree.getroot(), encoding='utf-8')
 
             if debug:

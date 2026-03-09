@@ -26,7 +26,7 @@ from datetime import datetime
 try:
     import ttkbootstrap as tb
     from ttkbootstrap.constants import *
-    HAS_TTKBOOTSTRAP = True
+    HAS_TTKBOOTSTRAP = False   # disabled — ttkbootstrap overrides all custom styles
 except ImportError:
     HAS_TTKBOOTSTRAP = False
 

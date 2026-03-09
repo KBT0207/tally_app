@@ -16,15 +16,37 @@ Phase 3 fixes:
 import logging
 import logging.handlers
 import os
+import sys
 import glob
 import configparser
 from datetime import datetime, timedelta
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Paths
+#  EXE-safe path resolution
+#
+#  When frozen by PyInstaller:
+#    sys.frozen = True  and  sys._MEIPASS = temp extraction folder
+#    sys.executable     = path to the actual .exe file
+#
+#  LOG_DIR must be writable → resolve relative to the .exe folder (or project
+#  root in dev), NOT _MEIPASS which is deleted on exit.
+#
+#  tally_config.ini is a read-only bundled resource → resolve from _MEIPASS
+#  (or project root in dev).
 # ─────────────────────────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR  = os.path.join(BASE_DIR, "logs")
+def _get_exe_dir() -> str:
+    """Folder containing the .exe (frozen) or main.py (dev)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _get_bundle_dir() -> str:
+    """Extraction folder in frozen mode (_MEIPASS), else project root."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS  # type: ignore[attr-defined]
+    return os.path.dirname(os.path.abspath(__file__))
+
+LOG_DIR = os.path.join(_get_exe_dir(), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 today_date     = datetime.now().strftime("%d-%b-%Y")
@@ -34,7 +56,7 @@ error_log_file = os.path.join(LOG_DIR, f"error_{today_date}.log")
 # ─────────────────────────────────────────────────────────────────────────────
 #  Read retention setting from tally_config.ini
 # ─────────────────────────────────────────────────────────────────────────────
-_ADVANCED_CFG = os.path.join(BASE_DIR, "tally_config.ini")
+_ADVANCED_CFG = os.path.join(_get_bundle_dir(), "tally_config.ini")
 _DEFAULT_RETENTION_DAYS = 30
 
 

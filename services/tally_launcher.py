@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import subprocess
 from typing import Tuple
@@ -31,8 +32,18 @@ except ImportError:
     HAS_PYGETWINDOW = False
 
 
-# Folder where all PNG images are stored (assets/)
-ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
+# ─────────────────────────────────────────────────────────────────────────────
+#  EXE-safe assets path
+#  Dev  : project_root/assets/
+#  EXE  : _MEIPASS/assets/   (PyInstaller extracts bundled files there)
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_assets_dir() -> str:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, "assets")  # type: ignore[attr-defined]
+    # services/tally_launcher.py  →  one folder up = project root
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+
+ASSETS_DIR = _get_assets_dir()
 
 # Image filenames used for screen detection
 IMAGE_FILES = {
