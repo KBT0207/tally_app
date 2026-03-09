@@ -18,6 +18,7 @@ Usage (from run_gui.py):
 
 import threading
 import queue
+import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
@@ -99,6 +100,16 @@ class TallySyncApp:
     #  Root window
     # ─────────────────────────────────────────────────────────────────────────
     def _build_root(self):
+        # Tell Windows this app handles its own DPI scaling.
+        # Prevents Windows from blurring the UI at 125%/150% on laptops.
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()   # Fallback
+            except Exception:
+                pass
+
         if HAS_TTKBOOTSTRAP:
             self.root = tb.Window(themename=BOOTSTRAP_THEME)
         else:

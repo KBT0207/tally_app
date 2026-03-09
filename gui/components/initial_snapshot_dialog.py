@@ -39,7 +39,7 @@ class InitialSnapshotDialog(tk.Toplevel):
     def __init__(self, parent, company: CompanyState):
         super().__init__(parent)
         self.title("Initial Snapshot Required")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.grab_set()
         self.result: Optional[str] = None
         self._company = company
@@ -49,10 +49,16 @@ class InitialSnapshotDialog(tk.Toplevel):
 
     def _center(self, parent):
         self.update_idletasks()
-        w, h = 480, 340
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = min(560, int(sw * 0.92))
+        h = min(400, int(sh * 0.90))
         px = parent.winfo_rootx() + parent.winfo_width()  // 2
         py = parent.winfo_rooty() + parent.winfo_height() // 2
-        self.geometry(f"{w}x{h}+{px - w//2}+{py - h//2}")
+        x = max(8, min(px - w // 2, sw - w - 8))
+        y = max(8, min(py - h // 2, sh - h - 8))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(w, h)
 
     def _build(self):
         co  = self._company
@@ -95,7 +101,7 @@ class InitialSnapshotDialog(tk.Toplevel):
                 "incremental updates (only new/changed records)."
             ),
             font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
-            justify="left", anchor="w", wraplength=420,
+            justify="left", anchor="w", wraplength=500,
         ).pack(fill="x")
 
         # ── Buttons ───────────────────────────────────────
@@ -149,7 +155,7 @@ class PostSnapshotDialog(tk.Toplevel):
     def __init__(self, parent, company: CompanyState):
         super().__init__(parent)
         self.title("Initial Snapshot Complete")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.grab_set()
         self.result: Optional[str] = None
         self._company = company
@@ -159,10 +165,16 @@ class PostSnapshotDialog(tk.Toplevel):
 
     def _center(self, parent):
         self.update_idletasks()
-        w, h = 460, 320
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = min(540, int(sw * 0.92))
+        h = min(380, int(sh * 0.90))
         px = parent.winfo_rootx() + parent.winfo_width()  // 2
         py = parent.winfo_rooty() + parent.winfo_height() // 2
-        self.geometry(f"{w}x{h}+{px - w//2}+{py - h//2}")
+        x = max(8, min(px - w // 2, sw - w - 8))
+        y = max(8, min(py - h // 2, sh - h - 8))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(w, h)
 
     def _build(self):
         co  = self._company
@@ -203,7 +215,7 @@ class PostSnapshotDialog(tk.Toplevel):
                 "so this company stays up to date automatically?"
             ),
             font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
-            justify="left", anchor="w", wraplength=400,
+            justify="left", anchor="w", wraplength=480,
         ).pack(fill="x")
 
         # ── Buttons ───────────────────────────────────────

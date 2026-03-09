@@ -47,7 +47,7 @@ class ConfigureCompanyDialog(tk.Toplevel):
     def __init__(self, parent, company: CompanyState, app, state):
         super().__init__(parent)
         self.title(f"Configure  —  {company.name}")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.grab_set()           # modal
         self.saved    = False
         self._company = company
@@ -58,10 +58,16 @@ class ConfigureCompanyDialog(tk.Toplevel):
 
         # Center over parent
         self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = min(520, int(sw * 0.95))
+        h = min(700, int(sh * 0.92))
         pw = parent.winfo_rootx() + parent.winfo_width()  // 2
         ph = parent.winfo_rooty() + parent.winfo_height() // 2
-        w, h = 500, 640
-        self.geometry(f"{w}x{h}+{pw - w//2}+{ph - h//2}")
+        x = max(8, min(pw - w // 2, sw - w - 8))
+        y = max(8, min(ph - h // 2, sh - h - 8))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(w, h)
 
         self.bind("<Return>", lambda e: self._on_save())
         self.bind("<Escape>", lambda e: self.destroy())

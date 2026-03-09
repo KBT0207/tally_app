@@ -58,7 +58,7 @@ class SetupWizard(tk.Toplevel):
     def __init__(self, parent, config_manager: ConfigManager, error_msg: str = ""):
         super().__init__(parent)
         self.title("Tally Sync Manager — Setup")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
@@ -75,14 +75,20 @@ class SetupWizard(tk.Toplevel):
     # ─────────────────────────────────────────────────────────────────────────
     def _center(self, parent):
         self.update_idletasks()
-        w, h = 540, 560
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = min(560, int(sw * 0.95))
+        h = min(680, int(sh * 0.90))   # taller — ensures buttons never clip
         try:
             px = parent.winfo_rootx() + parent.winfo_width()  // 2
             py = parent.winfo_rooty() + parent.winfo_height() // 2
         except Exception:
-            px = self.winfo_screenwidth()  // 2
-            py = self.winfo_screenheight() // 2
-        self.geometry(f"{w}x{h}+{px - w // 2}+{py - h // 2}")
+            px = sw // 2
+            py = sh // 2
+        x = max(8, min(px - w // 2, sw - w - 8))
+        y = max(8, min(py - h // 2, sh - h - 8))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(w, h)
 
     def _clear(self):
         for w in self.winfo_children():
