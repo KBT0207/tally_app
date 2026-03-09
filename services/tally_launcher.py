@@ -13,7 +13,7 @@ except ImportError:
     HAS_PYAUTOGUI = False
 
 try:
-    import cv2  # noqa
+    import cv2
     HAS_OPENCV = True
 except ImportError:
     HAS_OPENCV = False
@@ -30,570 +30,566 @@ try:
 except ImportError:
     HAS_PYGETWINDOW = False
 
-try:
-    import pyperclip
-    HAS_PYPERCLIP = True
-except ImportError:
-    HAS_PYPERCLIP = False
 
-_ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
+# Folder where all PNG images are stored (assets/)
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
 
-
-class TallyLaunchError(Exception):
-    pass
+# Image filenames used for screen detection
+IMAGE_FILES = {
+    "gateway":     "tally_gateway_screen.png",
+    "search_box":  "tally_company_search_box.png",
+    "username":    "tally_username_field.png",
+    "data_server": "tally_dataserver_image.png",
+    "local_path":  "tally_local_path_image.png",
+}
 
 
 class TallyLauncher:
 
     def __init__(self, state):
-        self._state = state
+        self.state = state
+
+    # ──────────────────────────────────────────────
+    #  MAIN ENTRY POINT
+    # ──────────────────────────────────────────────
 
     def prepare(self, company_name: str) -> Tuple[bool, str]:
+        """
+        Open a company in Tally and wait until it is ready.
+        Returns (True, "ready") on success or (False, error_message) on failure.
+        """
 
         if not HAS_PYAUTOGUI:
             return False, "PyAutoGUI not installed"
 
-        co = self._state.companies.get(company_name)
-        if not co:
-            return False, f"Company '{company_name}' not found in state"
+        # Get company info from state
+        company = self.state.companies.get(company_name)
+        if not company:
+            return False, f"Company '{company_name}' not found"
 
-        exe_path = getattr(self._state, 'tally_exe_path', '') or ''
-        logger.info(f"[TallyLauncher] Preparing: '{company_name}'")
+        tally_exe    = getattr(self.state, 'tally_exe_path', '') or ''
+        company_type = getattr(company, 'company_type', 'local') or 'local'
+
+        logger.info(f"[TallyLauncher] Starting: '{company_name}' (type={company_type})")
 
         try:
 
-            # ── Always close Tally first if running ───────────────────────
-            # Simple and bulletproof: never try to reuse an open Tally.
-            # Always kill → wait → launch fresh → select company.
-            # This prevents the "second Tally window" bug where
-            # _get_all_open_companies() returns empty/wrong and we
-            # end up with old Tally still open + new one launching.
-            if self._is_tally_running():
-                logger.info(
-                    f"[TallyLauncher] Tally already running — closing before opening '{company_name}'..."
-                )
-                ok, msg = self._kill_tally()
+            # Step 1 — Close Tally if already open
+            if self.is_tally_running():
+                logger.info("[TallyLauncher] Tally is open — closing it first...")
+                self.kill_tally()
+                self.wait_for_tally_to_close()
+
+            # Step 2 — Open Tally
+            ok, msg = self.open_tally(tally_exe)
+            if not ok:
+                return False, msg
+
+            # Step 3 — Handle Tally login screen (if credentials set)
+            ok, msg = self.handle_tally_login()
+            if not ok:
+                return False, msg
+
+            # Step 4 — Wait for the company list screen
+            ok, msg = self.wait_for_company_list()
+            if not ok:
+                return False, msg
+
+            # Step 5 — For TDS: navigate to Data Server first
+            if company_type == 'tds':
+                ok, msg = self.navigate_to_tds_data_server()
                 if not ok:
-                    return False, f"Could not close existing Tally: {msg}"
-                self._wait_for_tally_exit()
-                logger.info("[TallyLauncher] Existing Tally closed ✓")
-            else:
-                logger.info("[TallyLauncher] Tally not running")
+                    return False, msg
 
-            ok, msg = self._launch_tally(exe_path)
+            # Step 6 — Search and open the company
+            ok, msg = self.select_company(company)
             if not ok:
                 return False, msg
 
-            ok, msg = self._handle_tally_login()
+            # Step 7 — Handle company login (username/password if required)
+            ok, msg = self.handle_company_login(company, company_type)
             if not ok:
                 return False, msg
 
-            ok, msg = self._wait_for_select_company_screen()
-            if not ok:
-                return False, msg
-
-            ok, msg = self._set_path_if_needed(co)
-            if not ok:
-                return False, msg
-
-            ok, msg = self._select_company(co)
-            if not ok:
-                return False, msg
-
-            ok, msg = self._handle_company_login(co)
-            if not ok:
-                return False, msg
-
-            ok, msg = self._wait_for_gateway()
+            # Step 8 — Wait for the Gateway screen (confirms company is open)
+            ok, msg = self.wait_for_gateway()
             if not ok:
                 return False, f"Gateway not found after opening '{company_name}': {msg}"
 
-            logger.info(f"[TallyLauncher] '{company_name}' ready ✓")
+            logger.info(f"[TallyLauncher] '{company_name}' is ready ✓")
             return True, "ready"
 
         except Exception as e:
             logger.exception(f"[TallyLauncher] Unexpected error for '{company_name}'")
             return False, str(e)
 
+    # ──────────────────────────────────────────────
+    #  CLOSE TALLY (called after sync is done)
+    # ──────────────────────────────────────────────
+
     def close_tally(self) -> Tuple[bool, str]:
-        """
-        Close Tally if it is currently running.
-        Called automatically after each company sync completes.
-        Safe to call even if Tally is already closed — returns (True, 'not_running').
-        """
-        if not self._is_tally_running():
-            logger.info("[TallyLauncher] close_tally: Tally not running — nothing to close")
+        """Close Tally after sync is done. Safe to call even if Tally is not open."""
+        if not self.is_tally_running():
             return True, "not_running"
 
-        logger.info("[TallyLauncher] close_tally: Closing Tally after sync...")
-        ok, msg = self._kill_tally()
+        logger.info("[TallyLauncher] Closing Tally after sync...")
+        ok, msg = self.kill_tally()
         if ok:
-            self._wait_for_tally_exit()
-            logger.info("[TallyLauncher] close_tally: Tally closed ✓")
-        else:
-            logger.warning(f"[TallyLauncher] close_tally: Could not close Tally: {msg}")
+            self.wait_for_tally_to_close()
+            logger.info("[TallyLauncher] Tally closed ✓")
         return ok, msg
 
-    def _is_tally_running(self) -> bool:
-        # Primary: use psutil if available
+    # ──────────────────────────────────────────────
+    #  STEP 1 — CHECK / KILL TALLY
+    # ──────────────────────────────────────────────
+
+    def is_tally_running(self) -> bool:
+        """Returns True if Tally.exe is currently running."""
         if HAS_PSUTIL:
-            try:
-                return any(
-                    'tally' in (p.info.get('name') or '').lower()
-                    for p in psutil.process_iter(['name'])
-                    if p.is_running()
-                )
-            except Exception:
-                pass
+            for p in psutil.process_iter(['name']):
+                if 'tally' in (p.info.get('name') or '').lower():
+                    return True
+            return False
 
-        # Fallback: use tasklist (Windows) — works without psutil
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq tally.exe", "/NH"],
-                capture_output=True, text=True,
-            )
-            return "tally.exe" in result.stdout.lower()
-        except Exception:
-            pass
+        # Fallback if psutil not installed
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq tally.exe", "/NH"],
+            capture_output=True, text=True
+        )
+        return "tally.exe" in result.stdout.lower()
 
-        return False
+    def kill_tally(self) -> Tuple[bool, str]:
+        """Force-close Tally.exe."""
+        logger.info("[TallyLauncher] Killing Tally.exe...")
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "tally.exe", "/T"],
+            capture_output=True, text=True
+        )
+        logger.info("[TallyLauncher] Tally killed ✓")
+        return True, "killed"
 
-    def _kill_tally(self) -> Tuple[bool, str]:
-        try:
-            logger.info("[TallyLauncher] Killing Tally.exe...")
-            result = subprocess.run(
-                ["taskkill", "/F", "/IM", "tally.exe", "/T"],
-                capture_output=True, text=True,
-            )
-            # taskkill exit code 0 = success, 128 = process not found (also fine)
-            if result.returncode in (0, 128):
-                logger.info("[TallyLauncher] Tally killed ✓")
-                return True, "killed"
-            # Check output text as secondary confirmation
-            out = (result.stdout + result.stderr).lower()
-            if "success" in out or "not found" in out or "no tasks" in out:
-                logger.info("[TallyLauncher] Tally killed ✓ (via output check)")
-                return True, "killed"
-            logger.warning(
-                f"[TallyLauncher] taskkill returned code {result.returncode}: "
-                f"{result.stdout.strip()} {result.stderr.strip()}"
-            )
-            return True, "killed"   # continue anyway — Tally may already be gone
-        except Exception as e:
-            return False, str(e)
-
-    def _wait_for_tally_exit(self, timeout: int = 10) -> None:
+    def wait_for_tally_to_close(self):
+        """Wait until Tally process is fully gone (max 15 seconds)."""
         if not HAS_PSUTIL:
-            time.sleep(3)
+            time.sleep(5)
             return
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            still_running = any(
-                'tally' in (p.info.get('name') or '').lower()
-                for p in psutil.process_iter(['name'])
-                if p.is_running()
-            )
+
+        for _ in range(15):
+            still_running = False
+            for p in psutil.process_iter(['name']):
+                if 'tally' in (p.info.get('name') or '').lower():
+                    still_running = True
+                    break
             if not still_running:
-                logger.info("[TallyLauncher] Tally process fully exited ✓")
+                logger.info("[TallyLauncher] Tally process closed ✓")
+                time.sleep(2)  # extra wait for Windows to release file locks
                 return
-            time.sleep(0.5)
-        logger.warning("[TallyLauncher] Tally still in process list — continuing anyway")
+            time.sleep(1)
 
-    def _launch_tally(self, exe_path: str) -> Tuple[bool, str]:
+        logger.warning("[TallyLauncher] Tally still running after 15s — continuing anyway")
+        time.sleep(3)
 
+    # ──────────────────────────────────────────────
+    #  STEP 2 — OPEN TALLY
+    # ──────────────────────────────────────────────
+
+    def open_tally(self, exe_path: str) -> Tuple[bool, str]:
+        """Launch Tally.exe and wait for its window to appear."""
         if not exe_path:
-            return False, "Tally.exe path not configured. Go to Settings → Automation."
+            return False, "Tally.exe path not set. Go to Settings → Automation."
         if not os.path.exists(exe_path):
             return False, f"Tally.exe not found at: {exe_path}"
-        try:
-            logger.info(f"[TallyLauncher] Launching: {exe_path}")
-            subprocess.Popen(
-                [exe_path],
-                creationflags=(
-                    subprocess.CREATE_NEW_PROCESS_GROUP
-                    if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP') else 0
-                ),
-            )
 
-            logger.info("[TallyLauncher] Waiting for Tally window...")
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                if self._get_tally_window() is not None:
-                    logger.info("[TallyLauncher] Tally window appeared ✓")
-                    break
-                time.sleep(0.5)
+        logger.info(f"[TallyLauncher] Opening Tally: {exe_path}")
+        subprocess.Popen([exe_path])
 
-            logger.info("[TallyLauncher] Stabilizing (4s)...")
-            time.sleep(4)
+        # Wait up to 30 seconds for the Tally window to appear
+        logger.info("[TallyLauncher] Waiting for Tally window...")
+        for _ in range(30):
+            if self.get_tally_window() is not None:
+                logger.info("[TallyLauncher] Tally window appeared ✓")
+                break
+            time.sleep(1)
 
-            return True, "launched"
-        except Exception as e:
-            return False, f"Failed to launch Tally: {e}"
+        # Wait extra time for Tally to fully load
+        logger.info("[TallyLauncher] Waiting 6s for Tally to load...")
+        time.sleep(6)
+        return True, "launched"
 
-    def _handle_tally_login(self) -> Tuple[bool, str]:
+    # ──────────────────────────────────────────────
+    #  STEP 3 — TALLY LOGIN (Tally-level password)
+    # ──────────────────────────────────────────────
 
-        tally_username = getattr(self._state, 'tally_username', '') or ''
-        tally_password = getattr(self._state, 'tally_password', '') or ''
+    def handle_tally_login(self) -> Tuple[bool, str]:
+        """
+        If Tally has a login screen (Tally-level username/password),
+        type the credentials and press Enter.
+        If no credentials are configured, skip this step.
+        """
+        username = getattr(self.state, 'tally_username', '') or ''
+        password = getattr(self.state, 'tally_password', '') or ''
 
-        if not tally_username:
-            logger.info("[TallyLauncher] No Tally-level credentials configured — skipping login check")
-            return True, "no_tally_login"
+        if not username:
+            logger.info("[TallyLauncher] No Tally login credentials — skipping")
+            return True, "skipped"
 
-        logger.info("[TallyLauncher] Checking for Tally login screen (8s)...")
-        found, _ = self._wait_for_image(self._img("username"), timeout=8)
+        logger.info("[TallyLauncher] Checking for Tally login screen...")
+        found = self.wait_for_image("username", seconds=8)
 
         if not found:
-            logger.info("[TallyLauncher] No Tally login screen — proceeding to Select Company")
-            return True, "no_tally_login"
+            logger.info("[TallyLauncher] No Tally login screen — moving on")
+            return True, "no_login_screen"
 
         logger.info("[TallyLauncher] Tally login screen found — entering credentials")
-        self._bring_to_front()
-        time.sleep(0.5)
+        self.bring_tally_to_front()
+        time.sleep(1)
 
-        delay = self._click_delay()
-
-        # Type username char by char — field is already focused after login screen appears
-        self._type_interval(tally_username, interval=0.1)
-        time.sleep(0.2)
+        # Tally auto-focuses the username field
+        self.type_text(username)
+        time.sleep(0.3)
         pyautogui.press('enter')
-        time.sleep(delay)
+        time.sleep(1)
 
-        # Type password char by char
-        self._type_interval(tally_password, interval=0.1)
-        time.sleep(0.2)
+        self.type_text(password)
+        time.sleep(0.3)
         pyautogui.press('enter')
-        time.sleep(delay * 3)
+        time.sleep(2)
 
         logger.info("[TallyLauncher] Tally login submitted ✓")
-        return True, "tally_logged_in"
+        return True, "logged_in"
 
-    def _wait_for_select_company_screen(self) -> Tuple[bool, str]:
+    # ──────────────────────────────────────────────
+    #  STEP 4 — WAIT FOR COMPANY LIST
+    # ──────────────────────────────────────────────
 
-        logger.info("[TallyLauncher] Waiting for Select Company screen...")
-        ok, msg = self._wait_for_image(self._img("search_box"), timeout=self._timeout())
-        if ok:
-            logger.info("[TallyLauncher] Select Company screen ready ✓")
+    def wait_for_company_list(self) -> Tuple[bool, str]:
+        """Wait for the Select Company screen (the yellow search box)."""
+        logger.info("[TallyLauncher] Waiting for company list screen...")
+        found = self.wait_for_image("search_box", seconds=self.get_timeout())
+        if found:
+            logger.info("[TallyLauncher] Company list screen ready ✓")
             time.sleep(1)
-        return ok, msg
+            return True, "ready"
+        return False, "Company list screen did not appear"
 
-    def _set_path_if_needed(self, co) -> Tuple[bool, str]:
+    # ──────────────────────────────────────────────
+    #  STEP 5 — TDS: NAVIGATE TO DATA SERVER
+    # ──────────────────────────────────────────────
 
-        company_type = getattr(co, 'company_type', 'local') or 'local'
-
-        if company_type == 'local':
-            return True, "local_no_path_needed"
-
-        elif company_type == 'remote':
-            drive = (co.drive_letter or '').rstrip('\\').rstrip('/')
-            path = co.data_path or ''
-            if drive and path:
-                full_path = f"{drive}\\{path.lstrip('/').lstrip('\\')}"
-            elif drive:
-                full_path = drive + "\\"
-            else:
-                full_path = path
-            if full_path:
-                ok, msg = self._set_data_path(full_path)
-                if not ok:
-                    logger.warning(f"[TallyLauncher] Remote path set failed ({msg}) — continuing")
-            return True, "remote_path_set"
-
-        elif company_type == 'tds':
-            return self._set_tds_path(co)
-
-        return True, "unknown_type_skipped"
-
-    def _set_data_path(self, path: str) -> Tuple[bool, str]:
-        delay = self._click_delay()
-        ok, msg = self._click_image(self._img("change_path"))
-        if not ok:
-            return False, f"Change path button not found: {msg}"
-        time.sleep(delay)
-        self._type_interval(path, interval=0.05)
-        time.sleep(0.2)
-        pyautogui.press('enter')
-        time.sleep(delay * 2)
-        return True, "path_set"
-
-    def _set_tds_path(self, co) -> Tuple[bool, str]:
-        delay = self._click_delay()
-        ok, msg = self._click_image(self._img("remote_tab"))
-        if not ok:
-            return False, f"Remote tab not found: {msg}"
-        time.sleep(delay)
-        if co.tds_path:
-            ok, msg = self._click_image(self._img("tds_field"))
-            if not ok:
-                logger.warning(f"[TallyLauncher] TDS field not found: {msg}")
-            else:
-                self._type_interval(co.tds_path, interval=0.05)
-                pyautogui.press('enter')
-                time.sleep(delay * 2)
-        if co.data_path:
-            self._set_data_path(co.data_path)
-        return True, "tds_set"
-
-    @staticmethod
-    def _clean_company_name(name) -> str:
+    def navigate_to_tds_data_server(self) -> Tuple[bool, str]:
         """
-        Convert to str and strip whitespace.
-        Tally search box matches the name exactly as displayed — type it as-is.
+        TDS only: double-click the Data Server button,
+        then wait for the local path screen,
+        then wait for the company list to reload.
         """
-        if name is None:
-            return ''
-        return str(name).strip()
+        logger.info("[TallyLauncher] TDS: Navigating to Data Server...")
 
-    def _select_company(self, co) -> Tuple[bool, str]:
-
-        self._bring_to_front()
+        self.bring_tally_to_front()
         time.sleep(0.5)
 
-        delay = self._click_delay()
-        search_name = self._clean_company_name(co.name)
-        logger.info(f"[TallyLauncher] Searching company: '{search_name}'")
-
-        # Click the yellow search box to give it keyboard focus
-        ok, _ = self._click_image(self._img("search_box"))
+        # Double-click the Data Server button
+        ok = self.double_click_image("data_server")
         if not ok:
-            logger.warning("[TallyLauncher] Search box image not found — typing anyway")
-            self._bring_to_front()
+            return False, "Data Server button not found on screen"
+
+        logger.info("[TallyLauncher] TDS: Data Server clicked ✓ — waiting for path screen...")
+
+        # Move mouse away so it doesn't block image detection
+        pyautogui.moveTo(5, pyautogui.size().height // 2)
         time.sleep(0.5)
 
-        # Type company name character by character at 0.1s interval
-        # so Tally's live search filter can keep up with each keystroke
-        self._type_interval(search_name, interval=0.1)
-        time.sleep(1.0)   # wait for Tally list to fully filter
+        # Wait for local path screen to appear
+        found = self.wait_for_image("local_path", seconds=self.get_timeout())
+        if not found:
+            return False, "Local path screen did not appear after clicking Data Server"
 
+        logger.info("[TallyLauncher] TDS: Local path screen found ✓ — waiting for company list...")
+
+        # Move mouse away again
+        pyautogui.moveTo(5, pyautogui.size().height // 2)
+
+        # Wait for company list (search box) to reload
+        found = self.wait_for_image("search_box", seconds=self.get_timeout())
+        if not found:
+            return False, "Company list did not reload after TDS navigation"
+
+        logger.info("[TallyLauncher] TDS: Company list ready ✓")
+        time.sleep(0.5)
+        return True, "tds_ready"
+
+    # ──────────────────────────────────────────────
+    #  STEP 6 — SEARCH AND OPEN COMPANY
+    # ──────────────────────────────────────────────
+
+    def select_company(self, company) -> Tuple[bool, str]:
+        """Click the search box, type the company name, press Enter."""
+        self.bring_tally_to_front()
+        time.sleep(0.5)
+
+        name = str(company.name or '').strip()
+        logger.info(f"[TallyLauncher] Searching for company: '{name}'")
+
+        # Click the search box
+        clicked = self.click_image("search_box")
+        if not clicked:
+            logger.warning("[TallyLauncher] Search box not found — typing anyway")
+        time.sleep(0.5)
+
+        # Type the company name slowly so Tally's filter can keep up
+        self.type_text(name)
+        time.sleep(1)
+
+        # Press Enter to open the company
         logger.info("[TallyLauncher] Pressing Enter to open company")
         pyautogui.press('enter')
-        time.sleep(delay * 3)
+        time.sleep(1.5)
 
         return True, "company_selected"
 
-    def _handle_company_login(self, co) -> Tuple[bool, str]:
+    # ──────────────────────────────────────────────
+    #  STEP 7 — COMPANY LOGIN (per-company password)
+    # ──────────────────────────────────────────────
 
-        delay = self._click_delay()
+    def handle_company_login(self, company, company_type: str) -> Tuple[bool, str]:
+        """
+        Type username and password for the company login dialog.
 
-        # Wait for the username image — if login dialog appears after Enter
+        LOCAL: wait for username image to appear, then type credentials.
+        TDS:   skip image detection — just wait 3 seconds then type credentials.
+               (TDS search box can cause false image matches, so we skip detection.)
+        """
+        username = getattr(company, 'tally_username', '') or ''
+        password = getattr(company, 'tally_password', '') or ''
+
+        # ── TDS login ──────────────────────────────────────────────────────
+        if company_type == 'tds':
+            if not username:
+                logger.info("[TallyLauncher] TDS: No company credentials — skipping login")
+                return True, "no_login"
+
+            logger.info("[TallyLauncher] TDS: Waiting 3s for login dialog...")
+            time.sleep(3)
+
+            self.bring_tally_to_front()
+            time.sleep(0.5)
+
+            logger.info(f"[TallyLauncher] TDS: Typing username '{username}'")
+            self.type_text(username)
+            time.sleep(0.3)
+            pyautogui.press('enter')
+            time.sleep(1)
+
+            self.type_text(password)
+            time.sleep(0.3)
+            pyautogui.press('enter')
+            time.sleep(2)
+
+            logger.info("[TallyLauncher] TDS: Login submitted ✓")
+            return True, "logged_in"
+
+        # ── Local / Remote login ───────────────────────────────────────────
         logger.info("[TallyLauncher] Waiting for company login dialog (10s)...")
-        found, _ = self._wait_for_image(self._img("username"), timeout=10)
+        found = self.wait_for_image("username", seconds=10)
 
         if not found:
-            logger.info("[TallyLauncher] No company login dialog — company opened directly ✓")
-            return True, "no_company_login"
+            logger.info("[TallyLauncher] No login dialog — company opened directly ✓")
+            return True, "no_login"
 
-        username = getattr(co, 'tally_username', '') or ''
-        password = getattr(co, 'tally_password', '') or ''
+        logger.info(f"[TallyLauncher] Login dialog found — typing username '{username}'")
+        self.bring_tally_to_front()
+        time.sleep(1)
 
-        logger.info(
-            f"[TallyLauncher] Login dialog detected for '{co.name}' — "
-            f"typing username: '{username}'"
+        self.type_text(username)
+        time.sleep(0.3)
+        pyautogui.press('enter')
+        time.sleep(1)
+
+        self.type_text(password)
+        time.sleep(0.3)
+        pyautogui.press('enter')
+        time.sleep(2)
+
+        # Check if dialog is gone (login success)
+        img_path = os.path.join(ASSETS_DIR, IMAGE_FILES["username"])
+        for _ in range(8):
+            if not self.find_image_on_screen(img_path):
+                logger.info("[TallyLauncher] Login successful ✓")
+                return True, "logged_in"
+            time.sleep(1)
+
+        return False, (
+            f"Login failed for '{company.name}' — dialog still visible. "
+            "Check username/password in Configure Company."
         )
 
-        # Type username char by char at 0.1s — field is already focused, no ctrl+a
-        self._type_interval(username, interval=0.1)
-        time.sleep(0.3)
-        pyautogui.press('enter')
-        time.sleep(delay * 1.5)
+    # ──────────────────────────────────────────────
+    #  STEP 8 — WAIT FOR GATEWAY
+    # ──────────────────────────────────────────────
 
-        # Type password char by char at 0.1s — no ctrl+a
-        self._type_interval(password, interval=0.1)
-        time.sleep(0.3)
-        pyautogui.press('enter')
-        time.sleep(delay * 2)
+    def wait_for_gateway(self) -> Tuple[bool, str]:
+        """Wait for the Tally Gateway screen — confirms company is fully open."""
+        timeout = self.get_timeout()
+        logger.info(f"[TallyLauncher] Waiting for Gateway screen (timeout={timeout}s)...")
 
-        # Confirm login dialog is dismissed
-        still_showing, _ = self._wait_for_image(self._img("username"), timeout=4)
-        if still_showing:
-            return False, (
-                f"Login failed for '{co.name}' — dialog still visible. "
-                "Check username/password in Configure Company."
-            )
+        found = self.wait_for_image("gateway", seconds=timeout)
+        if found:
+            logger.info("[TallyLauncher] Gateway screen found ✓")
+            return True, "gateway_found"
 
-        logger.info(f"[TallyLauncher] Company login successful ✓")
-        return True, "company_logged_in"
-
-    def _wait_for_gateway(self) -> Tuple[bool, str]:
-
-        timeout = self._timeout()
-        logger.info(f"[TallyLauncher] Waiting for Gateway (timeout={timeout}s)...")
-
-        ok, msg = self._wait_for_image(self._img("gateway"), timeout=timeout)
-        if ok:
-            logger.info("[TallyLauncher] Gateway confirmed via image ✓")
-            return True, "gateway_image_found"
-
-        logger.warning("[TallyLauncher] Gateway image not found — trying XML fallback...")
+        # Fallback: try connecting via XML to confirm Tally is responding
+        logger.warning("[TallyLauncher] Gateway image not found — trying XML connection...")
         for attempt in range(5):
             try:
                 from services.tally_connector import TallyConnector
-                tc = TallyConnector(
-                    host=self._state.tally.host,
-                    port=self._state.tally.port,
-                )
+                tc = TallyConnector(host=self.state.tally.host, port=self.state.tally.port)
                 if tc.status == "Connected":
                     logger.info("[TallyLauncher] Gateway confirmed via XML ✓")
-                    return True, "gateway_xml_confirmed"
+                    return True, "gateway_xml"
             except Exception as e:
-                logger.debug(f"[TallyLauncher] XML attempt {attempt+1}: {e}")
+                logger.debug(f"[TallyLauncher] XML attempt {attempt + 1}: {e}")
             time.sleep(3)
 
-        return False, "Gateway not confirmed — image not found and XML not responding"
+        return False, "Gateway not found — image not detected and XML not responding"
 
-    def _get_tally_window(self):
-        if HAS_PYGETWINDOW:
-            wins = gw.getWindowsWithTitle("Tally") or gw.getWindowsWithTitle("tally")
-            return wins[0] if wins else None
-        return None
+    # ──────────────────────────────────────────────
+    #  HELPER — WINDOW
+    # ──────────────────────────────────────────────
 
-    def _bring_to_front(self) -> Tuple[bool, str]:
+    def get_tally_window(self):
+        """Get the Tally window object. Returns None if not found."""
+        if not HAS_PYGETWINDOW:
+            return None
+        wins = gw.getWindowsWithTitle("Tally") or gw.getWindowsWithTitle("tally")
+        return wins[0] if wins else None
+
+    def bring_tally_to_front(self):
+        """Bring the Tally window to the front so we can type into it."""
         if not HAS_PYGETWINDOW:
             time.sleep(0.3)
-            return True, "no_pygetwindow"
-        win = self._get_tally_window()
+            return
+        win = self.get_tally_window()
         if not win:
-            return False, "Tally window not found"
+            return
         try:
             if win.isMinimized:
                 win.restore()
                 time.sleep(0.5)
             win.activate()
-            time.sleep(0.8)   # single settle time — removed duplicate 0.5s (was 1.3s total)
-            return True, "focused"
-        except Exception as e:
-            return False, str(e)
+            time.sleep(0.8)
+        except Exception:
+            pass
 
-    def _get_all_open_companies(self, retries: int = 3) -> list:
-        from services.tally_connector import TallyConnector
-        host = self._state.tally.host
-        port = self._state.tally.port
-        for attempt in range(retries):
-            try:
-                tc = TallyConnector(host=host, port=port)
-                if tc.status != "Connected":
-                    time.sleep(2)
-                    continue
-                companies = tc.fetch_all_companies()
-                return [c.get('name', '').strip() for c in companies if c.get('name', '').strip()]
-            except Exception:
-                if attempt < retries - 1:
-                    time.sleep(2)
-        return []
+    # ──────────────────────────────────────────────
+    #  HELPER — IMAGE DETECTION
+    # ──────────────────────────────────────────────
 
-    def _locate_on_screen(self, img_path: str):
+    def find_image_on_screen(self, img_path: str):
+        """
+        Look for an image on the screen.
+        Returns the location if found, or None if not found.
+        """
         try:
             if HAS_OPENCV:
-                return pyautogui.locateOnScreen(
-                    img_path, confidence=self._confidence(), grayscale=True
-                )
+                return pyautogui.locateOnScreen(img_path, confidence=self.get_confidence(), grayscale=True)
             else:
                 return pyautogui.locateOnScreen(img_path)
         except pyautogui.ImageNotFoundException:
             return None
-        except Exception as e:
-            err = str(e).lower()
-            if "confidence" in err or "opencv" in err:
-                try:
-                    return pyautogui.locateOnScreen(img_path)
-                except pyautogui.ImageNotFoundException:
-                    return None
+        except Exception:
             return None
 
-    def _wait_for_image(self, image_filename: str, timeout: int = None) -> Tuple[bool, str]:
-        if timeout is None:
-            timeout = self._timeout()
-        img_path = os.path.join(_ASSETS_DIR, image_filename)
-        if not os.path.exists(img_path):
-            return False, f"Image file missing: {image_filename}"
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self._locate_on_screen(img_path):
-                return True, "found"
-            time.sleep(1)
-        return False, f"Timeout {timeout}s — '{image_filename}' not found"
+    def wait_for_image(self, image_key: str, seconds: int = 30) -> bool:
+        """
+        Wait up to `seconds` for an image to appear on screen.
+        Returns True if found, False if timed out.
+        image_key is a key from IMAGE_FILES dict (e.g. "search_box", "gateway").
+        """
+        # Get image filename from state (loaded from DB) or fall back to defaults
+        images   = getattr(self.state, 'tally_images', {}) or {}
+        filename = images.get(image_key) or IMAGE_FILES.get(image_key) or f"tally_{image_key}.png"
+        img_path = os.path.join(ASSETS_DIR, filename)
 
-    def _click_image(self, image_filename: str) -> Tuple[bool, str]:
-        img_path = os.path.join(_ASSETS_DIR, image_filename)
         if not os.path.exists(img_path):
-            return False, f"Image file missing: {image_filename}"
-        for attempt in range(self._retry_count()):
-            loc = self._locate_on_screen(img_path)
+            logger.warning(f"[TallyLauncher] Image file not found: {filename}")
+            return False
+
+        end_time = time.time() + seconds
+        while time.time() < end_time:
+            if self.find_image_on_screen(img_path):
+                return True
+            time.sleep(1)
+
+        logger.warning(f"[TallyLauncher] Timed out waiting for: {filename}")
+        return False
+
+    def click_image(self, image_key: str) -> bool:
+        """
+        Find an image on screen and click it.
+        Returns True if clicked, False if image not found.
+        """
+        images   = getattr(self.state, 'tally_images', {}) or {}
+        filename = images.get(image_key) or IMAGE_FILES.get(image_key) or f"tally_{image_key}.png"
+        img_path = os.path.join(ASSETS_DIR, filename)
+
+        if not os.path.exists(img_path):
+            logger.warning(f"[TallyLauncher] Image file not found: {filename}")
+            return False
+
+        for _ in range(3):
+            loc = self.find_image_on_screen(img_path)
             if loc:
-                cx, cy = pyautogui.center(loc)
-                pyautogui.click(cx, cy)
-                return True, "clicked"
+                x, y = pyautogui.center(loc)
+                pyautogui.click(x, y)
+                return True
             time.sleep(1)
-        return False, f"'{image_filename}' not found after {self._retry_count()} attempts"
 
-    def _type_interval(self, text, interval: float = 0.1) -> None:
+        logger.warning(f"[TallyLauncher] Could not find image to click: {filename}")
+        return False
+
+    def double_click_image(self, image_key: str) -> bool:
         """
-        Convert input to str, then type character by character using
-        pyautogui.press() with a fixed delay between each keystroke.
-        No clipboard, no ctrl shortcuts — pure keystroke simulation.
+        Find an image on screen and double-click it.
+        Returns True if clicked, False if image not found.
         """
-        if text is None:
-            return
-        text = str(text)
+        images   = getattr(self.state, 'tally_images', {}) or {}
+        filename = images.get(image_key) or IMAGE_FILES.get(image_key) or f"tally_{image_key}.png"
+        img_path = os.path.join(ASSETS_DIR, filename)
+
+        if not os.path.exists(img_path):
+            logger.warning(f"[TallyLauncher] Image file not found: {filename}")
+            return False
+
+        for _ in range(3):
+            loc = self.find_image_on_screen(img_path)
+            if loc:
+                x, y = pyautogui.center(loc)
+                pyautogui.doubleClick(x, y)
+                return True
+            time.sleep(1)
+
+        logger.warning(f"[TallyLauncher] Could not find image to double-click: {filename}")
+        return False
+
+    # ──────────────────────────────────────────────
+    #  HELPER — TYPING
+    # ──────────────────────────────────────────────
+
+    def type_text(self, text) -> None:
+        """Type text character by character into the active window."""
         if not text:
             return
-        for ch in text:
-            pyautogui.press(ch)
-            time.sleep(interval)
+        pyautogui.write(str(text), interval=0.1)
 
-    def _paste_text(self, text) -> None:
-        """
-        Convert input to str, then type using pyautogui.typewrite().
-        No clipboard, no ctrl shortcuts.
-        """
-        if text is None:
-            return
-        text = str(text)
-        if not text:
-            return
-        safe = ''.join(c if c.isascii() and c.isprintable() else '' for c in text)
-        pyautogui.typewrite(safe, interval=0.05)
+    # ──────────────────────────────────────────────
+    #  HELPER — SETTINGS FROM STATE
+    # ──────────────────────────────────────────────
 
-    def _type_text(self, text, char_interval: float = 0.0) -> None:
-        """Convert to str and type. char_interval kept for compatibility."""
-        self._paste_text(text)
-
-    def _automation(self):
-        """
-        Safe accessor for state.automation.
-        Returns the AutomationConfig object if it exists, or None.
-        state.automation may be None if DB load failed on startup
-        (e.g. first-run with no DB, or DB connection error) — all callers
-        must use this instead of accessing state.automation directly to avoid
-        AttributeError crashes during Tally launch.
-        """
-        return getattr(self._state, 'automation', None)
-
-    def _confidence(self) -> float:
-        aut = self._automation()
+    def get_confidence(self) -> float:
+        """Image match confidence (0.0 to 1.0). Default 0.80."""
+        aut = getattr(self.state, 'automation', None)
         return float(getattr(aut, 'confidence', 0.80)) if aut else 0.80
 
-    def _click_delay(self) -> float:
-        aut = self._automation()
-        return float(getattr(aut, 'click_delay_ms', 500)) / 1000.0 if aut else 0.5
-
-    def _timeout(self) -> int:
-        aut = self._automation()
+    def get_timeout(self) -> int:
+        """How many seconds to wait for images. Default 30."""
+        aut = getattr(self.state, 'automation', None)
         return int(getattr(aut, 'wait_timeout_sec', 30)) if aut else 30
-
-    def _retry_count(self) -> int:
-        aut = self._automation()
-        return int(getattr(aut, 'retry_attempts', 3)) if aut else 3
-
-    def _img(self, key: str) -> str:
-        images = getattr(self._state, 'tally_images', {})
-        defaults = {
-            "gateway": "tally_gateway_screen.png",
-            "search_box": "tally_company_search_box.png",
-            "username": "tally_username_field.png",
-            "password": "tally_password_field.png",
-            "select_title": "tally_select_company_title.png",
-            "change_path": "tally_change_path_btn.png",
-            "remote_tab": "tally_remote_tab.png",
-            "tds_field": "tally_tds_field.png",
-        }
-        return images.get(key, defaults.get(key, f"tally_{key}.png"))

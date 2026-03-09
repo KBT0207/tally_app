@@ -73,6 +73,7 @@ class SyncController:
         sequential:     bool = True,
         from_dates_map: Optional[dict] = None,
         to_dates_map:   Optional[dict] = None,
+        bypass_active_check: bool = False,   # ← set True by SyncQueueController
     ):
         self._state      = state
         self._q          = out_queue
@@ -91,6 +92,7 @@ class SyncController:
         self._sequential = sequential
         self._cancelled  = False
         self._threads: list[threading.Thread] = []
+        self._bypass_active_check = bypass_active_check
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Public API
@@ -101,9 +103,14 @@ class SyncController:
 
         Phase 2: Uses module-level lock to prevent double-sync race condition.
         If another sync is already running, logs a warning and aborts.
+
+        bypass_active_check=True (set by SyncQueueController): skips the
+        sync_active guard. The queue controller serialises companies itself —
+        checking sync_active here causes CDC syncs to be silently skipped
+        when sync_active hasn't fully cleared between companies.
         """
         with _SYNC_LOCK:
-            if self._state.sync_active:
+            if not self._bypass_active_check and self._state.sync_active:
                 logger.warning("[SyncController] Sync already active — skipping duplicate start")
                 # Post all_done so caller doesn't hang waiting
                 self._q.put(("all_done",))

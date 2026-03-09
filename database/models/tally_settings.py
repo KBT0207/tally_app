@@ -31,6 +31,8 @@ class TallySettings(Base):
     image_change_path  = Column(String(255), default='tally_change_path_btn.png')
     image_remote_tab   = Column(String(255), default='tally_remote_tab.png')
     image_tds_field    = Column(String(255), default='tally_tds_field.png')
+    image_data_server  = Column(String(255), default='tally_dataserver_image.png')   # TDS: Data Server button
+    image_local_path   = Column(String(255), default='tally_local_path_image.png')   # TDS: path input field
 
     updated_at  = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

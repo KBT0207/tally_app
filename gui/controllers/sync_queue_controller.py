@@ -702,6 +702,7 @@ class SyncQueueController:
             to_date    = datetime.now().strftime("%Y%m%d"),
             vouchers   = self._state.voucher_selection,
             sequential = True,
+            bypass_active_check = True,   # queue controller owns serialisation
         )
         controller.start()
 

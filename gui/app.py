@@ -627,6 +627,8 @@ class TallySyncApp:
                 "change_path":  ts.image_change_path  or "tally_change_path_btn.png",
                 "remote_tab":   ts.image_remote_tab   or "tally_remote_tab.png",
                 "tds_field":    ts.image_tds_field    or "tally_tds_field.png",
+                "data_server":  getattr(ts, 'image_data_server', None) or "tally_dataserver_image.png",
+                "local_path":   getattr(ts, 'image_local_path',  None) or "tally_local_path_image.png",
             }
 
             # ── AutomationSettings ────────────────────────

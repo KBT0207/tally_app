@@ -317,41 +317,25 @@ class ConfigureCompanyDialog(tk.Toplevel):
             ).grid(row=2, column=1, columnspan=2, sticky="w", pady=(2, 0))
 
         elif typ == "tds":
-            # TDS server IP + path
-            tk.Label(f, text="Server IP:", font=Font.BODY,
-                     bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
-                     width=10, anchor="w").grid(row=0, column=0, sticky="w")
-
-            tk.Entry(
-                f, textvariable=self._tds_path_var,
-                font=Font.BODY, width=20,
-                bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
-                relief="solid", bd=1,
-            ).grid(row=0, column=1, sticky="w", padx=(4, 0))
+            # TDS: no manual IP or path needed.
+            # TallyLauncher will click the Data Server button automatically
+            # and handle the path selection via image recognition.
+            tk.Label(
+                f,
+                text="✓  TDS Server mode selected.",
+                font=Font.BODY,
+                bg=Color.SUCCESS_BG, fg=Color.SUCCESS_FG,
+                padx=10, pady=6,
+            ).grid(row=0, column=0, columnspan=3, sticky="w")
 
             tk.Label(
-                f, text="e.g.  192.168.1.10",
-                font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
-            ).grid(row=0, column=2, sticky="w", padx=(8, 0))
-
-            tk.Label(f, text="Data Path:", font=Font.BODY,
-                     bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
-                     width=10, anchor="w").grid(row=1, column=0, sticky="w", pady=(6, 0))
-
-            tk.Entry(
-                f, textvariable=self._data_path_var,
-                font=Font.BODY, width=30,
-                bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
-                relief="solid", bd=1,
-            ).grid(row=1, column=1, sticky="w", padx=(4, 6), pady=(6, 0))
-
-            tk.Button(
-                f, text="Browse…",
-                font=Font.BUTTON_SM,
-                bg=Color.PRIMARY_LIGHT, fg=Color.PRIMARY,
-                relief="solid", bd=1, padx=8, pady=3, cursor="hand2",
-                command=self._browse_data_path,
-            ).grid(row=1, column=2, sticky="w", pady=(6, 0))
+                f,
+                text="Tally will be opened and the Data Server will be\n"
+                     "selected automatically during sync.",
+                font=Font.BODY_SM,
+                bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+                justify="left",
+            ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def _browse_data_path(self):
         """Open folder browser and set data_path_var."""
@@ -400,8 +384,8 @@ class ConfigureCompanyDialog(tk.Toplevel):
         username      = self._username_var.get().strip()
         password      = self._password_var.get().strip()
         company_type  = self._type_var.get()
-        data_path     = self._data_path_var.get().strip()
-        tds_path      = self._tds_path_var.get().strip()
+        data_path     = self._data_path_var.get().strip() if company_type != "tds" else ""
+        tds_path      = self._tds_path_var.get().strip()  if company_type != "tds" else ""
         drive_letter  = self._drive_var.get().strip()
 
         # ── Detect start-date change on an already-synced company ────────────
