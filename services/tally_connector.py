@@ -620,6 +620,40 @@ class TallyConnector:
             company_name, alter_id=last_alter_id, debug=debug,
         )
 
+    # ── Outstanding fetches ───────────────────────────────────────────────────
+
+    def fetch_outstanding_debtors(
+        self,
+        company_name: str,
+        from_date:    Optional[str] = None,
+        to_date:      Optional[str] = None,
+        debug:        bool          = False,
+    ) -> Optional[bytes]:
+        """
+        Fetch all vouchers under Sundry Debtors (Receivables) for the given
+        date range.  Parsed by data_processor.parse_outstanding().
+        """
+        return self._fetch(
+            'utils/outstanding_debtors.xml', 'Outstanding Debtors',
+            company_name, from_date, to_date, debug=debug,
+        )
+
+    def fetch_outstanding_creditors(
+        self,
+        company_name: str,
+        from_date:    Optional[str] = None,
+        to_date:      Optional[str] = None,
+        debug:        bool          = False,
+    ) -> Optional[bytes]:
+        """
+        Fetch all vouchers under Sundry Creditors (Payables) for the given
+        date range.  Parsed by data_processor.parse_outstanding().
+        """
+        return self._fetch(
+            'utils/outstanding_creditors.xml', 'Outstanding Creditors',
+            company_name, from_date, to_date, debug=debug,
+        )
+
     # ── Date utilities ────────────────────────────────────────────────────────
 
     @staticmethod

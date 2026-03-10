@@ -74,32 +74,34 @@ class CompanyState:
 # ─────────────────────────────────────────────
 @dataclass
 class VoucherSelection:
-    ledgers:       bool = True
-    items:         bool = True
-    sales:         bool = True
-    purchase:      bool = True
-    credit_note:   bool = True
-    debit_note:    bool = True
-    receipt:       bool = True
-    payment:       bool = True
-    journal:       bool = True
-    contra:        bool = True
-    trial_balance: bool = True
+    ledgers:              bool = True
+    items:                bool = True
+    sales:                bool = True
+    purchase:             bool = True
+    credit_note:          bool = True
+    debit_note:           bool = True
+    receipt:              bool = True
+    payment:              bool = True
+    journal:              bool = True
+    contra:               bool = True
+    trial_balance:        bool = True
+    outstanding_debtors:  bool = True
 
     def selected_types(self) -> list:
         """Return list of selected voucher_type strings matching VOUCHER_CONFIG keys."""
         mapping = {
-            'ledgers':       'ledger',
-            'items':         'items',
-            'sales':         'sales',
-            'purchase':      'purchase',
-            'credit_note':   'credit_note',
-            'debit_note':    'debit_note',
-            'receipt':       'receipt',
-            'payment':       'payment',
-            'journal':       'journal',
-            'contra':        'contra',
-            'trial_balance': 'trial_balance',
+            'ledgers':             'ledger',
+            'items':               'items',
+            'sales':               'sales',
+            'purchase':            'purchase',
+            'credit_note':         'credit_note',
+            'debit_note':          'debit_note',
+            'receipt':             'receipt',
+            'payment':             'payment',
+            'journal':             'journal',
+            'contra':              'contra',
+            'trial_balance':       'trial_balance',
+            'outstanding_debtors': 'outstanding_debtors',
         }
         return [v for k, v in mapping.items() if getattr(self, k)]
 
@@ -107,7 +109,7 @@ class VoucherSelection:
         return all([
             self.ledgers, self.items, self.sales, self.purchase, self.credit_note,
             self.debit_note, self.receipt, self.payment, self.journal,
-            self.contra, self.trial_balance
+            self.contra, self.trial_balance, self.outstanding_debtors,
         ])
 
 

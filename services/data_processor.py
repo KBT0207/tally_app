@@ -1090,3 +1090,127 @@ def parse_items(xml_content, company_name: str) -> list:
         logger.error(f"Error parsing items: {e}")
         logger.error(traceback.format_exc())
         return []
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outstanding — Debtors parser
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Tally AMOUNT field is FCY-formatted:
+#   "-$32283.00 @ ? 50.1288/$ = -? 1618306.50"
+#   Negative raw = debit to party  = receivable still outstanding
+#   Positive raw = credit to party = receipt already received
+#
+# Uses lxml recover=True to handle Tally's occasional invalid XML characters.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_outstanding_debtors(xml_content, company_name: str) -> list:
+    """
+    Parse Sundry Debtors (Receivables) outstanding vouchers.
+
+    Usage:
+        raw  = tally.fetch_outstanding_debtors(company, from_date, to_date)
+        rows = parse_outstanding_debtors(raw, company_name)
+
+    Returns list[dict] with keys:
+        company_name, party_type, party_name,
+        voucher_number, voucher_type,
+        bill_name, bill_type, date, bill_date, due_date,
+        reference, narration,
+        currency,       ← 'USD' / 'INR' — tells caller what unit amount is in
+        exchange_rate,  ← INR per FCY unit; 1.0 for plain INR vouchers
+        amount          ← in detected currency; negative = still outstanding
+    """
+    try:
+        from lxml import etree as _lxml
+
+        if not xml_content:
+            logger.warning(f"Empty XML for outstanding debtors [{company_name}]")
+            return []
+
+        raw = xml_content if isinstance(xml_content, bytes) else xml_content.encode('utf-8')
+
+        # lxml recover=True silently skips invalid chars Tally sometimes emits
+        parser   = _lxml.XMLParser(recover=True, encoding='utf-8')
+        root     = _lxml.fromstring(raw, parser=parser)
+        vouchers = root.findall('.//VOUCHER')
+        logger.info(f"Found {len(vouchers)} debtors vouchers [{company_name}]")
+
+        if not vouchers:
+            return []
+
+        all_rows = []
+
+        for voucher in vouchers:
+            vnum    = clean_text(voucher.findtext('VOUCHERNUMBER',      ''))
+            vtype   = clean_text(voucher.findtext('VOUCHERTYPENAME',    ''))
+            party   = clean_text(voucher.findtext('PARTYLEDGERNAME',    ''))
+            ref     = clean_text(voucher.findtext('REFERENCE',          ''))
+            narr    = clean_text(voucher.findtext('NARRATION',          ''))
+            raw_dt  = clean_text(voucher.findtext('DATE',               ''))
+            due_raw = clean_text(voucher.findtext('BASICDUEDATEOFPYMT', ''))
+
+            if not vnum:
+                continue
+
+            txn_date = parse_tally_date_formatted(raw_dt)
+            due_date = (
+                parse_tally_date_formatted(due_raw)
+                if due_raw and due_raw not in ('', '000000000') else None
+            )
+
+            # ── Find party leg in ALLLEDGERENTRIES ────────────────────────────
+            amount        = 0.0
+            exchange_rate = 1.0
+            currency      = 'INR'
+            bill_name     = vnum
+            bill_type     = vtype
+            bill_date     = txn_date
+            is_debit      = True
+
+            for le in voucher.findall('.//ALLLEDGERENTRIES.LIST'):
+                isparty = clean_text(le.findtext('ISPARTYLEDGER', 'No'))
+                le_name = clean_text(le.findtext('LEDGERNAME',    ''))
+                amt_raw = clean_text(le.findtext('AMOUNT',        '0'))
+                bn      = clean_text(le.findtext('NAME',          ''))
+                bt      = clean_text(le.findtext('BILLTYPE',      ''))
+                bd      = clean_text(le.findtext('BILLDATE',      ''))
+
+                if isparty == 'Yes' and le_name == party:
+                    is_debit      = amt_raw.strip().startswith('-')
+                    amount        = _parse_fcy_amount(amt_raw)
+                    exchange_rate = _parse_fcy_exchange_rate(amt_raw)
+                    currency      = _detect_currency(amt_raw)
+                    if bn:
+                        bill_name = bn
+                    if bt:
+                        bill_type = bt
+                    if bd and bd not in ('', '000000000'):
+                        bill_date = parse_tally_date_formatted(bd)
+                    break
+
+            signed_amount = -amount if is_debit else amount
+
+            all_rows.append({
+                'company_name'  : company_name,
+                'party_name'    : party,
+                'voucher_number': vnum,
+                'voucher_type'  : vtype,
+                'bill_name'     : bill_name,
+                'bill_type'     : bill_type,
+                'date'          : txn_date,
+                'bill_date'     : bill_date,
+                'due_date'      : due_date,
+                'reference'     : ref,
+                'currency'      : currency,
+                'exchange_rate' : exchange_rate,
+                'amount'        : signed_amount,
+                'narration'     : narr,
+            })
+
+        logger.info(f"Parsed {len(all_rows)} debtors rows [{company_name}]")
+        return all_rows
+
+    except Exception as e:
+        logger.error(f"Error parsing outstanding debtors [{company_name}]: {e}")
+        logger.error(traceback.format_exc())
+        return []

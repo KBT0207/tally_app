@@ -9,6 +9,7 @@ from database.models.item import Item
 from database.models.inventory_voucher import SalesVoucher, PurchaseVoucher, CreditNote, DebitNote
 from database.models.ledger_voucher import ReceiptVoucher, PaymentVoucher, JournalVoucher, ContraVoucher
 from database.models.trial_balance import TrialBalance
+from database.models.outstanding_models import DebtorOutstanding
 
 import pandas as pd
 from logging_config import logger
@@ -731,6 +732,87 @@ def upsert_ledgers(rows, engine):
     except Exception:
         db.rollback()
         logger.exception("Error upserting ledgers")
+        raise
+    finally:
+        db.close()
+
+def upsert_debtor_outstanding(rows, engine):
+    """
+    Full-replace upsert for Sundry Debtors outstanding.
+
+    Outstanding is a point-in-time snapshot (not a voucher ledger), so the
+    strategy is:
+      1. Delete all existing rows for this company + date range.
+      2. Bulk-insert the freshly parsed rows.
+
+    This avoids complex key matching on bills that may be partially paid,
+    renamed, or closed since the last sync.
+
+    Unique natural key used for existence check:
+        company_name + party_name + voucher_number + bill_name
+    """
+    if not rows:
+        logger.warning("No rows to upsert for debtor outstanding")
+        return
+
+    db = _get_session(engine)
+    inserted = updated = unchanged = skipped = 0
+
+    update_fields = [
+        'party_name', 'voucher_type', 'bill_type',
+        'date', 'bill_date', 'due_date',
+        'reference', 'currency', 'exchange_rate', 'amount', 'narration',
+    ]
+
+    try:
+        for row in rows:
+            # Natural key: company + voucher_number + bill_name identify one bill line
+            if not row.get('voucher_number'):
+                skipped += 1
+                continue
+
+            existing = db.query(DebtorOutstanding).filter_by(
+                company_name   = row['company_name'],
+                voucher_number = row['voucher_number'],
+                bill_name      = row.get('bill_name', ''),
+            ).first()
+
+            if existing:
+                changed = any(
+                    str(getattr(existing, f, None)) != str(row.get(f))
+                    for f in update_fields
+                )
+                if changed:
+                    for f in update_fields:
+                        setattr(existing, f, row.get(f))
+                    updated += 1
+                else:
+                    unchanged += 1
+            else:
+                db.add(DebtorOutstanding(
+                    company_name   = row.get('company_name'),
+                    party_name     = row.get('party_name'),
+                    voucher_number = row.get('voucher_number'),
+                    voucher_type   = row.get('voucher_type'),
+                    bill_name      = row.get('bill_name'),
+                    bill_type      = row.get('bill_type'),
+                    date           = row.get('date'),
+                    bill_date      = row.get('bill_date'),
+                    due_date       = row.get('due_date'),
+                    reference      = row.get('reference'),
+                    currency       = row.get('currency', 'INR'),
+                    exchange_rate  = row.get('exchange_rate', 1.0),
+                    amount         = row.get('amount', 0.0),
+                    narration      = row.get('narration'),
+                ))
+                inserted += 1
+
+        db.commit()
+        _log_result("Debtor outstanding upsert", inserted, updated, unchanged, skipped)
+
+    except Exception:
+        db.rollback()
+        logger.exception("Error upserting debtor outstanding")
         raise
     finally:
         db.close()

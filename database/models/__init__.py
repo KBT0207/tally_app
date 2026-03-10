@@ -24,6 +24,7 @@ from .scheduler_config      import CompanySchedulerConfig
 # ── Phase 1: New models ───────────────────────────────────────────────────────
 from .tally_settings        import TallySettings
 from .automation_settings   import AutomationSettings
+from .outstanding_models import DebtorOutstanding
 
 __all__ = [
     'Base',
@@ -36,6 +37,8 @@ __all__ = [
     'ReceiptVoucher', 'PaymentVoucher', 'JournalVoucher', 'ContraVoucher',
     'TrialBalance',
     'CompanySchedulerConfig',
+
+    'DebtorOutstanding',
     # phase 1
     'TallySettings',
     'AutomationSettings',

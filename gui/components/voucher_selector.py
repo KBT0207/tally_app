@@ -12,17 +12,18 @@ from gui.state  import VoucherSelection
 
 # Label, attribute name on VoucherSelection, icon
 VOUCHER_ITEMS = [
-    ("Ledgers",          "ledgers",       "📒"),
-    ("Items",            "items",         "📦"),
-    ("Sales",            "sales",         "🧾"),
-    ("Purchase",         "purchase",      "🛒"),
-    ("Credit Note",      "credit_note",   "📄"),
-    ("Debit Note",       "debit_note",    "📄"),
-    ("Receipt",          "receipt",       "💰"),
-    ("Payment",          "payment",       "💸"),
-    ("Journal",          "journal",       "📓"),
-    ("Contra",           "contra",        "🔄"),
-    ("Trial Balance",    "trial_balance", "⚖️"),
+    ("Ledgers",                "ledgers",              "📒"),
+    ("Items",                  "items",                "📦"),
+    ("Sales",                  "sales",                "🧾"),
+    ("Purchase",               "purchase",             "🛒"),
+    ("Credit Note",            "credit_note",          "📄"),
+    ("Debit Note",             "debit_note",           "📄"),
+    ("Receipt",                "receipt",              "💰"),
+    ("Payment",                "payment",              "💸"),
+    ("Journal",                "journal",              "📓"),
+    ("Contra",                 "contra",               "🔄"),
+    ("Trial Balance",          "trial_balance",        "⚖️"),
+    ("Outstanding Receivable", "outstanding_debtors",  "📊"),
 ]
 
 

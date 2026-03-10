@@ -26,17 +26,18 @@ from gui.controllers.sync_controller    import SyncController
 #  Voucher definitions
 # ─────────────────────────────────────────────────────────────────────────────
 VOUCHER_COLS = [
-    ("Ld", "ledgers",       "Ledgers",       "📒"),
-    ("It", "items",         "Items / Stock", "📦"),
-    ("Sl", "sales",         "Sales",         "🧾"),
-    ("Pu", "purchase",      "Purchase",      "🛒"),
-    ("CN", "credit_note",   "Credit Note",   "📄"),
-    ("DN", "debit_note",    "Debit Note",    "📄"),
-    ("Rc", "receipt",       "Receipt",       "💰"),
-    ("Pm", "payment",       "Payment",       "💸"),
-    ("Jn", "journal",       "Journal",       "📓"),
-    ("Co", "contra",        "Contra",        "🔄"),
-    ("TB", "trial_balance", "Trial Balance", "⚖️"),
+    ("Ld", "ledgers",              "Ledgers",               "📒"),
+    ("It", "items",                "Items / Stock",         "📦"),
+    ("Sl", "sales",                "Sales",                 "🧾"),
+    ("Pu", "purchase",             "Purchase",              "🛒"),
+    ("CN", "credit_note",          "Credit Note",           "📄"),
+    ("DN", "debit_note",           "Debit Note",            "📄"),
+    ("Rc", "receipt",              "Receipt",               "💰"),
+    ("Pm", "payment",              "Payment",               "💸"),
+    ("Jn", "journal",              "Journal",               "📓"),
+    ("Co", "contra",               "Contra",                "🔄"),
+    ("TB", "trial_balance",        "Trial Balance",         "⚖️"),
+    ("Od", "outstanding_debtors",  "Outstanding Receivable","📊"),
 ]
 
 # Colour tokens

@@ -5,13 +5,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import quote_plus
 from typing import Optional, Dict, Any
 from contextlib import contextmanager
-import logging
+from logging_config import logger
 
 from database.models import (
     Base, 
 )
-
-logger = logging.getLogger(__name__)
 
 
 class DatabaseConnector:

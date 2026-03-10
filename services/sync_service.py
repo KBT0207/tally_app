@@ -13,6 +13,7 @@ from services.data_processor import (
     parse_ledgers,
     parse_items,
     parse_trial_balance,
+    parse_outstanding_debtors,
 )
 from database.database_processor import (
     get_sync_state,
@@ -29,6 +30,7 @@ from database.database_processor import (
     upsert_journal_vouchers,
     upsert_contra_vouchers,
     upsert_trial_balance,
+    upsert_debtor_outstanding,
     INVENTORY_MODEL_MAP,
     LEDGER_MODEL_MAP,
     _upsert_inventory_voucher_in_session,
@@ -306,6 +308,64 @@ def _sync_trial_balance(
 
     except Exception:
         logger.exception(f"[{company_name}] Trial Balance sync failed")
+
+
+def _sync_outstanding_debtors(
+    company_name: str,
+    tally:        TallyConnector,
+    engine,
+    from_date:    str,
+    to_date:      str,
+    progress_cb=None,
+):
+    """
+    Fetch and upsert Sundry Debtors outstanding for the given date range.
+
+    No CDC / alter_id check — outstanding is always a fresh point-in-time
+    snapshot so we always fetch and upsert. SyncState is updated after each
+    successful run so the dashboard can show last_sync_time.
+    """
+    logger.info(f"[{company_name}] Syncing Outstanding Debtors | {from_date} -> {to_date}")
+    try:
+        if progress_cb:
+            progress_cb(0.0, "Fetching outstanding debtors from Tally...")
+
+        if not _tally_semaphore_acquire('outstanding_debtors'):
+            raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+        try:
+            xml = tally.fetch_outstanding_debtors(
+                company_name=company_name, from_date=from_date, to_date=to_date
+            )
+        finally:
+            _TALLY_SEMAPHORE.release()
+
+        if not xml:
+            logger.warning(f"[{company_name}] No outstanding debtors data from Tally")
+            return
+
+        rows = parse_outstanding_debtors(xml, company_name)
+        if not rows:
+            logger.warning(f"[{company_name}] Outstanding debtors parsed 0 rows")
+            return
+
+        upsert_debtor_outstanding(rows, engine)
+
+        lock = _get_company_lock(company_name)
+        with lock:
+            update_sync_state(
+                company_name    = company_name,
+                voucher_type    = 'outstanding_debtors',
+                last_alter_id   = 0,          # no alter_id for outstanding snapshots
+                engine          = engine,
+                is_initial_done = True,
+            )
+
+        logger.info(
+            f"[{company_name}] Outstanding Debtors done | rows={len(rows)}"
+        )
+
+    except Exception:
+        logger.exception(f"[{company_name}] Outstanding Debtors sync failed")
 
 
 def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=None):
@@ -664,10 +724,11 @@ def sync_company(
 
     start_time = datetime.now()
 
-    # Ledgers, items and trial balance are sequential (fast master syncs)
+    # Ledgers, items, trial balance and outstanding are sequential (fast master syncs)
     _sync_ledgers(comp_name, tally, engine)
     _sync_items(comp_name, tally, engine)
     _sync_trial_balance(comp_name, tally, engine, from_date, to_date)
+    _sync_outstanding_debtors(comp_name, tally, engine, from_date, to_date)
 
     logger.info(f"[{comp_name}] Launching {len(VOUCHER_CONFIG)} voucher syncs …")
     with ThreadPoolExecutor(max_workers=inner_workers) as executor:
