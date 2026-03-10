@@ -1118,7 +1118,7 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
         reference, narration,
         currency,       ← 'USD' / 'INR' — tells caller what unit amount is in
         exchange_rate,  ← INR per FCY unit; 1.0 for plain INR vouchers
-        amount          ← in detected currency; negative = still outstanding
+        amount          ← always positive absolute value
     """
     try:
         from lxml import etree as _lxml
@@ -1165,7 +1165,6 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
             bill_name     = vnum
             bill_type     = vtype
             bill_date     = txn_date
-            is_debit      = True
 
             for le in voucher.findall('.//ALLLEDGERENTRIES.LIST'):
                 isparty = clean_text(le.findtext('ISPARTYLEDGER', 'No'))
@@ -1176,8 +1175,8 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
                 bd      = clean_text(le.findtext('BILLDATE',      ''))
 
                 if isparty == 'Yes' and le_name == party:
-                    is_debit      = amt_raw.strip().startswith('-')
-                    amount        = _parse_fcy_amount(amt_raw)
+                    # Always store as absolute value — no sign needed
+                    amount        = abs(_parse_fcy_amount(amt_raw))
                     exchange_rate = _parse_fcy_exchange_rate(amt_raw)
                     currency      = _detect_currency(amt_raw)
                     if bn:
@@ -1187,8 +1186,6 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
                     if bd and bd not in ('', '000000000'):
                         bill_date = parse_tally_date_formatted(bd)
                     break
-
-            signed_amount = -amount if is_debit else amount
 
             all_rows.append({
                 'company_name'  : company_name,
@@ -1203,7 +1200,7 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
                 'reference'     : ref,
                 'currency'      : currency,
                 'exchange_rate' : exchange_rate,
-                'amount'        : signed_amount,
+                'amount'        : amount,
                 'narration'     : narr,
             })
 
