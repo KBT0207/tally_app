@@ -51,8 +51,9 @@ VOUCHER_WORKERS       = 1   # parallel threads for voucher sync within ONE compa
 # fetch dominates (seconds vs milliseconds). Setting this to 2+ only wastes RAM.
 # Raise ONLY if on Tally Server (multi-user) AND you've verified concurrent connections.
 
-# Phase 3 — GUID reconciliation window (days looking back from to_date)
-RECONCILE_WINDOW_DAYS = 90
+# Phase 3 — GUID reconciliation runs from company starting_from → today
+# in SNAPSHOT_CHUNK_MONTHS-month chunks (same cadence as initial snapshot).
+# No fixed rolling window — every sync covers the full company history.
 
 # ── Global Tally request semaphore ───────────────────────────────────────────
 # Tally Prime is single-user/single-connection — even when multiple companies
@@ -335,109 +336,119 @@ def _reconcile_deleted_vouchers(
     config:       dict,
     tally:        TallyConnector,
     engine,
+    from_date:    str,    # company starting_from date (YYYYMMDD) — full history scanned
     to_date:      str,
 ):
     """
-    Phase 3 — Catch deletes that CDC missed.
+    Phase 3 — Catch deletes that CDC missed, scanning from_date → to_date
+    in 3-month chunks (same chunk size as snapshot).
 
-    Called after CDC completes for each voucher type. Compares GUIDs currently
-    in Tally (90-day rolling window) against GUIDs in DB. Any DB row whose GUID
-    is absent from Tally → physically deleted in Tally → hard DELETE from DB.
+    WHY CHUNKS:
+      Fetching GUIDs for the entire company history in one Tally request can
+      return a very large XML payload and time out. Chunking keeps each request
+      small and consistent with how snapshot works.
 
     SAFE FAILURE CONTRACT (never deletes when uncertain):
-      tally_guids is None  → Tally fetch or parse failed → skip, log warning
-      tally_guids is empty → skip (could mean genuine 0 vouchers OR a bug)
-      Any exception        → log, return 0, never raise
+      tally_guids is None  → Tally fetch or parse failed → skip that chunk
+      tally_guids is empty dict → skip that chunk (could be genuine 0 OR a bug)
+      Any chunk exception  → log and continue to next chunk (non-fatal)
 
     Only runs when is_initial_done=True (snapshot must be complete first).
-    Skipped during snapshot phase — no point reconciling while still pulling history.
     """
     voucher_type = config['voucher_type']
     kind         = config['kind']
     guid_fetch   = config['guid_fetch']
+    fetch_fn     = getattr(tally, guid_fetch)
 
-    try:
-        # ── Calculate 90-day window ────────────────────────────────────────
-        td         = datetime.strptime(to_date, '%Y%m%d').date()
-        fd         = td - timedelta(days=RECONCILE_WINDOW_DAYS)
-        from_date  = fd.strftime('%Y%m%d')
+    if kind == 'inventory':
+        model_class = INVENTORY_MODEL_MAP[voucher_type]
+    else:
+        model_class = LEDGER_MODEL_MAP[voucher_type]
 
-        logger.info(
-            f"[{company_name}][{voucher_type}] "
-            f"Phase 3: GUID reconciliation | window {from_date}→{to_date}"
-        )
+    total_deleted = 0
 
-        # ── Fetch GUIDs from Tally ─────────────────────────────────────────
-        fetch_fn = getattr(tally, guid_fetch)
-        if not _tally_semaphore_acquire(voucher_type):
-            logger.warning(
-                f"[{company_name}][{voucher_type}] "
-                f"Phase 3: semaphore timeout — skipping reconciliation"
-            )
-            return
+    logger.info(
+        f"[{company_name}][{voucher_type}] "
+        f"Phase 3: GUID reconciliation | {from_date}→{to_date} | "
+        f"{SNAPSHOT_CHUNK_MONTHS}-month chunks"
+    )
 
+    for chunk_from, chunk_to, month_str in _generate_chunks(from_date, to_date):
         try:
-            xml = fetch_fn(company_name=company_name, from_date=from_date, to_date=to_date)
-        finally:
-            _TALLY_SEMAPHORE.release()
+            # ── Fetch GUIDs for this chunk ─────────────────────────────────
+            if not _tally_semaphore_acquire(voucher_type):
+                logger.warning(
+                    f"[{company_name}][{voucher_type}] "
+                    f"Phase 3 chunk {month_str}: semaphore timeout — skipping chunk"
+                )
+                continue
 
-        if not xml:
-            logger.warning(
-                f"[{company_name}][{voucher_type}] "
-                f"Phase 3: Tally returned no data — skipping (safe)"
+            try:
+                xml = fetch_fn(
+                    company_name = company_name,
+                    from_date    = chunk_from,
+                    to_date      = chunk_to,
+                )
+            finally:
+                _TALLY_SEMAPHORE.release()
+
+            if not xml:
+                logger.debug(
+                    f"[{company_name}][{voucher_type}] "
+                    f"Phase 3 chunk {month_str}: no data from Tally — skipping (safe)"
+                )
+                continue
+
+            # ── Parse GUIDs — None means parse failure ─────────────────────
+            tally_guids = parse_guids(xml)
+
+            if tally_guids is None:
+                logger.warning(
+                    f"[{company_name}][{voucher_type}] "
+                    f"Phase 3 chunk {month_str}: parse_guids failed — skipping chunk (safe)"
+                )
+                continue
+
+            if len(tally_guids) == 0:
+                logger.debug(
+                    f"[{company_name}][{voucher_type}] "
+                    f"Phase 3 chunk {month_str}: 0 GUIDs from Tally — skipping (safe)"
+                )
+                continue
+
+            # ── Reconcile this chunk ───────────────────────────────────────
+            deleted_count = reconcile_deleted_by_guids(
+                company_name = company_name,
+                model_class  = model_class,
+                tally_guids  = tally_guids,
+                from_date    = chunk_from,
+                to_date      = chunk_to,
+                engine       = engine,
             )
-            return
+            total_deleted += deleted_count
 
-        # ── Parse GUIDs — None means parse failure ─────────────────────────
-        tally_guids = parse_guids(xml)
+            if deleted_count > 0:
+                logger.info(
+                    f"[{company_name}][{voucher_type}] "
+                    f"Phase 3 chunk {month_str}: removed {deleted_count} missed deletes ✓"
+                )
+            else:
+                logger.debug(
+                    f"[{company_name}][{voucher_type}] "
+                    f"Phase 3 chunk {month_str}: no missed deletes ✓"
+                )
 
-        if tally_guids is None:
-            logger.warning(
+        except Exception:
+            # One bad chunk must never stop the rest — log and continue
+            logger.exception(
                 f"[{company_name}][{voucher_type}] "
-                f"Phase 3: parse_guids returned None (parse error) — skipping (safe)"
-            )
-            return
-
-        if len(tally_guids) == 0:
-            logger.info(
-                f"[{company_name}][{voucher_type}] "
-                f"Phase 3: Tally returned 0 GUIDs for window — skipping (safe, may be genuine)"
-            )
-            return
-
-        # ── Determine model class ──────────────────────────────────────────
-        if kind == 'inventory':
-            model_class = INVENTORY_MODEL_MAP[voucher_type]
-        else:
-            model_class = LEDGER_MODEL_MAP[voucher_type]
-
-        # ── Run reconciliation ─────────────────────────────────────────────
-        deleted_count = reconcile_deleted_by_guids(
-            company_name = company_name,
-            model_class  = model_class,
-            tally_guids  = tally_guids,
-            from_date    = from_date,
-            to_date      = to_date,
-            engine       = engine,
-        )
-
-        if deleted_count > 0:
-            logger.info(
-                f"[{company_name}][{voucher_type}] "
-                f"Phase 3: reconciled {deleted_count} missed deletes ✓"
-            )
-        else:
-            logger.info(
-                f"[{company_name}][{voucher_type}] "
-                f"Phase 3: no missed deletes found ✓"
+                f"Phase 3 chunk {month_str}: failed (non-fatal, continuing)"
             )
 
-    except Exception:
-        # Phase 3 must NEVER crash the sync — log and continue
-        logger.exception(
-            f"[{company_name}][{voucher_type}] "
-            f"Phase 3: reconciliation failed (non-fatal, sync continues)"
-        )
+    logger.info(
+        f"[{company_name}][{voucher_type}] "
+        f"Phase 3: done | total removed={total_deleted}"
+    )
 
 
 # ── Sub-sync functions ────────────────────────────────────────────────────────
@@ -747,7 +758,7 @@ def _sync_voucher(
                     f"[{company_name}][{voucher_type}] CDC: no response from Tally ({fetch_ms}ms)"
                 )
                 # Still run Phase 3 — may catch old missed deletes
-                _reconcile_deleted_vouchers(company_name, config, tally, engine, to_date)
+                _reconcile_deleted_vouchers(company_name, config, tally, engine, from_date, to_date)
                 return
 
             rows = parser(xml, company_name, parser_type_name)
@@ -761,7 +772,7 @@ def _sync_voucher(
                 )
                 _advance_alter_id_from_xml(xml, company_name, voucher_type, engine, lock)
                 # Still run Phase 3
-                _reconcile_deleted_vouchers(company_name, config, tally, engine, to_date)
+                _reconcile_deleted_vouchers(company_name, config, tally, engine, from_date, to_date)
                 return
 
             t1 = datetime.now()
@@ -778,7 +789,7 @@ def _sync_voucher(
             )
 
             # ── PHASE 3: GUID reconciliation (always after CDC) ───────────────
-            _reconcile_deleted_vouchers(company_name, config, tally, engine, to_date)
+            _reconcile_deleted_vouchers(company_name, config, tally, engine, from_date, to_date)
             return
 
         # ── PHASE 1: Snapshot mode (first run — chunked) ──────────────────────
@@ -1047,3 +1058,109 @@ def sync_all_companies_parallel(
                 logger.info(f"Company '{name}' sync thread finished ✓")
             except Exception:
                 logger.error(f"Company '{name}' sync thread raised an exception")
+
+# ── Deep Reconcile — re-runs Phase 3 for full company history ────────────────
+#
+# Since _reconcile_deleted_vouchers now already scans from starting_from → today
+# in 3-month chunks on every normal CDC sync, a separate "deep reconcile" is no
+# longer needed.  This function is kept as a thin public wrapper so sync_page.py
+# and any external callers still work without changes.
+
+def deep_reconcile_company(
+    company:     dict,
+    tally:       TallyConnector,
+    engine,
+    to_date:     str,
+    progress_cb  = None,
+) -> dict:
+    """
+    Re-run Phase 3 GUID reconciliation for the full company history
+    (starting_from → to_date) in 3-month chunks.
+
+    Identical to what normal CDC sync already does on every run, but exposed
+    as a standalone callable so the UI "Deep Reconcile" button can trigger it
+    on-demand without running a full sync.
+
+    Returns dict: { voucher_type: deleted_count, ... }
+    """
+    comp_name = company.get('name', '').strip()
+    from_date = _resolve_from_date(company)
+    results   = {}
+    total     = len(VOUCHER_CONFIG)
+
+    logger.info('=' * 60)
+    logger.info(f'[{comp_name}] DEEP RECONCILE START')
+    logger.info(f'  Range : {from_date} → {to_date} | {SNAPSHOT_CHUNK_MONTHS}-month chunks')
+    logger.info(f'  Voucher types : {total}')
+    logger.info('=' * 60)
+
+    for idx, config in enumerate(VOUCHER_CONFIG):
+        vt = config['voucher_type']
+
+        if progress_cb:
+            progress_cb(
+                (idx / total) * 100,
+                f"Deep reconcile: {vt} ({idx + 1}/{total})...",
+            )
+
+        state = get_sync_state(comp_name, vt, engine)
+        if not state or not state.is_initial_done:
+            logger.info(f"[{comp_name}][{vt}] Deep reconcile: skipped (snapshot not done)")
+            results[vt] = 0
+            continue
+
+        before = _count_active_rows(comp_name, config, engine, from_date, to_date)
+
+        _reconcile_deleted_vouchers(
+            company_name = comp_name,
+            config       = config,
+            tally        = tally,
+            engine       = engine,
+            from_date    = from_date,
+            to_date      = to_date,
+        )
+
+        after        = _count_active_rows(comp_name, config, engine, from_date, to_date)
+        results[vt]  = max(0, before - after)
+
+    if progress_cb:
+        progress_cb(100.0, "Deep reconcile complete")
+
+    total_deleted = sum(results.values())
+    logger.info(
+        f"[{comp_name}] DEEP RECONCILE DONE | "
+        f"total deleted={total_deleted} | by type={results}"
+    )
+    return results
+
+
+def _count_active_rows(
+    company_name: str,
+    config:       dict,
+    engine,
+    from_date:    str,
+    to_date:      str,
+) -> int:
+    """Count active (is_deleted=No) DB rows in the given date range."""
+    try:
+        kind = config['kind']
+        vt   = config['voucher_type']
+        model_class = (INVENTORY_MODEL_MAP if kind == 'inventory' else LEDGER_MODEL_MAP)[vt]
+
+        fd = datetime.strptime(from_date, '%Y%m%d').date()
+        td = datetime.strptime(to_date,   '%Y%m%d').date()
+
+        db = _get_session(engine)
+        try:
+            return db.query(model_class).filter(
+                model_class.company_name == company_name,
+                model_class.date         >= fd,
+                model_class.date         <= td,
+                model_class.is_deleted   == 'No',
+            ).count()
+        finally:
+            db.close()
+    except Exception:
+        return 0
+    except Exception:
+        return 0

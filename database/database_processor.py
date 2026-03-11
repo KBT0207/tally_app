@@ -225,77 +225,150 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
 #    2. Delete is now hard DELETE, not soft is_deleted='Yes'
 # ─────────────────────────────────────────────────────────────────────────────
 def _upsert_ledger_voucher_in_session(rows, model_class, db):
+    """
+    Upsert ledger voucher rows (Receipt / Payment / Journal / Contra).
+
+    VOUCHER-NUMBER RENUMBERING FIX
+    ─────────────────────────────────────────────────────────────────────────
+    When a voucher is deleted in Tally, Tally auto-renumbers the remaining
+    vouchers.  Example: vouchers 1, 2, 3 → delete 2 → Tally renames 3 to 2.
+
+    The CDC response contains:
+      • GUID_2  is_deleted=Yes  (the deleted voucher)
+      • GUID_3  alter_id bumped, voucher_number now = "2"  (renumbered)
+
+    Old strategy (field-level UPDATE per row) had two failure modes:
+      1. CDC batch order not guaranteed — if GUID_3 update arrives before
+         GUID_2 delete in the same batch, both voucher_number='2' rows exist
+         in DB simultaneously, risking a unique-constraint violation or
+         wrong data in reports until the delete is processed.
+      2. Per-row lookup by (guid + ledger_name) could miss rows if the
+         same GUID had multiple ledger entries with varying alter_ids from
+         a previous partial sync.
+
+    NEW STRATEGY — mirrors inventory voucher upsert:
+      1. Group all incoming rows by GUID.
+      2. Process ALL DELETES first in a single pass, before any inserts/updates.
+         This ensures the old voucher_number='2' row is gone before we write
+         the renumbered voucher_number='2' for a different GUID.
+      3. For altered vouchers: hard DELETE all existing rows for that GUID,
+         then INSERT fresh rows.  This is safe because:
+         - If the commit fails after DELETE but before INSERT, the next CDC
+           will re-fetch (alter_id still > saved) and re-insert correctly.
+         - No stale field values can survive — the full row is replaced.
+      4. For new vouchers: plain INSERT.
+      5. For unchanged (alter_id same): skip.
+    ─────────────────────────────────────────────────────────────────────────
+    """
+    from collections import defaultdict
+
     inserted = updated = unchanged = skipped = deleted = 0
 
-    update_fields = [
-        'date', 'voucher_type', 'voucher_number', 'reference',
-        'amount', 'amount_type', 'currency', 'exchange_rate',
-        'narration', 'alter_id', 'master_id', 'change_status',
-    ]
-
+    # ── Step 1: group rows by GUID ─────────────────────────────────────────
+    groups: dict[str, list] = defaultdict(list)
     for row in rows:
         if not row.get('guid'):
             skipped += 1
             continue
+        groups[row['guid']].append(row)
 
-        is_deleted_flag = row.get('is_deleted', 'No')
-        company_name    = row.get('company_name', '')
-        guid            = row['guid']
-
-        # ── CDC delete signal → hard DELETE from DB ────────────────────────
-        if is_deleted_flag == 'Yes':
-            affected = db.query(model_class).filter(
-                model_class.guid         == guid,
-                model_class.company_name == company_name,
-                model_class.is_deleted   == 'No',
-            ).all()
-            for record in affected:
-                db.delete(record)
-            deleted += len(affected)
-            logger.debug(
-                f"[{company_name}] Hard deleted {len(affected)} ledger rows "
-                f"for guid={guid} (CDC delete)"
-            )
-            continue
-
-        # ── Lookup active row only (is_deleted='No') ───────────────────────
-        # Old version had no is_deleted filter — could match already-deleted
-        # rows and try to update them instead of inserting fresh.
-        existing = db.query(model_class).filter(
+    # ── Step 2: process ALL DELETES first ─────────────────────────────────
+    # Critical for renumber safety: removes old voucher_number rows before
+    # we insert/update the renumbered ones.
+    delete_guids = {
+        guid for guid, group in groups.items()
+        if group[0].get('is_deleted', 'No') == 'Yes'
+    }
+    for guid in delete_guids:
+        company_name = groups[guid][0].get('company_name', '')
+        affected = db.query(model_class).filter(
             model_class.guid         == guid,
             model_class.company_name == company_name,
-            model_class.ledger_name  == (row.get('ledger_name') or ''),
             model_class.is_deleted   == 'No',
-        ).first()
+        ).all()
+        for rec in affected:
+            db.delete(rec)
+        deleted += len(affected)
+        logger.debug(
+            f"[{company_name}] Hard deleted {len(affected)} ledger rows "
+            f"for guid={guid} (CDC delete — renumber-safe pass)"
+        )
 
-        if existing:
-            if int(row.get('alter_id', 0)) > int(existing.alter_id or 0):
-                _log_changes("ledger_voucher UPDATE", existing, update_fields, row)
-                for field in update_fields:
-                    setattr(existing, field, row.get(field))
-                updated += 1
-            else:
-                unchanged += 1
+    # ── Step 3: process INSERTS / UPDATES ─────────────────────────────────
+    for guid, group_rows in groups.items():
+        if guid in delete_guids:
+            continue   # already handled above
+
+        first        = group_rows[0]
+        company_name = first.get('company_name', '')
+        new_alter_id = max(int(r.get('alter_id', 0)) for r in group_rows)
+
+        # Find all existing active rows for this GUID (any ledger_name)
+        existing_rows = db.query(model_class).filter(
+            model_class.guid         == guid,
+            model_class.company_name == company_name,
+            model_class.is_deleted   == 'No',
+        ).all()
+
+        if not existing_rows:
+            # Brand new voucher → INSERT all ledger-entry rows
+            for row in group_rows:
+                db.add(model_class(
+                    company_name   = company_name,
+                    date           = row.get('date'),
+                    voucher_type   = row.get('voucher_type'),
+                    voucher_number = row.get('voucher_number'),
+                    reference      = row.get('reference'),
+                    ledger_name    = row.get('ledger_name'),
+                    amount         = row.get('amount', 0.0),
+                    amount_type    = row.get('amount_type'),
+                    currency       = row.get('currency', 'INR'),
+                    exchange_rate  = row.get('exchange_rate', 1.0),
+                    narration      = row.get('narration'),
+                    guid           = guid,
+                    alter_id       = row.get('alter_id', 0),
+                    master_id      = row.get('master_id'),
+                    change_status  = row.get('change_status'),
+                    is_deleted     = 'No',
+                ))
+            inserted += len(group_rows)
+            continue
+
+        old_alter_id = max(int(r.alter_id or 0) for r in existing_rows)
+
+        if new_alter_id > old_alter_id:
+            # Voucher altered (includes renumber) → hard DELETE old rows,
+            # INSERT fresh.  Guarantees voucher_number is always current.
+            logger.debug(
+                f"[{company_name}] Replacing {len(existing_rows)} ledger rows "
+                f"for guid={guid} "
+                f"(alter_id {old_alter_id} → {new_alter_id}, voucher_number renumber-safe)"
+            )
+            for rec in existing_rows:
+                db.delete(rec)
+            for row in group_rows:
+                db.add(model_class(
+                    company_name   = company_name,
+                    date           = row.get('date'),
+                    voucher_type   = row.get('voucher_type'),
+                    voucher_number = row.get('voucher_number'),
+                    reference      = row.get('reference'),
+                    ledger_name    = row.get('ledger_name'),
+                    amount         = row.get('amount', 0.0),
+                    amount_type    = row.get('amount_type'),
+                    currency       = row.get('currency', 'INR'),
+                    exchange_rate  = row.get('exchange_rate', 1.0),
+                    narration      = row.get('narration'),
+                    guid           = guid,
+                    alter_id       = row.get('alter_id', 0),
+                    master_id      = row.get('master_id'),
+                    change_status  = row.get('change_status'),
+                    is_deleted     = 'No',
+                ))
+            updated += len(group_rows)
         else:
-            db.add(model_class(
-                company_name   = company_name,
-                date           = row.get('date'),
-                voucher_type   = row.get('voucher_type'),
-                voucher_number = row.get('voucher_number'),
-                reference      = row.get('reference'),
-                ledger_name    = row.get('ledger_name'),
-                amount         = row.get('amount', 0.0),
-                amount_type    = row.get('amount_type'),
-                currency       = row.get('currency', 'INR'),
-                exchange_rate  = row.get('exchange_rate', 1.0),
-                narration      = row.get('narration'),
-                guid           = guid,
-                alter_id       = row.get('alter_id', 0),
-                master_id      = row.get('master_id'),
-                change_status  = row.get('change_status'),
-                is_deleted     = 'No',  # always No on insert
-            ))
-            inserted += 1
+            # alter_id unchanged — voucher not modified since last sync
+            unchanged += len(existing_rows)
 
     return inserted, updated, unchanged, skipped, deleted
 
@@ -316,15 +389,35 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
 def reconcile_deleted_by_guids(
     company_name: str,
     model_class,
-    tally_guids: set,
-    from_date:   str,    # YYYYMMDD — start of 90-day window
-    to_date:     str,    # YYYYMMDD — today
+    tally_guids: dict,   # {guid: voucher_number} — from parse_guids()
+    from_date:   str,    # YYYYMMDD
+    to_date:     str,    # YYYYMMDD
     engine,
 ) -> int:
     """
-    Hard delete DB rows whose GUID is not in tally_guids for the date window.
-    Returns count of rows deleted.
-    tally_guids must be a non-empty set — caller enforces this before calling.
+    Phase 3 reconciliation — two passes for the given date window:
+
+    PASS 1 — DELETE:
+      Hard delete DB rows whose GUID is absent from Tally entirely.
+      These are vouchers deleted in Tally that CDC missed.
+
+    PASS 2 — RENUMBER FIX:
+      For vouchers whose GUID still exists in Tally but voucher_number
+      in DB doesn't match what Tally reports, update all DB rows for
+      that GUID to the correct voucher_number.
+
+      This catches the case where:
+        - Tally renumbered a voucher (deleted another → auto-renumber)
+        - The app was offline / CDC missed the alter_id bump
+        - GUID still exists in both DB and Tally, so Pass 1 skips it
+        - But DB has stale voucher_number that will never self-correct
+
+      Only applies when tally_guids contains actual voucher_number values
+      (i.e. the GUID template fetches VOUCHERNUMBER). If voucher_number
+      is '' in the dict, the renumber check is skipped for that GUID.
+
+    Returns: total count of rows deleted (Pass 1 only — updates not counted).
+    tally_guids must be a non-empty dict — caller enforces this.
     """
     from datetime import datetime
     db = _get_session(engine)
@@ -347,28 +440,66 @@ def reconcile_deleted_by_guids(
             )
             return 0
 
-        # GUIDs in DB but not in Tally → deleted in Tally
-        to_delete = [r for r in db_rows if r.guid not in tally_guids]
+        tally_guid_set = set(tally_guids.keys())
 
-        if not to_delete:
-            logger.info(
-                f"[{company_name}][{model_class.__tablename__}] "
-                f"GUID reconciliation: all {len(db_rows)} DB rows confirmed in Tally ✓"
-            )
-            return 0
-
+        # ── PASS 1: hard delete rows whose GUID is gone from Tally ────────
+        to_delete = [r for r in db_rows if r.guid not in tally_guid_set]
         for rec in to_delete:
             db.delete(rec)
 
+        deleted_count = len(to_delete)
+        if deleted_count:
+            logger.info(
+                f"[{company_name}][{model_class.__tablename__}] "
+                f"GUID reconciliation Pass 1: hard deleted {deleted_count} rows "
+                f"not found in Tally | window {from_date}→{to_date}"
+            )
+
+        # ── PASS 2: fix stale voucher_numbers for renumbered vouchers ─────
+        # Group surviving DB rows by GUID (exclude just-deleted ones)
+        surviving_guids = {r.guid for r in db_rows if r.guid in tally_guid_set}
+
+        renumber_count = 0
+        from collections import defaultdict
+        rows_by_guid: dict = defaultdict(list)
+        for r in db_rows:
+            if r.guid in surviving_guids:
+                rows_by_guid[r.guid].append(r)
+
+        for guid, rows in rows_by_guid.items():
+            tally_vnum = tally_guids.get(guid, '')
+            if not tally_vnum:
+                # Template didn't fetch VOUCHERNUMBER — skip renumber check
+                continue
+
+            # Check if any row has a different voucher_number than Tally reports
+            stale_rows = [r for r in rows if r.voucher_number != tally_vnum]
+            if stale_rows:
+                for r in stale_rows:
+                    old_num = r.voucher_number
+                    r.voucher_number = tally_vnum
+                renumber_count += len(stale_rows)
+                logger.info(
+                    f"[{company_name}][{model_class.__tablename__}] "
+                    f"GUID reconciliation Pass 2: fixed voucher_number "
+                    f"guid={guid} | '{old_num}' → '{tally_vnum}' "
+                    f"({len(stale_rows)} rows)"
+                )
+
         db.commit()
-        count = len(to_delete)
-        logger.info(
-            f"[{company_name}][{model_class.__tablename__}] "
-            f"GUID reconciliation: hard deleted {count} rows "
-            f"not found in Tally | window {from_date}→{to_date} | "
-            f"DB had {len(db_rows)}, Tally has {len(tally_guids)}"
-        )
-        return count
+
+        if deleted_count == 0 and renumber_count == 0:
+            logger.debug(
+                f"[{company_name}][{model_class.__tablename__}] "
+                f"GUID reconciliation: all {len(db_rows)} DB rows confirmed correct in Tally ✓"
+            )
+        elif renumber_count:
+            logger.info(
+                f"[{company_name}][{model_class.__tablename__}] "
+                f"GUID reconciliation Pass 2: fixed {renumber_count} stale voucher_number rows ✓"
+            )
+
+        return deleted_count
 
     except Exception:
         db.rollback()

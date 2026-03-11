@@ -1226,18 +1226,25 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
 # GUID reconciliation parser  (Phase 3)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_guids(xml_content) -> "set | None":
+def parse_guids(xml_content) -> "dict | None":
     """
-    Parse a GUID-only XML response from Tally (utils/guid/*.xml templates).
+    Parse a GUID XML response from Tally (utils/guid/*.xml templates).
 
     Returns:
-        set[str]  — set of GUID strings on success (may be empty if Tally
-                    genuinely has 0 vouchers in the requested window)
-        None      — on ANY parse failure (network error, bad XML, empty content)
+        dict[str, str]  — {guid: voucher_number} on success.
+                          voucher_number is '' if the template doesn't fetch it
+                          (inventory GUID templates don't include VOUCHERNUMBER).
+        None            — on ANY parse failure (network error, bad XML, empty content)
 
     CRITICAL CONTRACT for callers:
-        None  → Tally fetch or parse FAILED → DO NOT delete anything
-        set() → Tally confirmed 0 vouchers in window → safe to delete DB rows
+        None       → Tally fetch or parse FAILED → DO NOT delete or update anything
+        {}  (empty)→ Tally confirmed 0 vouchers in window → safe to delete DB rows
+
+    WHY dict instead of set:
+        Ledger voucher GUID templates (receipt/payment/journal/contra) now also
+        fetch VOUCHERNUMBER.  This lets Phase 3 detect not only deleted vouchers
+        but also vouchers whose number changed (renumber) that CDC missed — e.g.
+        because the app was offline when the deletion/renumber happened.
     """
     try:
         if not xml_content:
@@ -1251,14 +1258,24 @@ def parse_guids(xml_content) -> "set | None":
 
         root = ET.fromstring(xml_str.encode('utf-8'))
 
-        guids = {
-            e.text.strip()
-            for e in root.iter('GUID')
-            if e.text and e.text.strip()
-        }
+        # Try to parse as voucher elements with both GUID and VOUCHERNUMBER
+        result = {}
+        for voucher in root.iter('VOUCHER'):
+            guid_el  = voucher.find('GUID')
+            vnum_el  = voucher.find('VOUCHERNUMBER')
+            if guid_el is not None and guid_el.text and guid_el.text.strip():
+                guid = guid_el.text.strip()
+                vnum = (vnum_el.text or '').strip() if vnum_el is not None else ''
+                result[guid] = vnum
 
-        logger.info(f"parse_guids: parsed {len(guids)} GUIDs from Tally response")
-        return guids
+        # Fallback: flat GUID list (templates that don't wrap in VOUCHER)
+        if not result:
+            for e in root.iter('GUID'):
+                if e.text and e.text.strip():
+                    result[e.text.strip()] = ''
+
+        logger.info(f"parse_guids: parsed {len(result)} GUIDs from Tally response")
+        return result
 
     except ET.ParseError as e:
         logger.error(f"parse_guids: XML parse error — {e}")

@@ -21,6 +21,7 @@
                         <FETCH>GUID</FETCH>
                         <FETCH>VOUCHERKEY</FETCH>
                         <FETCH>DATE</FETCH>
+                        <FETCH>VOUCHERNUMBER</FETCH>
                     </COLLECTION>
                 </TDLMESSAGE>
             </TDL>
