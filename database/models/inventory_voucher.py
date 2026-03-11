@@ -39,10 +39,11 @@ class _InventoryVoucherMixin:
     exchange_rate    = Column(Float,        nullable=True,  default=1.0)
     narration        = Column(Text,         nullable=True)
     guid             = Column(String(255),  nullable=False, index=True)
+    voucherkey       = Column(String(50),   nullable=False, default='', index=True)
     alter_id         = Column(BigInteger,   nullable=False, default=0)
     master_id        = Column(String(255),  nullable=True)
     change_status    = Column(String(50),   nullable=True)
-    is_deleted       = Column(String(3),    nullable=False, default='No')
+    is_deleted       = Column(String(10),   nullable=False, default='No')
     created_at       = Column(DateTime,     server_default=func.now())
     updated_at       = Column(DateTime,     server_default=func.now(), onupdate=func.now())
 

@@ -191,6 +191,31 @@ class TallyConnector:
             xml_content,
         )
 
+        # Fix unbound namespace prefixes (e.g. <UDF:FIELD> without xmlns:UDF="...").
+        # Tally sometimes omits the xmlns declaration for UDF and other custom prefixes,
+        # which causes ElementTree to raise "unbound prefix" and reject the entire response.
+        # Strategy: detect all prefix:TAG patterns, find which prefixes have no xmlns: declaration,
+        # and inject a dummy declaration into the root element so ElementTree accepts the XML.
+        # The UDF fields themselves are ignored by the parser — only standard Tally tags are read.
+        used_prefixes    = set(re.findall(r'<([A-Za-z][A-Za-z0-9_]*):[A-Za-z]', xml_content))
+        declared_prefixes = set(re.findall(r'xmlns:([A-Za-z][A-Za-z0-9_]*)\s*=', xml_content))
+        missing_prefixes = used_prefixes - declared_prefixes
+        if missing_prefixes:
+            ns_decls = ' '.join(
+                f'xmlns:{p}="urn:tally-{p}"' for p in sorted(missing_prefixes)
+            )
+            # Inject into the first opening tag of the document
+            xml_content = re.sub(
+                r'(<[A-Za-z][^>]*?)>',
+                lambda m: m.group(1) + ' ' + ns_decls + '>',
+                xml_content,
+                count=1,
+            )
+            logger.debug(
+                f'[sanitize_xml] Injected missing namespace declarations: '
+                f'{sorted(missing_prefixes)}'
+            )
+
         return xml_content.encode('utf-8')
 
     # ── Debug helpers ─────────────────────────────────────────────────────────
@@ -563,6 +588,107 @@ class TallyConnector:
         return self._fetch(
             'utils/cdc/debit_cdc.xml', 'Debit Note CDC',
             company_name, alter_id=last_alter_id, debug=debug,
+        )
+
+    # ── GUID reconciliation fetches (Phase 3) ────────────────────────────────
+    # Lightweight calls — only fetch GUID + VOUCHERKEY + DATE for a date window.
+    # Used by _reconcile_deleted_vouchers() in sync_service to detect missed deletes.
+    # SAFE FAILURE: _fetch() returns None on any error — callers must handle None.
+
+    def fetch_sales_guids(
+        self,
+        company_name: str,
+        from_date:    str,
+        to_date:      str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        return self._fetch(
+            'utils/guid/sales_guid.xml', 'Sales GUIDs',
+            company_name, from_date=from_date, to_date=to_date, debug=debug,
+        )
+
+    def fetch_purchase_guids(
+        self,
+        company_name: str,
+        from_date:    str,
+        to_date:      str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        return self._fetch(
+            'utils/guid/purchase_guid.xml', 'Purchase GUIDs',
+            company_name, from_date=from_date, to_date=to_date, debug=debug,
+        )
+
+    def fetch_credit_note_guids(
+        self,
+        company_name: str,
+        from_date:    str,
+        to_date:      str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        return self._fetch(
+            'utils/guid/credit_guid.xml', 'Credit Note GUIDs',
+            company_name, from_date=from_date, to_date=to_date, debug=debug,
+        )
+
+    def fetch_debit_note_guids(
+        self,
+        company_name: str,
+        from_date:    str,
+        to_date:      str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        return self._fetch(
+            'utils/guid/debit_guid.xml', 'Debit Note GUIDs',
+            company_name, from_date=from_date, to_date=to_date, debug=debug,
+        )
+
+    def fetch_receipt_guids(
+        self,
+        company_name: str,
+        from_date:    str,
+        to_date:      str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        return self._fetch(
+            'utils/guid/receipt_guid.xml', 'Receipt GUIDs',
+            company_name, from_date=from_date, to_date=to_date, debug=debug,
+        )
+
+    def fetch_payment_guids(
+        self,
+        company_name: str,
+        from_date:    str,
+        to_date:      str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        return self._fetch(
+            'utils/guid/payment_guid.xml', 'Payment GUIDs',
+            company_name, from_date=from_date, to_date=to_date, debug=debug,
+        )
+
+    def fetch_journal_guids(
+        self,
+        company_name: str,
+        from_date:    str,
+        to_date:      str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        return self._fetch(
+            'utils/guid/journal_guid.xml', 'Journal GUIDs',
+            company_name, from_date=from_date, to_date=to_date, debug=debug,
+        )
+
+    def fetch_contra_guids(
+        self,
+        company_name: str,
+        from_date:    str,
+        to_date:      str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        return self._fetch(
+            'utils/guid/contra_guid.xml', 'Contra GUIDs',
+            company_name, from_date=from_date, to_date=to_date, debug=debug,
         )
 
     # ── Report fetches ────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.orm import sessionmaker
 import threading
 
@@ -11,7 +11,6 @@ from database.models.ledger_voucher import ReceiptVoucher, PaymentVoucher, Journ
 from database.models.trial_balance import TrialBalance
 from database.models.outstanding_models import DebtorOutstanding
 
-import pandas as pd
 from logging_config import logger
 
 # ── Per-company SyncState write locks ────────────────────────────────────────
@@ -62,107 +61,176 @@ def _t(value, max_len):
         return value[:max_len]
     return value
 
+def _insert_voucher_rows(rows, model_class, db, set_total_amt=True):
+    """
+    Insert a list of pre-parsed voucher rows for ONE voucher (same voucherkey/guid).
+    Sorts by item_name first so idx==0 is always the same item across re-syncs.
+    Enforces total_amt only on idx==0 — all other rows get 0.
+    is_deleted is always 'No' — deleted vouchers are physically removed, never inserted.
+    """
+    rows_sorted = sorted(rows, key=lambda r: r.get('item_name', ''))
+    for idx, row in enumerate(rows_sorted):
+        db.add(model_class(
+            company_name     = row.get('company_name'),
+            date             = row.get('date'),
+            voucher_number   = row.get('voucher_number'),
+            reference        = row.get('reference'),
+            voucher_type     = row.get('voucher_type'),
+            party_name       = row.get('party_name'),
+            gst_number       = row.get('gst_number'),
+            e_invoice_number = row.get('e_invoice_number'),
+            eway_bill        = row.get('eway_bill'),
+            item_name        = row.get('item_name'),
+            quantity         = row.get('quantity', 0.0),
+            unit             = row.get('unit'),
+            alt_qty          = row.get('alt_qty', 0.0),
+            alt_unit         = row.get('alt_unit'),
+            batch_no         = row.get('batch_no'),
+            mfg_date         = row.get('mfg_date'),
+            exp_date         = row.get('exp_date'),
+            hsn_code         = row.get('hsn_code'),
+            gst_rate         = row.get('gst_rate', 0.0),
+            rate             = row.get('rate', 0.0),
+            amount           = row.get('amount', 0.0),
+            discount         = row.get('discount', 0.0),
+            cgst_amt         = row.get('cgst_amt', 0.0),
+            sgst_amt         = row.get('sgst_amt', 0.0),
+            igst_amt         = row.get('igst_amt', 0.0),
+            freight_amt      = row.get('freight_amt', 0.0),
+            dca_amt          = row.get('dca_amt', 0.0),
+            cf_amt           = row.get('cf_amt', 0.0),
+            other_amt        = row.get('other_amt', 0.0),
+            # total_amt is a voucher-level value — store only on first item row
+            total_amt        = row.get('total_amt', 0.0) if idx == 0 else 0.0,
+            currency         = row.get('currency', 'INR'),
+            exchange_rate    = row.get('exchange_rate', 1.0),
+            narration        = row.get('narration'),
+            guid             = row.get('guid'),
+            voucherkey       = row.get('voucherkey', ''),
+            alter_id         = row.get('alter_id', 0),
+            master_id        = row.get('master_id'),
+            change_status    = row.get('change_status'),
+            is_deleted       = 'No',    # always No — deleted rows are hard deleted, never inserted
+        ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHASE 1 + 2 — Inventory voucher upsert  (Sales / Purchase / Credit / Debit)
+#
+#  Strategy (replaces old Retired/Deleted soft-delete approach):
+#    DELETE signal  → hard DELETE all existing rows for that voucherkey
+#    New voucher    → INSERT fresh rows (is_deleted='No' always)
+#    Altered voucher→ hard DELETE old rows + INSERT fresh rows (clean replace)
+#    Unchanged      → skip
+#
+#  Used by BOTH snapshot chunks (Phase 1) and CDC (Phase 2).
+#  Snapshot calls this via upsert_and_advance_month().
+#  CDC calls this via _upsert_inventory_voucher().
+# ─────────────────────────────────────────────────────────────────────────────
 def _upsert_inventory_voucher_in_session(rows, model_class, db):
     inserted = updated = unchanged = skipped = deleted = 0
 
-    update_fields = [
-        'date', 'voucher_number', 'reference', 'voucher_type',
-        'party_name', 'gst_number', 'e_invoice_number', 'eway_bill',
-        'item_name', 'quantity', 'unit', 'alt_qty', 'alt_unit',
-        'batch_no', 'mfg_date', 'exp_date', 'hsn_code', 'gst_rate',
-        'rate', 'amount', 'discount',
-        'cgst_amt', 'sgst_amt', 'igst_amt',
-        'freight_amt', 'dca_amt', 'cf_amt', 'other_amt', 'total_amt',
-        'currency', 'exchange_rate', 'narration',
-        'alter_id', 'master_id', 'change_status', 'is_deleted',
-    ]
-
+    from collections import defaultdict
+    groups: dict[str, list] = defaultdict(list)
     for row in rows:
         if not row.get('guid'):
             skipped += 1
             continue
+        key = row.get('voucherkey') or row.get('guid', '')
+        groups[key].append(row)
 
-        is_deleted_flag = row.get('is_deleted', 'No')
+    for key, group_rows in groups.items():
+        first        = group_rows[0]
+        guid         = first.get('guid', '')
+        company_name = first.get('company_name', '')
+        # MAX alter_id across all rows in the group — Tally CDC can return
+        # items of the same voucher with different alter_ids in one response.
+        new_alter_id = max(int(r.get('alter_id', 0)) for r in group_rows)
+        is_del       = first.get('is_deleted', 'No')
 
-        if is_deleted_flag == 'Yes':
-            affected = db.query(model_class).filter_by(
-                guid         = row['guid'],
-                company_name = row['company_name'],
+        # ── Find existing active rows ──────────────────────────────────────
+        lookup_voucherkey = first.get('voucherkey', '')
+        if lookup_voucherkey:
+            existing_rows = db.query(model_class).filter(
+                model_class.company_name == company_name,
+                model_class.voucherkey   == lookup_voucherkey,
+                model_class.is_deleted   == 'No',
             ).all()
-            for record in affected:
-                record.is_deleted    = 'Yes'
-                record.change_status = row.get('change_status', 'Deleted')
-                record.alter_id      = row.get('alter_id', record.alter_id)
-            deleted += len(affected)
+        else:
+            existing_rows = db.query(model_class).filter(
+                model_class.company_name == company_name,
+                model_class.guid         == guid,
+                model_class.is_deleted   == 'No',
+            ).all()
+
+        # ── PHASE 2: CDC delete signal → hard DELETE from DB ──────────────
+        # Tally sets is_deleted='Yes' in CDC response when a voucher is deleted.
+        # We physically remove the rows — no soft-delete flag, no history.
+        if is_del == 'Yes':
+            for rec in existing_rows:
+                db.delete(rec)
+            deleted += len(existing_rows)
+            logger.debug(
+                f"[{company_name}] Hard deleted {len(existing_rows)} rows "
+                f"for voucherkey={lookup_voucherkey or guid} (CDC delete)"
+            )
             continue
 
-        existing = db.query(model_class).filter_by(
-            guid         = row['guid'],
-            company_name = row['company_name'],
-            item_name    = row.get('item_name', ''),
-            batch_no     = row.get('batch_no', ''),
-        ).first()
+        # ── No existing rows → fresh INSERT ───────────────────────────────
+        # Covers: new voucher in CDC, or first time this chunk runs in snapshot.
+        if not existing_rows:
+            _insert_voucher_rows(group_rows, model_class, db)
+            inserted += len(group_rows)
+            continue
 
-        if existing:
-            if int(row.get('alter_id', 0)) > int(existing.alter_id or 0):
-                _log_changes("inventory_voucher UPDATE", existing, update_fields, row)
-                for field in update_fields:
-                    setattr(existing, field, row.get(field))
-                updated += 1
-            else:
-                unchanged += 1
+        # ── Existing rows found — check alter_id to decide action ─────────
+        # MAX across all existing rows — handles mixed alter_ids from
+        # previous partial syncs under the same voucherkey.
+        old_alter_id = max(int(r.alter_id or 0) for r in existing_rows)
+
+        if new_alter_id > old_alter_id:
+            # Voucher was altered in Tally.
+            # Hard DELETE old rows first, then INSERT fresh.
+            # This is safe because: if commit fails after DELETE but before
+            # INSERT, the next CDC will re-fetch this voucher (alter_id still
+            # > last saved alter_id) and re-insert it correctly.
+            for rec in existing_rows:
+                db.delete(rec)
+            _insert_voucher_rows(group_rows, model_class, db)
+            updated += len(group_rows)
+            logger.debug(
+                f"[{company_name}] Replaced {len(existing_rows)} → {len(group_rows)} rows "
+                f"for voucherkey={lookup_voucherkey or guid} "
+                f"(alter_id {old_alter_id} → {new_alter_id})"
+            )
         else:
-            db.add(model_class(
-                company_name     = row.get('company_name'),
-                date             = row.get('date'),
-                voucher_number   = row.get('voucher_number'),
-                reference        = row.get('reference'),
-                voucher_type     = row.get('voucher_type'),
-                party_name       = row.get('party_name'),
-                gst_number       = row.get('gst_number'),
-                e_invoice_number = row.get('e_invoice_number'),
-                eway_bill        = row.get('eway_bill'),
-                item_name        = row.get('item_name'),
-                quantity         = row.get('quantity', 0.0),
-                unit             = row.get('unit'),
-                alt_qty          = row.get('alt_qty', 0.0),
-                alt_unit         = row.get('alt_unit'),
-                batch_no         = row.get('batch_no'),
-                mfg_date         = row.get('mfg_date'),
-                exp_date         = row.get('exp_date'),
-                hsn_code         = row.get('hsn_code'),
-                gst_rate         = row.get('gst_rate', 0.0),
-                rate             = row.get('rate', 0.0),
-                amount           = row.get('amount', 0.0),
-                discount         = row.get('discount', 0.0),
-                cgst_amt         = row.get('cgst_amt', 0.0),
-                sgst_amt         = row.get('sgst_amt', 0.0),
-                igst_amt         = row.get('igst_amt', 0.0),
-                freight_amt      = row.get('freight_amt', 0.0),
-                dca_amt          = row.get('dca_amt', 0.0),
-                cf_amt           = row.get('cf_amt', 0.0),
-                other_amt        = row.get('other_amt', 0.0),
-                total_amt        = row.get('total_amt', 0.0),
-                currency         = row.get('currency', 'INR'),
-                exchange_rate    = row.get('exchange_rate', 1.0),
-                narration        = row.get('narration'),
-                guid             = row.get('guid'),
-                alter_id         = row.get('alter_id', 0),
-                master_id        = row.get('master_id'),
-                change_status    = row.get('change_status'),
-                is_deleted       = row.get('is_deleted', 'No'),
-            ))
-            inserted += 1
+            # alter_id unchanged — voucher not modified since last sync
+            unchanged += len(existing_rows)
 
     return inserted, updated, unchanged, skipped, deleted
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHASE 2 — Ledger voucher upsert  (Receipt / Payment / Journal / Contra)
+#
+#  Ledger vouchers are single-row per ledger entry (not multi-row like inventory).
+#  Strategy:
+#    DELETE signal → hard DELETE matching rows
+#    Existing row  → update fields in-place if alter_id is higher
+#    No existing   → INSERT fresh
+#    Unchanged     → skip
+#
+#  Key fixes vs old version:
+#    1. Lookup now filters is_deleted='No' — avoids matching already-deleted rows
+#    2. Delete is now hard DELETE, not soft is_deleted='Yes'
+# ─────────────────────────────────────────────────────────────────────────────
 def _upsert_ledger_voucher_in_session(rows, model_class, db):
     inserted = updated = unchanged = skipped = deleted = 0
 
     update_fields = [
         'date', 'voucher_type', 'voucher_number', 'reference',
         'amount', 'amount_type', 'currency', 'exchange_rate',
-        'narration', 'alter_id', 'master_id', 'change_status', 'is_deleted',
+        'narration', 'alter_id', 'master_id', 'change_status',
     ]
 
     for row in rows:
@@ -171,23 +239,33 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
             continue
 
         is_deleted_flag = row.get('is_deleted', 'No')
+        company_name    = row.get('company_name', '')
+        guid            = row['guid']
 
+        # ── CDC delete signal → hard DELETE from DB ────────────────────────
         if is_deleted_flag == 'Yes':
-            affected = db.query(model_class).filter_by(
-                guid         = row['guid'],
-                company_name = row['company_name'],
+            affected = db.query(model_class).filter(
+                model_class.guid         == guid,
+                model_class.company_name == company_name,
+                model_class.is_deleted   == 'No',
             ).all()
             for record in affected:
-                record.is_deleted    = 'Yes'
-                record.change_status = row.get('change_status', 'Deleted')
-                record.alter_id      = row.get('alter_id', record.alter_id)
+                db.delete(record)
             deleted += len(affected)
+            logger.debug(
+                f"[{company_name}] Hard deleted {len(affected)} ledger rows "
+                f"for guid={guid} (CDC delete)"
+            )
             continue
 
-        existing = db.query(model_class).filter_by(
-            guid         = row['guid'],
-            company_name = row['company_name'],
-            ledger_name  = row.get('ledger_name', ''),
+        # ── Lookup active row only (is_deleted='No') ───────────────────────
+        # Old version had no is_deleted filter — could match already-deleted
+        # rows and try to update them instead of inserting fresh.
+        existing = db.query(model_class).filter(
+            model_class.guid         == guid,
+            model_class.company_name == company_name,
+            model_class.ledger_name  == (row.get('ledger_name') or ''),
+            model_class.is_deleted   == 'No',
         ).first()
 
         if existing:
@@ -200,7 +278,7 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
                 unchanged += 1
         else:
             db.add(model_class(
-                company_name   = row.get('company_name'),
+                company_name   = company_name,
                 date           = row.get('date'),
                 voucher_type   = row.get('voucher_type'),
                 voucher_number = row.get('voucher_number'),
@@ -211,24 +289,117 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
                 currency       = row.get('currency', 'INR'),
                 exchange_rate  = row.get('exchange_rate', 1.0),
                 narration      = row.get('narration'),
-                guid           = row.get('guid'),
+                guid           = guid,
                 alter_id       = row.get('alter_id', 0),
                 master_id      = row.get('master_id'),
                 change_status  = row.get('change_status'),
-                is_deleted     = row.get('is_deleted', 'No'),
+                is_deleted     = 'No',  # always No on insert
             ))
             inserted += 1
 
     return inserted, updated, unchanged, skipped, deleted
 
-def upsert_and_advance_month(rows, model_class, upsert_fn, company_name, voucher_type, month_str, engine, chunk_max_alter_id=0):
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PHASE 3 — GUID Reconciliation (catch deletes CDC missed)
+#
+#  Called after CDC completes for each voucher type.
+#  Compares GUIDs in DB (last 90 days) vs GUIDs currently in Tally.
+#  Any GUID present in DB but absent from Tally → physically deleted in Tally
+#  → hard DELETE from DB.
+#
+#  SAFE FAILURE CONTRACT:
+#    tally_guids=None   → Tally fetch failed     → skip, return 0
+#    tally_guids=set()  → Tally has 0 vouchers   → skip, return 0
+#    Both cases: NEVER delete when uncertain.
+# ─────────────────────────────────────────────────────────────────────────────
+def reconcile_deleted_by_guids(
+    company_name: str,
+    model_class,
+    tally_guids: set,
+    from_date:   str,    # YYYYMMDD — start of 90-day window
+    to_date:     str,    # YYYYMMDD — today
+    engine,
+) -> int:
     """
-    Upsert voucher rows for one chunk then atomically advance SyncState.
+    Hard delete DB rows whose GUID is not in tally_guids for the date window.
+    Returns count of rows deleted.
+    tally_guids must be a non-empty set — caller enforces this before calling.
+    """
+    from datetime import datetime
+    db = _get_session(engine)
+    try:
+        fd = datetime.strptime(from_date, '%Y%m%d').date()
+        td = datetime.strptime(to_date,   '%Y%m%d').date()
+
+        # Fetch all active rows in the window
+        db_rows = db.query(model_class).filter(
+            model_class.company_name == company_name,
+            model_class.date         >= fd,
+            model_class.date         <= td,
+            model_class.is_deleted   == 'No',
+        ).all()
+
+        if not db_rows:
+            logger.debug(
+                f"[{company_name}][{model_class.__tablename__}] "
+                f"GUID reconciliation: no DB rows in window {from_date}→{to_date}"
+            )
+            return 0
+
+        # GUIDs in DB but not in Tally → deleted in Tally
+        to_delete = [r for r in db_rows if r.guid not in tally_guids]
+
+        if not to_delete:
+            logger.info(
+                f"[{company_name}][{model_class.__tablename__}] "
+                f"GUID reconciliation: all {len(db_rows)} DB rows confirmed in Tally ✓"
+            )
+            return 0
+
+        for rec in to_delete:
+            db.delete(rec)
+
+        db.commit()
+        count = len(to_delete)
+        logger.info(
+            f"[{company_name}][{model_class.__tablename__}] "
+            f"GUID reconciliation: hard deleted {count} rows "
+            f"not found in Tally | window {from_date}→{to_date} | "
+            f"DB had {len(db_rows)}, Tally has {len(tally_guids)}"
+        )
+        return count
+
+    except Exception:
+        db.rollback()
+        logger.exception(
+            f"[{company_name}][{model_class.__tablename__}] "
+            f"GUID reconciliation DB error"
+        )
+        return 0
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Snapshot chunk helper — called from sync_service._sync_voucher() snapshot path
+# ─────────────────────────────────────────────────────────────────────────────
+def upsert_and_advance_month(
+    rows, model_class, upsert_fn,
+    company_name, voucher_type, month_str, engine,
+    chunk_max_alter_id=0,
+):
+    """
+    Upsert voucher rows for one snapshot chunk then atomically advance SyncState.
 
     The SyncState update is protected by a per-company lock so that two
     voucher worker threads for the same company cannot overwrite each other's
-    last_synced_month / last_alter_id.  The (slow) voucher upsert itself runs
+    last_synced_month / last_alter_id. The (slow) voucher upsert itself runs
     outside the lock so other voucher types are not blocked.
+
+    upsert_fn is _upsert_inventory_voucher_in_session or
+    _upsert_ledger_voucher_in_session — both now do hard delete+reinsert,
+    so snapshot chunks are automatically clean (no Retired rows).
     """
     db = _get_session(engine)
     try:
@@ -242,7 +413,7 @@ def upsert_and_advance_month(rows, model_class, upsert_fn, company_name, voucher
     else:
         db.close()
 
-    # Now update SyncState in a separate session, protected by the company lock.
+    # Update SyncState in a separate session, protected by the company lock.
     lock = _get_db_company_lock(company_name)
     with lock:
         db2 = _get_session(engine)
@@ -254,7 +425,7 @@ def upsert_and_advance_month(rows, model_class, upsert_fn, company_name, voucher
 
             if state:
                 state.last_synced_month = month_str
-                state.last_sync_time    = datetime.utcnow()
+                state.last_sync_time    = datetime.now()
                 if chunk_max_alter_id > (state.last_alter_id or 0):
                     state.last_alter_id = chunk_max_alter_id
             else:
@@ -264,7 +435,7 @@ def upsert_and_advance_month(rows, model_class, upsert_fn, company_name, voucher
                     last_alter_id     = chunk_max_alter_id,
                     is_initial_done   = False,
                     last_synced_month = month_str,
-                    last_sync_time    = datetime.utcnow(),
+                    last_sync_time    = datetime.now(),
                 ))
 
             db2.commit()
@@ -281,6 +452,7 @@ def upsert_and_advance_month(rows, model_class, upsert_fn, company_name, voucher
         finally:
             db2.close()
 
+
 def get_sync_state(company_name, voucher_type, engine):
     db = _get_session(engine)
     try:
@@ -291,7 +463,11 @@ def get_sync_state(company_name, voucher_type, engine):
     finally:
         db.close()
 
-def update_sync_state(company_name, voucher_type, last_alter_id, engine, last_synced_month=None, is_initial_done=True):
+
+def update_sync_state(
+    company_name, voucher_type, last_alter_id, engine,
+    last_synced_month=None, is_initial_done=True,
+):
     db = _get_session(engine)
     try:
         state = db.query(SyncState).filter_by(
@@ -302,7 +478,7 @@ def update_sync_state(company_name, voucher_type, last_alter_id, engine, last_sy
         if state:
             state.last_alter_id   = last_alter_id
             state.is_initial_done = is_initial_done
-            state.last_sync_time  = datetime.utcnow()
+            state.last_sync_time  = datetime.now()
             if last_synced_month is not None:
                 state.last_synced_month = last_synced_month
         else:
@@ -312,7 +488,7 @@ def update_sync_state(company_name, voucher_type, last_alter_id, engine, last_sy
                 last_alter_id     = last_alter_id,
                 is_initial_done   = is_initial_done,
                 last_synced_month = last_synced_month,
-                last_sync_time    = datetime.utcnow(),
+                last_sync_time    = datetime.now(),
             ))
 
         db.commit()
@@ -327,6 +503,7 @@ def update_sync_state(company_name, voucher_type, last_alter_id, engine, last_sy
         raise
     finally:
         db.close()
+
 
 def _upsert_inventory(rows, model_class, unique_fields, update_fields, engine):
     if not rows:
@@ -367,9 +544,10 @@ def _upsert_inventory(rows, model_class, unique_fields, update_fields, engine):
         logger.exception(f"Error upserting {model_class.__tablename__}")
         raise
     finally:
-        db.close()   # ← always close, even on exception
+        db.close()
 
     return inserted, updated, unchanged, skipped
+
 
 def _upsert_inventory_voucher(rows, model_class, engine):
     if not rows:
@@ -387,6 +565,7 @@ def _upsert_inventory_voucher(rows, model_class, engine):
     finally:
         db.close()
 
+
 def _upsert_ledger_voucher(rows, model_class, engine):
     if not rows:
         logger.warning(f"No rows to upsert for {model_class.__tablename__}")
@@ -402,6 +581,7 @@ def _upsert_ledger_voucher(rows, model_class, engine):
         raise
     finally:
         db.close()
+
 
 def upsert_sales_vouchers(rows, engine):
     i, u, unch, s, d = _upsert_inventory_voucher(rows, SalesVoucher, engine)
@@ -434,6 +614,7 @@ def upsert_journal_vouchers(rows, engine):
 def upsert_contra_vouchers(rows, engine):
     i, u, unch, s, d = _upsert_ledger_voucher(rows, ContraVoucher, engine)
     _log_result("Contra vouchers upsert", i, u, unch, s, d)
+
 
 def upsert_trial_balance(rows, engine):
     if not rows:
@@ -496,6 +677,7 @@ def upsert_trial_balance(rows, engine):
     finally:
         db.close()
 
+
 INVENTORY_MODEL_MAP = {
     'sales'       : SalesVoucher,
     'purchase'    : PurchaseVoucher,
@@ -509,6 +691,7 @@ LEDGER_MODEL_MAP = {
     'journal' : JournalVoucher,
     'contra'  : ContraVoucher,
 }
+
 
 def upsert_items(rows, engine):
     if not rows:
@@ -585,27 +768,36 @@ def upsert_items(rows, engine):
         db.close()
 
 
+def _parse_date_str(val) -> "date | None":
+    """Parse YYYYMMDD string → date object. Returns None on failure."""
+    from datetime import date as date_type
+    try:
+        return datetime.strptime(str(val)[:8], '%Y%m%d').date()
+    except Exception:
+        return None
+
+
 def company_import_db(data, engine):
     db = _get_session(engine)
     try:
         logger.info("Starting company import process")
-        df = pd.DataFrame(data)
-        df = df[df['name'].notna() & (df['name'].str.strip() != '')]
-        logger.info(f"Records after name filtering: {len(df)}")
 
         date_cols = ['starting_from', 'books_from', 'audited_upto']
-        for col in date_cols:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], format="%Y%m%d", errors="coerce").dt.date
-
+        fields    = ["name", "formal_name", "company_number", "starting_from", "books_from", "audited_upto"]
         inserted = updated = unchanged = skipped = 0
-        fields   = ["name", "formal_name", "company_number", "starting_from", "books_from", "audited_upto"]
 
-        for _, row in df.iterrows():
+        valid_rows = [r for r in data if r.get('name') and str(r['name']).strip()]
+        logger.info(f"Records after name filtering: {len(valid_rows)}")
+
+        for row in valid_rows:
             if not row.get("guid"):
                 skipped += 1
                 logger.warning("Skipped record due to missing GUID")
                 continue
+
+            for col in date_cols:
+                if col in row and row[col]:
+                    row[col] = _parse_date_str(row[col])
 
             existing = db.query(Company).filter_by(guid=row["guid"]).first()
 
@@ -648,6 +840,7 @@ def company_import_db(data, engine):
         raise
     finally:
         db.close()
+
 
 def upsert_ledgers(rows, engine):
     if not rows:
@@ -736,79 +929,49 @@ def upsert_ledgers(rows, engine):
     finally:
         db.close()
 
+
 def upsert_debtor_outstanding(rows, engine):
     """
-    Full-replace upsert for Sundry Debtors outstanding.
-
-    Outstanding is a point-in-time snapshot (not a voucher ledger), so the
-    strategy is:
-      1. Delete all existing rows for this company + date range.
-      2. Bulk-insert the freshly parsed rows.
-
-    This avoids complex key matching on bills that may be partially paid,
-    renamed, or closed since the last sync.
-
-    Unique natural key used for existence check:
-        company_name + party_name + voucher_number + bill_name
+    Full-replace for debtor outstanding — point-in-time snapshot.
+    Deletes all existing rows for the company then bulk-inserts fresh ones.
+    Both in one transaction — if insert fails, delete rolls back too.
+    Paid/closed bills are automatically removed on each sync.
     """
     if not rows:
         logger.warning("No rows to upsert for debtor outstanding")
         return
 
+    company_name = rows[0].get('company_name', '')
     db = _get_session(engine)
-    inserted = updated = unchanged = skipped = 0
-
-    update_fields = [
-        'party_name', 'voucher_type', 'bill_type',
-        'date', 'bill_date', 'due_date',
-        'reference', 'currency', 'exchange_rate', 'amount', 'narration',
-    ]
-
+    inserted = 0
     try:
+        db.query(DebtorOutstanding).filter_by(
+            company_name=company_name
+        ).delete(synchronize_session='fetch')
+
         for row in rows:
-            # Natural key: company + voucher_number + bill_name identify one bill line
             if not row.get('voucher_number'):
-                skipped += 1
                 continue
-
-            existing = db.query(DebtorOutstanding).filter_by(
-                company_name   = row['company_name'],
-                voucher_number = row['voucher_number'],
-                bill_name      = row.get('bill_name', ''),
-            ).first()
-
-            if existing:
-                changed = any(
-                    str(getattr(existing, f, None)) != str(row.get(f))
-                    for f in update_fields
-                )
-                if changed:
-                    for f in update_fields:
-                        setattr(existing, f, row.get(f))
-                    updated += 1
-                else:
-                    unchanged += 1
-            else:
-                db.add(DebtorOutstanding(
-                    company_name   = row.get('company_name'),
-                    party_name     = row.get('party_name'),
-                    voucher_number = row.get('voucher_number'),
-                    voucher_type   = row.get('voucher_type'),
-                    bill_name      = row.get('bill_name'),
-                    bill_type      = row.get('bill_type'),
-                    date           = row.get('date'),
-                    bill_date      = row.get('bill_date'),
-                    due_date       = row.get('due_date'),
-                    reference      = row.get('reference'),
-                    currency       = row.get('currency', 'INR'),
-                    exchange_rate  = row.get('exchange_rate', 1.0),
-                    amount         = row.get('amount', 0.0),
-                    narration      = row.get('narration'),
-                ))
-                inserted += 1
+            db.add(DebtorOutstanding(
+                company_name   = row.get('company_name'),
+                party_name     = row.get('party_name'),
+                voucher_number = row.get('voucher_number'),
+                voucher_type   = row.get('voucher_type'),
+                bill_name      = row.get('bill_name'),
+                bill_type      = row.get('bill_type'),
+                date           = row.get('date'),
+                bill_date      = row.get('bill_date'),
+                due_date       = row.get('due_date'),
+                reference      = row.get('reference'),
+                currency       = row.get('currency', 'INR'),
+                exchange_rate  = row.get('exchange_rate', 1.0),
+                amount         = row.get('amount', 0.0),
+                narration      = row.get('narration'),
+            ))
+            inserted += 1
 
         db.commit()
-        _log_result("Debtor outstanding upsert", inserted, updated, unchanged, skipped)
+        logger.info(f"Debtor outstanding full-replace | company={company_name} | inserted={inserted}")
 
     except Exception:
         db.rollback()

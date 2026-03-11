@@ -1,0 +1,29 @@
+<ENVELOPE>
+    <HEADER>
+        <VERSION>1</VERSION>
+        <TALLYREQUEST>Export</TALLYREQUEST>
+        <TYPE>Collection</TYPE>
+        <ID>ContraVoucherGUIDs</ID>
+    </HEADER>
+    <BODY>
+        <DESC>
+            <STATICVARIABLES>
+                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+                <SVCURRENTCOMPANY>COMPANY_NAME_HERE</SVCURRENTCOMPANY>
+                <SVFROMDATE>PLACEHOLDER_FROM_DATE</SVFROMDATE>
+                <SVTODATE>PLACEHOLDER_TO_DATE</SVTODATE>
+            </STATICVARIABLES>
+            <TDL>
+                <TDLMESSAGE>
+                    <COLLECTION NAME="ContraVoucherGUIDs">
+                        <TYPE>Voucher</TYPE>
+                        <CHILDOF>$$VchTypeContra</CHILDOF>
+                        <FETCH>GUID</FETCH>
+                        <FETCH>VOUCHERKEY</FETCH>
+                        <FETCH>DATE</FETCH>
+                    </COLLECTION>
+                </TDLMESSAGE>
+            </TDL>
+        </DESC>
+    </BODY>
+</ENVELOPE>

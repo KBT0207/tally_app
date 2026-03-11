@@ -98,14 +98,15 @@ def parse_expiry_date(exp_date_text):
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Tally FCY strings look like:
-#   RATE  : "$14.00 = ? 14.00/box"
+#   RATE  : "$14.00 = ? 84.5/$ = ? 1183/box"
+#           "$14.00 = ? 1/$ = ? 14.00/box"
 #   AMOUNT: "$61600.00 @ ? 1/$ = ? 61600.00"
 #           "-$61600.00 @ ? 1/$ = -? 61600.00"   ← ledger (negative) side
 #
 # Strategy
 # ─────────
-#   • Rate   → take the number immediately before "/unit"
-#   • Amount → take the FIRST numeric value (the FCY amount Tally prints first)
+#   • Rate         → take the number immediately AFTER the currency symbol
+#   • Amount       → take the FIRST numeric value (the FCY amount Tally prints first)
 #   • Exchange rate → look for the "? <n>/<symbol>" pattern Tally embeds
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -133,23 +134,44 @@ def _detect_currency(text: str) -> str:
 
 def _parse_fcy_rate(raw: str) -> float:
     """
-    Extract per-unit rate from Tally RATE field.
+    Extract per-unit FCY rate from Tally RATE field.
 
-    "$14.00 = ? 14.00/box"  → 14.0
-    "14.00/box"             → 14.0
-    "14.00"                 → 14.0
+    Tally FCY rate string formats:
+      "$14.00/box"                      → 14.0
+      "$14.00 = ? 1/$ = ? 14.00/box"   → 14.0  (exchange rate = 1)
+      "$14.00 = ? 84.5/$ = ? 1183/box" → 14.0  (exchange rate = 84.5, home = 1183)
+      "14.00/box"                       → 14.0  (plain INR rate)
+
+    BUG FIXED: The old regex r'(-?[\d,]+\.?\d*)\s*/\s*\w' matched "1183/box" on
+    FCY strings like "$14.00 = ? 84.5/$ = ? 1183/box", returning the INR
+    home-rate (1183) instead of the correct FCY per-unit rate ($14.00).
+    Root cause: \w skips '$' (not a word char), so the regex found the last
+    /alphabetic match instead of the first /currency match.
+
+    Fix strategy:
+      1. FCY  → take the number immediately after the currency symbol ($14.00 → 14.0)
+      2. INR  → take the number immediately before /alphabetic-unit (14.00/box → 14.0)
+      3. Fallback → first number in string
     """
     if not raw:
         return 0.0
     raw = str(raw).strip()
 
-    # Number immediately before /unit  e.g. 14.00/box
-    m = re.search(r'(-?[\d,]+\.?\d*)\s*/\s*\w', raw)
+    # Step 1: FCY — number immediately after currency symbol
+    #   "$14.00 = ? 84.5/$ = ? 1183/box"  →  grabs 14.0  ✓
+    #   "$14.00/box"                        →  grabs 14.0  ✓
+    m = re.search(_CURRENCY_SYMBOLS + r'\s*([\d,]+\.?\d*)', raw)
+    if m:
+        return abs(convert_to_float(m.group(1)))
+
+    # Step 2: INR — number immediately before /alphabetic-unit
+    #   "14.00/box"  →  14.0  ✓
+    m = re.search(r'([\d,]+\.?\d*)\s*/\s*[a-zA-Z]', raw)
     if m:
         return abs(convert_to_float(m.group(1)))
 
     # Fallback: first number in string
-    m = re.search(r'(-?[\d,]+\.?\d*)', raw)
+    m = re.search(r'([\d,]+\.?\d*)', raw)
     if m:
         return abs(convert_to_float(m.group(1)))
 
@@ -184,10 +206,11 @@ def _parse_fcy_amount(raw: str) -> float:
 
 def _parse_fcy_exchange_rate(raw_amount: str) -> float:
     """
-    Extract exchange rate embedded in Tally FCY amount string.
+    Extract exchange rate embedded in Tally FCY amount/rate string.
 
-    "$61600.00 @ ? 1/$ = ? 61600.00"  → 1.0   (1 home-unit per $)
-    "$615.00 @ ? 84.5/$ = ? 51997.50" → 84.5
+    "$61600.00 @ ? 1/$ = ? 61600.00"       → 1.0
+    "$615.00 @ ? 84.5/$ = ? 51997.50"      → 84.5
+    "$14.00 = ? 84.5/$ = ? 1183/box"       → 84.5
     Returns 1.0 if not found.
     """
     if not raw_amount:
@@ -275,7 +298,7 @@ def extract_currency_and_values(rate_text=None, amount_text=None, discount_text=
             result['exchange_rate'] = _parse_fcy_exchange_rate(amount_text)
 
         if rate_text:
-            result['rate'] = _parse_fcy_rate(rate_text)
+            result['rate'] = _parse_fcy_rate(rate_text)  # ← fixed function
 
             # If exchange rate still at default, try deriving from rate string
             if result['exchange_rate'] == 1.0:
@@ -458,6 +481,7 @@ def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: s
             guid           = voucher.findtext('GUID', '')
             alter_id       = voucher.findtext('ALTERID', '0')
             master_id      = voucher.findtext('MASTERID', '')
+            voucherkey     = clean_text(voucher.findtext('VOUCHERKEY', ''))
             voucher_number = clean_text(voucher.findtext('VOUCHERNUMBER', ''))
             voucher_type   = clean_text(voucher.findtext('VOUCHERTYPENAME', ''))
             date           = clean_text(voucher.findtext('DATE', ''))
@@ -483,7 +507,7 @@ def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: s
                 all_rows.append(_deleted_inventory_stub(
                     company_name, date, voucher_number, reference, voucher_type,
                     party_name, party_gstin, irn_number, eway_bill,
-                    narration, guid, alter_id, master_id, change_status,
+                    narration, guid, voucherkey, alter_id, master_id, change_status,
                 ))
                 continue
 
@@ -601,7 +625,7 @@ def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: s
                     amount_txt   = clean_text(amount_elem.text      if amount_elem     is not None and amount_elem.text      else '0')
                     discount_txt = clean_text(discount_elem.text    if discount_elem   is not None and discount_elem.text    else '0')
 
-                    # ── KEY FIX: use FCY-aware parsers ────────────────────────
+                    # FCY-aware parsers (rate now correctly returns FCY per-unit rate)
                     currency_data = extract_currency_and_values(rate_txt, amount_txt, discount_txt)
 
                     # Propagate voucher-level FCY if item-level didn't resolve
@@ -650,8 +674,8 @@ def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: s
                         'mfg_date'     : mfg_date,
                         'exp_date'     : exp_date,
                         'hsn_code'     : hsn_code,
-                        'rate'         : currency_data['rate'],     # ✅ FCY rate
-                        'amount'       : item_amount,               # ✅ FCY amount
+                        'rate'         : currency_data['rate'],      # ✅ FCY per-unit rate
+                        'amount'       : item_amount,                # ✅ FCY amount
                         'discount'     : currency_data['discount'],
                         'currency'     : currency_data['currency'],
                         'exchange_rate': currency_data['exchange_rate'],
@@ -676,9 +700,27 @@ def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: s
                 'is_deleted'      : is_deleted_flag,
                 'narration'       : narration,
                 'guid'            : guid,
+                'voucherkey'      : voucherkey,
                 'alter_id'        : int(alter_id) if alter_id else 0,
                 'master_id'       : master_id,
             }
+
+            # Sort items by name — makes idx==0 deterministic across re-syncs
+            temp_item_data.sort(key=lambda x: x['item_name'])
+
+            # total_amt fallback: if party ledger returned 0, compute from line items
+            if total_amt_from_xml == 0 and temp_item_data:
+                total_amt_from_xml = round(
+                    sum(i['amount'] for i in temp_item_data)
+                    + voucher_gst_data['cgst_total']
+                    + voucher_gst_data['sgst_total']
+                    + voucher_gst_data['igst_total']
+                    + voucher_charges['freight_amt']
+                    + voucher_charges['dca_amt']
+                    + voucher_charges['cf_amt']
+                    + voucher_charges['other_amt'],
+                    2,
+                )
 
             if not temp_item_data or total_item_amount == 0:
                 # No inventory items parsed — emit a summary row
@@ -756,7 +798,7 @@ def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: s
 def _deleted_inventory_stub(
     company_name, date, voucher_number, reference, voucher_type,
     party_name, party_gstin, irn_number, eway_bill,
-    narration, guid, alter_id, master_id, change_status,
+    narration, guid, voucherkey, alter_id, master_id, change_status,
 ) -> dict:
     """Return a zeroed stub row used to mark a voucher deleted in the DB."""
     return {
@@ -794,6 +836,7 @@ def _deleted_inventory_stub(
         'exchange_rate'   : 1.0,
         'narration'       : narration,
         'guid'            : guid,
+        'voucherkey'      : voucherkey,
         'alter_id'        : int(alter_id) if alter_id else 0,
         'master_id'       : master_id,
         'change_status'   : change_status,
@@ -1016,11 +1059,9 @@ def parse_items(xml_content, company_name: str) -> list:
         skipped  = 0
 
         for item in items:
-            # ── Identity ──────────────────────────────────────────────────────
             item_name = clean_text(item.get('NAME', '') or item.findtext('NAME', ''))
             guid      = clean_text(item.findtext('GUID', ''))
 
-            # Skip placeholder / empty nodes (no name or no guid)
             if not item_name or not guid:
                 skipped += 1
                 logger.debug(f"Skipping item with no name/guid (name={item_name!r})")
@@ -1029,15 +1070,11 @@ def parse_items(xml_content, company_name: str) -> list:
             remote_alt_guid = clean_text(item.findtext('REMOTEALTGUID', ''))
             alter_id_raw    = clean_text(item.findtext('ALTERID', '0'))
 
-            # ── Master descriptors — Tally embeds a leading space in PARENT / CATEGORY
             parent_group = clean_text(item.findtext('PARENT',          '')).strip()
             category     = clean_text(item.findtext('CATEGORY',        '')).strip()
             base_units   = clean_text(item.findtext('BASEUNITS',       ''))
             gst_type     = clean_text(item.findtext('GSTTYPEOFSUPPLY', ''))
 
-            # ── Opening-stock values ──────────────────────────────────────────
-            # OPENINGBALANCE can be "0.00 Ltr" (qty + unit) — numeric extractor handles it
-            # OPENINGRATE can be "1437.28/Ltr"              — numeric extractor handles it
             opening_balance = convert_to_float(
                 extract_numeric_amount(clean_text(item.findtext('OPENINGBALANCE', '0')))
             )
@@ -1048,33 +1085,23 @@ def parse_items(xml_content, company_name: str) -> list:
                 extract_numeric_amount(clean_text(item.findtext('OPENINGVALUE',   '0')))
             )
 
-            # ── Audit ─────────────────────────────────────────────────────────
             entered_by = clean_text(item.findtext('ENTEREDBY', ''))
 
-            # Tally emits <ISDELETED TYPE="Logical"></ISDELETED> (empty tag) for
-            # active items — findtext default is never triggered for existing empty
-            # tags, so we must treat '' as 'No' explicitly.
             is_deleted_raw = clean_text(item.findtext('ISDELETED', ''))
             is_deleted     = 'Yes' if is_deleted_raw.lower() in ('yes', 'true', '1') else 'No'
 
             all_rows.append({
-                # 1. Identity
                 'company_name'      : company_name,
-                # 2. Master descriptors
                 'item_name'         : item_name,
                 'parent_group'      : parent_group,
                 'category'          : category,
-                # 3. UoM / supply type
                 'base_units'        : base_units,
                 'gst_type_of_supply': gst_type,
-                # 4. Opening-stock financials
                 'opening_balance'   : opening_balance,
                 'opening_rate'      : opening_rate,
                 'opening_value'     : opening_value,
-                # 5. Audit metadata
                 'entered_by'        : entered_by,
                 'is_deleted'        : is_deleted,
-                # 6. CDC / change-tracking keys
                 'guid'              : guid,
                 'remote_alt_guid'   : remote_alt_guid,
                 'alter_id'          : int(alter_id_raw) if alter_id_raw else 0,
@@ -1094,31 +1121,17 @@ def parse_items(xml_content, company_name: str) -> list:
 # ──────────────────────────────────────────────────────────────────────────────
 # Outstanding — Debtors parser
 # ──────────────────────────────────────────────────────────────────────────────
-#
-# Tally AMOUNT field is FCY-formatted:
-#   "-$32283.00 @ ? 50.1288/$ = -? 1618306.50"
-#   Negative raw = debit to party  = receivable still outstanding
-#   Positive raw = credit to party = receipt already received
-#
-# Uses lxml recover=True to handle Tally's occasional invalid XML characters.
-# ──────────────────────────────────────────────────────────────────────────────
 
 def parse_outstanding_debtors(xml_content, company_name: str) -> list:
     """
     Parse Sundry Debtors (Receivables) outstanding vouchers.
 
-    Usage:
-        raw  = tally.fetch_outstanding_debtors(company, from_date, to_date)
-        rows = parse_outstanding_debtors(raw, company_name)
-
     Returns list[dict] with keys:
-        company_name, party_type, party_name,
+        company_name, party_name,
         voucher_number, voucher_type,
         bill_name, bill_type, date, bill_date, due_date,
         reference, narration,
-        currency,       ← 'USD' / 'INR' — tells caller what unit amount is in
-        exchange_rate,  ← INR per FCY unit; 1.0 for plain INR vouchers
-        amount          ← always positive absolute value
+        currency, exchange_rate, amount
     """
     try:
         from lxml import etree as _lxml
@@ -1129,7 +1142,6 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
 
         raw = xml_content if isinstance(xml_content, bytes) else xml_content.encode('utf-8')
 
-        # lxml recover=True silently skips invalid chars Tally sometimes emits
         parser   = _lxml.XMLParser(recover=True, encoding='utf-8')
         root     = _lxml.fromstring(raw, parser=parser)
         vouchers = root.findall('.//VOUCHER')
@@ -1158,7 +1170,6 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
                 if due_raw and due_raw not in ('', '000000000') else None
             )
 
-            # ── Find party leg in ALLLEDGERENTRIES ────────────────────────────
             amount        = 0.0
             exchange_rate = 1.0
             currency      = 'INR'
@@ -1175,7 +1186,6 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
                 bd      = clean_text(le.findtext('BILLDATE',      ''))
 
                 if isparty == 'Yes' and le_name == party:
-                    # Always store as absolute value — no sign needed
                     amount        = abs(_parse_fcy_amount(amt_raw))
                     exchange_rate = _parse_fcy_exchange_rate(amt_raw)
                     currency      = _detect_currency(amt_raw)
@@ -1211,3 +1221,49 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
         logger.error(f"Error parsing outstanding debtors [{company_name}]: {e}")
         logger.error(traceback.format_exc())
         return []
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GUID reconciliation parser  (Phase 3)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_guids(xml_content) -> "set | None":
+    """
+    Parse a GUID-only XML response from Tally (utils/guid/*.xml templates).
+
+    Returns:
+        set[str]  — set of GUID strings on success (may be empty if Tally
+                    genuinely has 0 vouchers in the requested window)
+        None      — on ANY parse failure (network error, bad XML, empty content)
+
+    CRITICAL CONTRACT for callers:
+        None  → Tally fetch or parse FAILED → DO NOT delete anything
+        set() → Tally confirmed 0 vouchers in window → safe to delete DB rows
+    """
+    try:
+        if not xml_content:
+            logger.warning("parse_guids: received empty/None xml_content")
+            return None
+
+        xml_str = sanitize_xml_content(xml_content)
+        if not xml_str or not xml_str.strip():
+            logger.warning("parse_guids: empty XML after sanitization")
+            return None
+
+        root = ET.fromstring(xml_str.encode('utf-8'))
+
+        guids = {
+            e.text.strip()
+            for e in root.iter('GUID')
+            if e.text and e.text.strip()
+        }
+
+        logger.info(f"parse_guids: parsed {len(guids)} GUIDs from Tally response")
+        return guids
+
+    except ET.ParseError as e:
+        logger.error(f"parse_guids: XML parse error — {e}")
+        return None
+    except Exception as e:
+        logger.error(f"parse_guids: unexpected error — {e}")
+        logger.error(traceback.format_exc())
+        return None

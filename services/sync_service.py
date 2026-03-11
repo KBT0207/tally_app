@@ -1,7 +1,8 @@
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from calendar import monthrange
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import xml.etree.ElementTree as ET
 
 from logging_config import logger
 from database.models.sync_state import SyncState
@@ -14,6 +15,8 @@ from services.data_processor import (
     parse_items,
     parse_trial_balance,
     parse_outstanding_debtors,
+    parse_guids,
+    sanitize_xml_content,
 )
 from database.database_processor import (
     get_sync_state,
@@ -31,6 +34,7 @@ from database.database_processor import (
     upsert_contra_vouchers,
     upsert_trial_balance,
     upsert_debtor_outstanding,
+    reconcile_deleted_by_guids,
     INVENTORY_MODEL_MAP,
     LEDGER_MODEL_MAP,
     _upsert_inventory_voucher_in_session,
@@ -46,6 +50,9 @@ VOUCHER_WORKERS       = 1   # parallel threads for voucher sync within ONE compa
 # gain zero throughput benefit. DB writes between requests ARE fast but the Tally
 # fetch dominates (seconds vs milliseconds). Setting this to 2+ only wastes RAM.
 # Raise ONLY if on Tally Server (multi-user) AND you've verified concurrent connections.
+
+# Phase 3 — GUID reconciliation window (days looking back from to_date)
+RECONCILE_WINDOW_DAYS = 90
 
 # ── Global Tally request semaphore ───────────────────────────────────────────
 # Tally Prime is single-user/single-connection — even when multiple companies
@@ -90,12 +97,16 @@ def _get_company_lock(company_name: str) -> threading.Lock:
             _SYNC_STATE_LOCKS[company_name] = threading.Lock()
         return _SYNC_STATE_LOCKS[company_name]
 
+
 # ── Voucher configuration table ───────────────────────────────────────────────
+# guid_fetch: name of the TallyConnector method for Phase 3 GUID reconciliation.
+# All 8 voucher types have a corresponding fetch_*_guids() method.
 VOUCHER_CONFIG = [
     {
         'voucher_type'    : 'sales',
         'snapshot_fetch'  : 'fetch_sales',
         'cdc_fetch'       : 'fetch_sales_cdc',
+        'guid_fetch'      : 'fetch_sales_guids',
         'parser'          : parse_inventory_voucher,
         'upsert'          : upsert_sales_vouchers,
         'parser_type_name': 'Sales Vouchers',
@@ -105,6 +116,7 @@ VOUCHER_CONFIG = [
         'voucher_type'    : 'purchase',
         'snapshot_fetch'  : 'fetch_purchase',
         'cdc_fetch'       : 'fetch_purchase_cdc',
+        'guid_fetch'      : 'fetch_purchase_guids',
         'parser'          : parse_inventory_voucher,
         'upsert'          : upsert_purchase_vouchers,
         'parser_type_name': 'Purchase Vouchers',
@@ -114,6 +126,7 @@ VOUCHER_CONFIG = [
         'voucher_type'    : 'credit_note',
         'snapshot_fetch'  : 'fetch_credit_note',
         'cdc_fetch'       : 'fetch_credit_note_cdc',
+        'guid_fetch'      : 'fetch_credit_note_guids',
         'parser'          : parse_inventory_voucher,
         'upsert'          : upsert_credit_notes,
         'parser_type_name': 'Credit Note',
@@ -123,6 +136,7 @@ VOUCHER_CONFIG = [
         'voucher_type'    : 'debit_note',
         'snapshot_fetch'  : 'fetch_debit_note',
         'cdc_fetch'       : 'fetch_debit_note_cdc',
+        'guid_fetch'      : 'fetch_debit_note_guids',
         'parser'          : parse_inventory_voucher,
         'upsert'          : upsert_debit_notes,
         'parser_type_name': 'Debit Note',
@@ -132,6 +146,7 @@ VOUCHER_CONFIG = [
         'voucher_type'    : 'receipt',
         'snapshot_fetch'  : 'fetch_receipt',
         'cdc_fetch'       : 'fetch_receipt_cdc',
+        'guid_fetch'      : 'fetch_receipt_guids',
         'parser'          : parse_ledger_voucher,
         'upsert'          : upsert_receipt_vouchers,
         'parser_type_name': 'Receipt Vouchers',
@@ -141,6 +156,7 @@ VOUCHER_CONFIG = [
         'voucher_type'    : 'payment',
         'snapshot_fetch'  : 'fetch_payment',
         'cdc_fetch'       : 'fetch_payment_cdc',
+        'guid_fetch'      : 'fetch_payment_guids',
         'parser'          : parse_ledger_voucher,
         'upsert'          : upsert_payment_vouchers,
         'parser_type_name': 'Payment Vouchers',
@@ -150,6 +166,7 @@ VOUCHER_CONFIG = [
         'voucher_type'    : 'journal',
         'snapshot_fetch'  : 'fetch_journal',
         'cdc_fetch'       : 'fetch_journal_cdc',
+        'guid_fetch'      : 'fetch_journal_guids',
         'parser'          : parse_ledger_voucher,
         'upsert'          : upsert_journal_vouchers,
         'parser_type_name': 'Journal Vouchers',
@@ -159,6 +176,7 @@ VOUCHER_CONFIG = [
         'voucher_type'    : 'contra',
         'snapshot_fetch'  : 'fetch_contra',
         'cdc_fetch'       : 'fetch_contra_cdc',
+        'guid_fetch'      : 'fetch_contra_guids',
         'parser'          : parse_ledger_voucher,
         'upsert'          : upsert_contra_vouchers,
         'parser_type_name': 'Contra Vouchers',
@@ -204,7 +222,7 @@ def _generate_chunks(from_date_str: str, to_date_str: str, chunk_months: int = S
         end_month = (end_month - 1) % 12 + 1
         last_day  = monthrange(end_year, end_month)[1]
 
-        chunk_end = min(date(end_year, end_month, last_day), end)
+        chunk_end  = min(date(end_year, end_month, last_day), end)
         month_str  = chunk_end.strftime('%Y%m')
         chunk_from = chunk_start.strftime('%Y%m%d')
         chunk_to   = chunk_end.strftime('%Y%m%d')
@@ -250,6 +268,176 @@ def _mark_chunk_done(company_name: str, voucher_type: str, month_str: str, engin
             raise
         finally:
             db.close()
+
+
+def _advance_alter_id_from_xml(
+    xml:          bytes,
+    company_name: str,
+    voucher_type: str,
+    engine,
+    lock:         threading.Lock,
+):
+    """
+    FIX: Infinite re-fetch of deleted-only CDC batches.
+
+    When CDC returns ONLY deleted vouchers, the parser correctly returns []
+    (deleted stubs are consumed by the upsert — there's nothing to INSERT).
+    But the old code returned early without advancing last_alter_id, causing
+    the same deleted records to be fetched again on every subsequent sync.
+
+    This function extracts the max ALTERID directly from the raw XML bytes
+    and advances SyncState even when the parser returned no active rows.
+    That way the next CDC call will use a higher alter_id and skip past the
+    already-processed deletions.
+
+    Called only when parser returns [] but we have a valid XML response.
+    """
+    try:
+        xml_str = sanitize_xml_content(xml)
+        if not xml_str:
+            return
+
+        root = ET.fromstring(xml_str.encode('utf-8'))
+        ids  = [
+            int(e.text.strip())
+            for e in root.iter('ALTERID')
+            if e.text and e.text.strip().lstrip('-').isdigit()
+        ]
+        if not ids:
+            return
+
+        new_max = max(ids)
+        with lock:
+            update_sync_state(
+                company_name    = company_name,
+                voucher_type    = voucher_type,
+                last_alter_id   = new_max,
+                engine          = engine,
+                is_initial_done = True,
+            )
+        logger.info(
+            f"[{company_name}][{voucher_type}] "
+            f"alter_id advanced to {new_max} from deleted-only CDC batch"
+        )
+
+    except Exception as e:
+        # Non-fatal — worst case: same deletes fetched next time (harmless, just slow)
+        logger.warning(
+            f"[{company_name}][{voucher_type}] "
+            f"_advance_alter_id_from_xml failed (non-fatal): {e}"
+        )
+
+
+# ── Phase 3 — GUID Reconciliation ────────────────────────────────────────────
+
+def _reconcile_deleted_vouchers(
+    company_name: str,
+    config:       dict,
+    tally:        TallyConnector,
+    engine,
+    to_date:      str,
+):
+    """
+    Phase 3 — Catch deletes that CDC missed.
+
+    Called after CDC completes for each voucher type. Compares GUIDs currently
+    in Tally (90-day rolling window) against GUIDs in DB. Any DB row whose GUID
+    is absent from Tally → physically deleted in Tally → hard DELETE from DB.
+
+    SAFE FAILURE CONTRACT (never deletes when uncertain):
+      tally_guids is None  → Tally fetch or parse failed → skip, log warning
+      tally_guids is empty → skip (could mean genuine 0 vouchers OR a bug)
+      Any exception        → log, return 0, never raise
+
+    Only runs when is_initial_done=True (snapshot must be complete first).
+    Skipped during snapshot phase — no point reconciling while still pulling history.
+    """
+    voucher_type = config['voucher_type']
+    kind         = config['kind']
+    guid_fetch   = config['guid_fetch']
+
+    try:
+        # ── Calculate 90-day window ────────────────────────────────────────
+        td         = datetime.strptime(to_date, '%Y%m%d').date()
+        fd         = td - timedelta(days=RECONCILE_WINDOW_DAYS)
+        from_date  = fd.strftime('%Y%m%d')
+
+        logger.info(
+            f"[{company_name}][{voucher_type}] "
+            f"Phase 3: GUID reconciliation | window {from_date}→{to_date}"
+        )
+
+        # ── Fetch GUIDs from Tally ─────────────────────────────────────────
+        fetch_fn = getattr(tally, guid_fetch)
+        if not _tally_semaphore_acquire(voucher_type):
+            logger.warning(
+                f"[{company_name}][{voucher_type}] "
+                f"Phase 3: semaphore timeout — skipping reconciliation"
+            )
+            return
+
+        try:
+            xml = fetch_fn(company_name=company_name, from_date=from_date, to_date=to_date)
+        finally:
+            _TALLY_SEMAPHORE.release()
+
+        if not xml:
+            logger.warning(
+                f"[{company_name}][{voucher_type}] "
+                f"Phase 3: Tally returned no data — skipping (safe)"
+            )
+            return
+
+        # ── Parse GUIDs — None means parse failure ─────────────────────────
+        tally_guids = parse_guids(xml)
+
+        if tally_guids is None:
+            logger.warning(
+                f"[{company_name}][{voucher_type}] "
+                f"Phase 3: parse_guids returned None (parse error) — skipping (safe)"
+            )
+            return
+
+        if len(tally_guids) == 0:
+            logger.info(
+                f"[{company_name}][{voucher_type}] "
+                f"Phase 3: Tally returned 0 GUIDs for window — skipping (safe, may be genuine)"
+            )
+            return
+
+        # ── Determine model class ──────────────────────────────────────────
+        if kind == 'inventory':
+            model_class = INVENTORY_MODEL_MAP[voucher_type]
+        else:
+            model_class = LEDGER_MODEL_MAP[voucher_type]
+
+        # ── Run reconciliation ─────────────────────────────────────────────
+        deleted_count = reconcile_deleted_by_guids(
+            company_name = company_name,
+            model_class  = model_class,
+            tally_guids  = tally_guids,
+            from_date    = from_date,
+            to_date      = to_date,
+            engine       = engine,
+        )
+
+        if deleted_count > 0:
+            logger.info(
+                f"[{company_name}][{voucher_type}] "
+                f"Phase 3: reconciled {deleted_count} missed deletes ✓"
+            )
+        else:
+            logger.info(
+                f"[{company_name}][{voucher_type}] "
+                f"Phase 3: no missed deletes found ✓"
+            )
+
+    except Exception:
+        # Phase 3 must NEVER crash the sync — log and continue
+        logger.exception(
+            f"[{company_name}][{voucher_type}] "
+            f"Phase 3: reconciliation failed (non-fatal, sync continues)"
+        )
 
 
 # ── Sub-sync functions ────────────────────────────────────────────────────────
@@ -540,9 +728,9 @@ def _sync_voucher(
         last_alter_id     = state.last_alter_id     if state else 0
         last_synced_month = state.last_synced_month if state else None
 
-        # ── CDC mode (after first full snapshot) ──────────────────────────────
+        # ── PHASE 2: CDC mode (after first full snapshot is done) ─────────────
         if is_initial_done:
-            logger.info(f"[{company_name}][{voucher_type}] CDC | last_alter_id={last_alter_id}")
+            logger.info(f"[{company_name}][{voucher_type}] Phase 2: CDC | last_alter_id={last_alter_id}")
 
             t0       = datetime.now()
             fetch_fn = getattr(tally, cdc_fetch)
@@ -558,14 +746,22 @@ def _sync_voucher(
                 logger.warning(
                     f"[{company_name}][{voucher_type}] CDC: no response from Tally ({fetch_ms}ms)"
                 )
+                # Still run Phase 3 — may catch old missed deletes
+                _reconcile_deleted_vouchers(company_name, config, tally, engine, to_date)
                 return
 
             rows = parser(xml, company_name, parser_type_name)
+
             if not rows:
+                # FIX: deleted-only CDC batch — parser returns [] but alter_id must advance.
+                # Without this, the same deleted records are re-fetched every sync forever.
                 logger.info(
-                    f"[{company_name}][{voucher_type}] CDC: nothing changed "
-                    f"(fetch={fetch_ms}ms, 0 rows)"
+                    f"[{company_name}][{voucher_type}] CDC: 0 active rows "
+                    f"(possible delete-only batch) | advancing alter_id from XML"
                 )
+                _advance_alter_id_from_xml(xml, company_name, voucher_type, engine, lock)
+                # Still run Phase 3
+                _reconcile_deleted_vouchers(company_name, config, tally, engine, to_date)
                 return
 
             t1 = datetime.now()
@@ -576,15 +772,18 @@ def _sync_voucher(
             with lock:
                 update_sync_state(company_name, voucher_type, new_max, engine, is_initial_done=True)
             logger.info(
-                f"[{company_name}][{voucher_type}] CDC done | "
+                f"[{company_name}][{voucher_type}] Phase 2: CDC done | "
                 f"rows={len(rows)} | new max_alter_id={new_max} | "
                 f"fetch={fetch_ms}ms upsert={upsert_ms}ms"
             )
+
+            # ── PHASE 3: GUID reconciliation (always after CDC) ───────────────
+            _reconcile_deleted_vouchers(company_name, config, tally, engine, to_date)
             return
 
-        # ── Snapshot mode (first run — chunked) ───────────────────────────────
+        # ── PHASE 1: Snapshot mode (first run — chunked) ──────────────────────
         logger.info(
-            f"[{company_name}][{voucher_type}] SNAPSHOT "
+            f"[{company_name}][{voucher_type}] Phase 1: SNAPSHOT "
             f"({SNAPSHOT_CHUNK_MONTHS}-month chunks) | {from_date} → {to_date}"
         )
 
@@ -601,7 +800,7 @@ def _sync_voucher(
         all_alter_ids = [last_alter_id] if last_alter_id > 0 else []
 
         # Pre-calculate chunks for accurate progress reporting
-        _all_chunks = list(_generate_chunks(from_date, to_date))
+        _all_chunks  = list(_generate_chunks(from_date, to_date))
         total_chunks = max(len([c for c in _all_chunks
             if not (last_synced_month and c[2] < last_synced_month)]), 1)
 
@@ -651,6 +850,8 @@ def _sync_voucher(
             # upsert_and_advance_month internally acquires the per-company lock
             # for its SyncState write so we do NOT hold the lock around the
             # (potentially slow) DB upsert of the voucher rows themselves.
+            # The underlying _upsert_*_in_session functions now do hard delete
+            # + reinsert, so snapshot chunks never accumulate Retired rows.
             upsert_and_advance_month(
                 rows               = rows,
                 model_class        = model_class,
@@ -678,9 +879,13 @@ def _sync_voucher(
             )
 
         logger.info(
-            f"[{company_name}][{voucher_type}] Snapshot complete | "
+            f"[{company_name}][{voucher_type}] Phase 1: Snapshot complete | "
             f"chunks={chunks_done} | total_rows={total_rows} | max_alter_id={final_alter_id}"
         )
+        # NOTE: Phase 3 (GUID reconciliation) is intentionally NOT run after snapshot.
+        # During snapshot we are still pulling historical data — reconciling would
+        # incorrectly delete rows for months we haven't fetched yet.
+        # Phase 3 only runs in CDC mode (is_initial_done=True).
 
     except Exception:
         logger.exception(
@@ -700,7 +905,11 @@ def sync_company(
     parallel_company_mode: bool = False,
 ):
     """
-    Sync a single company.
+    Sync a single company — all 3 phases.
+
+    Phase 1 (Snapshot): runs on first sync, chunked 3-month fetches
+    Phase 2 (CDC):      runs on every subsequent sync, alter_id gated
+    Phase 3 (Reconcile): runs after every CDC sync, 90-day GUID diff
 
     parallel_company_mode=True  → called from sync_all_companies_parallel;
         inner voucher ThreadPoolExecutor is capped at 1 worker because Tally
