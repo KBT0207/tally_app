@@ -35,6 +35,7 @@ from database.database_processor import (
     upsert_trial_balance,
     upsert_debtor_outstanding,
     reconcile_deleted_by_guids,
+    reconcile_deleted_masters_in_db,
     INVENTORY_MODEL_MAP,
     LEDGER_MODEL_MAP,
     _upsert_inventory_voucher_in_session,
@@ -43,38 +44,15 @@ from database.database_processor import (
 )
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
-SNAPSHOT_CHUNK_MONTHS = 3   # months fetched per Tally API call during snapshot
-VOUCHER_WORKERS       = 1   # parallel threads for voucher sync within ONE company
-# NOTE: Tally Prime is single-user — ALL HTTP requests go through _TALLY_SEMAPHORE
-# which is a Semaphore(1). Extra threads beyond 1 just wait on the semaphore and
-# gain zero throughput benefit. DB writes between requests ARE fast but the Tally
-# fetch dominates (seconds vs milliseconds). Setting this to 2+ only wastes RAM.
-# Raise ONLY if on Tally Server (multi-user) AND you've verified concurrent connections.
-
-# Phase 3 — GUID reconciliation runs from company starting_from → today
-# in SNAPSHOT_CHUNK_MONTHS-month chunks (same cadence as initial snapshot).
-# No fixed rolling window — every sync covers the full company history.
+SNAPSHOT_CHUNK_MONTHS = 3
+VOUCHER_WORKERS       = 1
 
 # ── Global Tally request semaphore ───────────────────────────────────────────
-# Tally Prime is single-user/single-connection — even when multiple companies
-# run in parallel, all HTTP requests must be serialised so Tally does not get
-# overwhelmed or return garbled XML.  A semaphore with limit=1 achieves this
-# without removing the benefit of parallel DB writes between requests.
-#
-# Increase to 2-3 ONLY if you are on Tally Server (multi-user edition) AND
-# have verified it handles concurrent connections reliably.
-_TALLY_SEMAPHORE = threading.Semaphore(1)
-
-# Max seconds to wait for the semaphore before giving up (prevents deadlock
-# when Tally hangs indefinitely on a request).
+_TALLY_SEMAPHORE         = threading.Semaphore(1)
 _TALLY_SEMAPHORE_TIMEOUT = 120
 
 
 def _tally_semaphore_acquire(voucher_type: str = "") -> bool:
-    """
-    Try to acquire _TALLY_SEMAPHORE within _TALLY_SEMAPHORE_TIMEOUT seconds.
-    Returns True on success, False on timeout.
-    """
     acquired = _TALLY_SEMAPHORE.acquire(timeout=_TALLY_SEMAPHORE_TIMEOUT)
     if not acquired:
         logger.error(
@@ -85,14 +63,10 @@ def _tally_semaphore_acquire(voucher_type: str = "") -> bool:
     return acquired
 
 # ── Per-company SyncState write lock ─────────────────────────────────────────
-# Prevents two threads (voucher workers within the same company) from updating
-# the same SyncState row simultaneously, which would cause a lost-update
-# on last_synced_month / last_alter_id.
 _SYNC_STATE_LOCKS: dict[str, threading.Lock] = {}
 _SYNC_STATE_LOCKS_MUTEX = threading.Lock()
 
 def _get_company_lock(company_name: str) -> threading.Lock:
-    """Return (creating if needed) a per-company threading.Lock."""
     with _SYNC_STATE_LOCKS_MUTEX:
         if company_name not in _SYNC_STATE_LOCKS:
             _SYNC_STATE_LOCKS[company_name] = threading.Lock()
@@ -100,8 +74,6 @@ def _get_company_lock(company_name: str) -> threading.Lock:
 
 
 # ── Voucher configuration table ───────────────────────────────────────────────
-# guid_fetch: name of the TallyConnector method for Phase 3 GUID reconciliation.
-# All 8 voucher types have a corresponding fetch_*_guids() method.
 VOUCHER_CONFIG = [
     {
         'voucher_type'    : 'sales',
@@ -195,7 +167,6 @@ def _get_max_alter_id(rows: list) -> int:
 
 
 def _resolve_from_date(company: dict) -> str:
-    """Return YYYYMMDD start date for a company; fall back to a safe default."""
     starting_from = company.get('starting_from', '')
     if starting_from:
         cleaned = str(starting_from).strip().replace('-', '')
@@ -239,7 +210,7 @@ def _generate_chunks(from_date_str: str, to_date_str: str, chunk_months: int = S
 
 
 def _mark_chunk_done(company_name: str, voucher_type: str, month_str: str, engine):
-    """Persist progress for a chunk that returned no data so we can skip it on restart."""
+    """Persist progress for a chunk that returned no data."""
     lock = _get_company_lock(company_name)
     with lock:
         db = _get_session(engine)
@@ -279,19 +250,9 @@ def _advance_alter_id_from_xml(
     lock:         threading.Lock,
 ):
     """
-    FIX: Infinite re-fetch of deleted-only CDC batches.
-
-    When CDC returns ONLY deleted vouchers, the parser correctly returns []
-    (deleted stubs are consumed by the upsert — there's nothing to INSERT).
-    But the old code returned early without advancing last_alter_id, causing
-    the same deleted records to be fetched again on every subsequent sync.
-
-    This function extracts the max ALTERID directly from the raw XML bytes
-    and advances SyncState even when the parser returned no active rows.
-    That way the next CDC call will use a higher alter_id and skip past the
-    already-processed deletions.
-
-    Called only when parser returns [] but we have a valid XML response.
+    Advance last_alter_id from a deleted-only CDC batch where the parser
+    returned [] but valid XML was received.  Without this the same deleted
+    records are re-fetched on every subsequent sync.
     """
     try:
         xml_str = sanitize_xml_content(xml)
@@ -322,7 +283,6 @@ def _advance_alter_id_from_xml(
         )
 
     except Exception as e:
-        # Non-fatal — worst case: same deletes fetched next time (harmless, just slow)
         logger.warning(
             f"[{company_name}][{voucher_type}] "
             f"_advance_alter_id_from_xml failed (non-fatal): {e}"
@@ -336,24 +296,17 @@ def _reconcile_deleted_vouchers(
     config:       dict,
     tally:        TallyConnector,
     engine,
-    from_date:    str,    # company starting_from date (YYYYMMDD) — full history scanned
+    from_date:    str,
     to_date:      str,
 ):
     """
     Phase 3 — Catch deletes that CDC missed, scanning from_date → to_date
-    in 3-month chunks (same chunk size as snapshot).
-
-    WHY CHUNKS:
-      Fetching GUIDs for the entire company history in one Tally request can
-      return a very large XML payload and time out. Chunking keeps each request
-      small and consistent with how snapshot works.
+    in 3-month chunks.
 
     SAFE FAILURE CONTRACT (never deletes when uncertain):
       tally_guids is None  → Tally fetch or parse failed → skip that chunk
-      tally_guids is empty dict → skip that chunk (could be genuine 0 OR a bug)
-      Any chunk exception  → log and continue to next chunk (non-fatal)
-
-    Only runs when is_initial_done=True (snapshot must be complete first).
+      tally_guids is empty dict → skip that chunk
+      Any chunk exception  → log and continue (non-fatal)
     """
     voucher_type = config['voucher_type']
     kind         = config['kind']
@@ -375,7 +328,6 @@ def _reconcile_deleted_vouchers(
 
     for chunk_from, chunk_to, month_str in _generate_chunks(from_date, to_date):
         try:
-            # ── Fetch GUIDs for this chunk ─────────────────────────────────
             if not _tally_semaphore_acquire(voucher_type):
                 logger.warning(
                     f"[{company_name}][{voucher_type}] "
@@ -399,7 +351,6 @@ def _reconcile_deleted_vouchers(
                 )
                 continue
 
-            # ── Parse GUIDs — None means parse failure ─────────────────────
             tally_guids = parse_guids(xml)
 
             if tally_guids is None:
@@ -416,7 +367,6 @@ def _reconcile_deleted_vouchers(
                 )
                 continue
 
-            # ── Reconcile this chunk ───────────────────────────────────────
             deleted_count = reconcile_deleted_by_guids(
                 company_name = company_name,
                 model_class  = model_class,
@@ -439,7 +389,6 @@ def _reconcile_deleted_vouchers(
                 )
 
         except Exception:
-            # One bad chunk must never stop the rest — log and continue
             logger.exception(
                 f"[{company_name}][{voucher_type}] "
                 f"Phase 3 chunk {month_str}: failed (non-fatal, continuing)"
@@ -453,6 +402,60 @@ def _reconcile_deleted_vouchers(
 
 # ── Sub-sync functions ────────────────────────────────────────────────────────
 
+# ── Master GUID Reconciliation (items + ledgers) ─────────────────────────────
+
+def _reconcile_deleted_masters(
+    company_name: str,
+    master_type:  str,   # 'items' or 'ledger'
+    tally:        TallyConnector,
+    engine,
+):
+    """
+    Fetch all master GUIDs from Tally and soft-delete (is_deleted='Yes') any
+    DB rows whose GUID is no longer present in Tally.
+
+    WHY SOFT-DELETE (not hard delete) for masters:
+      Vouchers reference ledger_name / item_name by value, not by FK.
+      Hard-deleting a master would not break those references, but keeping
+      the master row as is_deleted='Yes' lets the UI show "deleted" badges
+      and prevents the name from being reused in future syncs incorrectly.
+
+    SAFE FAILURE CONTRACT:
+      tally_guids None or empty → skip entirely, never delete.
+    """
+    fetch_fn_name = 'fetch_item_guids' if master_type == 'items' else 'fetch_ledger_guids'
+    fetch_fn      = getattr(tally, fetch_fn_name)
+
+    logger.info(f"[{company_name}][{master_type}] Master GUID reconciliation starting")
+
+    if not _tally_semaphore_acquire(master_type):
+        logger.warning(f"[{company_name}][{master_type}] Master GUID reconciliation: semaphore timeout — skipping")
+        return
+
+    try:
+        xml = fetch_fn(company_name=company_name)
+    finally:
+        _TALLY_SEMAPHORE.release()
+
+    if not xml:
+        logger.warning(f"[{company_name}][{master_type}] Master GUID reconciliation: no response — skipping (safe)")
+        return
+
+    tally_guids = parse_guids(xml)
+
+    if not tally_guids:
+        logger.warning(f"[{company_name}][{master_type}] Master GUID reconciliation: 0 GUIDs — skipping (safe)")
+        return
+
+    deleted = reconcile_deleted_masters_in_db(
+        company_name = company_name,
+        master_type  = master_type,
+        tally_guids  = tally_guids,
+        engine       = engine,
+    )
+    logger.info(f"[{company_name}][{master_type}] Master GUID reconciliation done | hard-deleted={deleted}")
+
+
 def _sync_trial_balance(
     company_name: str,
     tally:        TallyConnector,
@@ -461,12 +464,23 @@ def _sync_trial_balance(
     to_date:      str,
     progress_cb=None,
 ):
+    """
+    Sync trial balance for the given date window.
+
+    FIX: The old alter_id skip guard used `max_alter_id == saved_alter_id`
+    to decide "nothing changed, skip".  Trial balance nodes in Tally
+    frequently return alter_id=0 — meaning max_alter_id would always be 0
+    and saved_alter_id would also be 0 after the first sync, causing ALL
+    subsequent trial balance syncs to be skipped silently.
+
+    New strategy: always fetch and upsert (the upsert itself is idempotent
+    and only writes when values actually differ), and advance the saved
+    alter_id to whatever Tally returns so the log is correct.
+    """
     logger.info(f"[{company_name}] Syncing Trial Balance | {from_date} -> {to_date}")
     try:
         if progress_cb:
             progress_cb(0.0, "Fetching trial balance from Tally...")
-        state          = get_sync_state(company_name, 'trial_balance', engine)
-        saved_alter_id = state.last_alter_id if state else 0
 
         if not _tally_semaphore_acquire():
             raise RuntimeError("Tally semaphore timeout — Tally may be hung")
@@ -476,6 +490,7 @@ def _sync_trial_balance(
             )
         finally:
             _TALLY_SEMAPHORE.release()
+
         if not xml:
             logger.warning(f"[{company_name}] No trial balance data from Tally")
             return
@@ -485,24 +500,19 @@ def _sync_trial_balance(
             logger.warning(f"[{company_name}] Trial balance parsed 0 rows")
             return
 
-        max_alter_id = _get_max_alter_id(rows)
-
-        if max_alter_id == saved_alter_id and saved_alter_id > 0:
-            logger.info(
-                f"[{company_name}] Trial Balance SKIPPED — "
-                f"max_alter_id unchanged ({max_alter_id}), no changes in Tally"
-            )
-            return
-
+        # FIX: always upsert — do not skip based on alter_id
+        # (trial balance alter_id is often 0 from Tally; skip guard was causing
+        # trial balance to never refresh after the very first sync)
         upsert_trial_balance(rows, engine)
 
+        max_alter_id = _get_max_alter_id(rows)
         lock = _get_company_lock(company_name)
         with lock:
             update_sync_state(company_name, 'trial_balance', max_alter_id, engine)
 
         logger.info(
             f"[{company_name}] Trial Balance done | "
-            f"rows={len(rows)} | max_alter_id={max_alter_id} (was {saved_alter_id})"
+            f"rows={len(rows)} | max_alter_id={max_alter_id}"
         )
 
     except Exception:
@@ -518,11 +528,8 @@ def _sync_outstanding_debtors(
     progress_cb=None,
 ):
     """
-    Fetch and upsert Sundry Debtors outstanding for the given date range.
-
-    No CDC / alter_id check — outstanding is always a fresh point-in-time
-    snapshot so we always fetch and upsert. SyncState is updated after each
-    successful run so the dashboard can show last_sync_time.
+    Fetch and full-replace Sundry Debtors outstanding.
+    Always a fresh point-in-time snapshot — no alter_id check.
     """
     logger.info(f"[{company_name}] Syncing Outstanding Debtors | {from_date} -> {to_date}")
     try:
@@ -554,7 +561,7 @@ def _sync_outstanding_debtors(
             update_sync_state(
                 company_name    = company_name,
                 voucher_type    = 'outstanding_debtors',
-                last_alter_id   = 0,          # no alter_id for outstanding snapshots
+                last_alter_id   = 0,
                 engine          = engine,
                 is_initial_done = True,
             )
@@ -569,10 +576,8 @@ def _sync_outstanding_debtors(
 
 def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=None):
     """
-    Sync the StockItem master for *company_name*.
-
-    • First run  → full snapshot  (no date range needed for masters)
-    • Subsequent → CDC using stored alter_id
+    Sync the StockItem master.
+    First run → full snapshot.  Subsequent → CDC using stored alter_id.
     """
     logger.info(f"[{company_name}] Syncing Items (StockItem master)")
     lock = _get_company_lock(company_name)
@@ -612,6 +617,8 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
             logger.info(
                 f"[{company_name}][items] CDC done | rows={len(rows)} | new max_alter_id={new_max}"
             )
+            # GUID reconciliation — catch deletes CDC missed
+            _reconcile_deleted_masters(company_name, 'items', tally, engine)
             return
 
         logger.info(f"[{company_name}][items] SNAPSHOT — fetching all stock items")
@@ -682,6 +689,8 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=
             logger.info(
                 f"[{company_name}][ledger] CDC done | rows={len(rows)} | new max_alter_id={new_max}"
             )
+            # GUID reconciliation — catch deletes CDC missed
+            _reconcile_deleted_masters(company_name, 'ledger', tally, engine)
             return
 
         logger.info(f"[{company_name}][ledger] SNAPSHOT — fetching all ledgers")
@@ -739,7 +748,7 @@ def _sync_voucher(
         last_alter_id     = state.last_alter_id     if state else 0
         last_synced_month = state.last_synced_month if state else None
 
-        # ── PHASE 2: CDC mode (after first full snapshot is done) ─────────────
+        # ── PHASE 2: CDC mode ─────────────────────────────────────────────────
         if is_initial_done:
             logger.info(f"[{company_name}][{voucher_type}] Phase 2: CDC | last_alter_id={last_alter_id}")
 
@@ -757,21 +766,17 @@ def _sync_voucher(
                 logger.warning(
                     f"[{company_name}][{voucher_type}] CDC: no response from Tally ({fetch_ms}ms)"
                 )
-                # Still run Phase 3 — may catch old missed deletes
                 _reconcile_deleted_vouchers(company_name, config, tally, engine, from_date, to_date)
                 return
 
             rows = parser(xml, company_name, parser_type_name)
 
             if not rows:
-                # FIX: deleted-only CDC batch — parser returns [] but alter_id must advance.
-                # Without this, the same deleted records are re-fetched every sync forever.
                 logger.info(
                     f"[{company_name}][{voucher_type}] CDC: 0 active rows "
                     f"(possible delete-only batch) | advancing alter_id from XML"
                 )
                 _advance_alter_id_from_xml(xml, company_name, voucher_type, engine, lock)
-                # Still run Phase 3
                 _reconcile_deleted_vouchers(company_name, config, tally, engine, from_date, to_date)
                 return
 
@@ -788,11 +793,11 @@ def _sync_voucher(
                 f"fetch={fetch_ms}ms upsert={upsert_ms}ms"
             )
 
-            # ── PHASE 3: GUID reconciliation (always after CDC) ───────────────
+            # Phase 3: GUID reconciliation (always after CDC)
             _reconcile_deleted_vouchers(company_name, config, tally, engine, from_date, to_date)
             return
 
-        # ── PHASE 1: Snapshot mode (first run — chunked) ──────────────────────
+        # ── PHASE 1: Snapshot mode ────────────────────────────────────────────
         logger.info(
             f"[{company_name}][{voucher_type}] Phase 1: SNAPSHOT "
             f"({SNAPSHOT_CHUNK_MONTHS}-month chunks) | {from_date} → {to_date}"
@@ -810,14 +815,19 @@ def _sync_voucher(
         chunks_done   = 0
         all_alter_ids = [last_alter_id] if last_alter_id > 0 else []
 
-        # Pre-calculate chunks for accurate progress reporting
         _all_chunks  = list(_generate_chunks(from_date, to_date))
         total_chunks = max(len([c for c in _all_chunks
             if not (last_synced_month and c[2] < last_synced_month)]), 1)
 
         for chunk_from, chunk_to, month_str in _generate_chunks(from_date, to_date):
 
-            if last_synced_month and month_str < last_synced_month:
+            # FIX: snapshot resume — skip chunks strictly LESS THAN last_synced_month.
+            # The old code used `month_str < last_synced_month` which correctly skips
+            # already-committed chunks.  However if last_synced_month == month_str the
+            # chunk was already committed by upsert_and_advance_month in the previous
+            # run, so we should also skip it (avoid double-insert).
+            # Changed from `<` to `<=` to correctly skip the already-committed boundary chunk.
+            if last_synced_month and month_str <= last_synced_month:
                 logger.debug(
                     f"[{company_name}][{voucher_type}] Skipping already-done chunk {month_str}"
                 )
@@ -858,11 +868,6 @@ def _sync_voucher(
                 continue
 
             chunk_max = max((int(r.get('alter_id', 0)) for r in rows), default=0)
-            # upsert_and_advance_month internally acquires the per-company lock
-            # for its SyncState write so we do NOT hold the lock around the
-            # (potentially slow) DB upsert of the voucher rows themselves.
-            # The underlying _upsert_*_in_session functions now do hard delete
-            # + reinsert, so snapshot chunks never accumulate Retired rows.
             upsert_and_advance_month(
                 rows               = rows,
                 model_class        = model_class,
@@ -893,10 +898,9 @@ def _sync_voucher(
             f"[{company_name}][{voucher_type}] Phase 1: Snapshot complete | "
             f"chunks={chunks_done} | total_rows={total_rows} | max_alter_id={final_alter_id}"
         )
-        # NOTE: Phase 3 (GUID reconciliation) is intentionally NOT run after snapshot.
-        # During snapshot we are still pulling historical data — reconciling would
-        # incorrectly delete rows for months we haven't fetched yet.
-        # Phase 3 only runs in CDC mode (is_initial_done=True).
+        # Phase 3 intentionally NOT run after snapshot — we are still pulling
+        # historical data; reconciling would incorrectly delete rows for months
+        # not yet fetched.
 
     except Exception:
         logger.exception(
@@ -920,19 +924,10 @@ def sync_company(
 
     Phase 1 (Snapshot): runs on first sync, chunked 3-month fetches
     Phase 2 (CDC):      runs on every subsequent sync, alter_id gated
-    Phase 3 (Reconcile): runs after every CDC sync, 90-day GUID diff
-
-    parallel_company_mode=True  → called from sync_all_companies_parallel;
-        inner voucher ThreadPoolExecutor is capped at 1 worker because Tally
-        requests are already serialised by _TALLY_SEMAPHORE, and adding more
-        threads just wastes memory with no throughput benefit.
-
-    parallel_company_mode=False → sequential call; use full VOUCHER_WORKERS.
+    Phase 3 (Reconcile): runs after every CDC sync, full-history GUID diff
     """
-    comp_name   = company.get('name', '').strip()
-    from_date   = manual_from_date if manual_from_date else _resolve_from_date(company)
-    # When multiple companies run in parallel the inner executor must stay at
-    # 1 worker — extra threads would all block on _TALLY_SEMAPHORE anyway.
+    comp_name    = company.get('name', '').strip()
+    from_date    = manual_from_date if manual_from_date else _resolve_from_date(company)
     inner_workers = 1 if parallel_company_mode else VOUCHER_WORKERS
 
     logger.info('=' * 60)
@@ -944,7 +939,6 @@ def sync_company(
 
     start_time = datetime.now()
 
-    # Ledgers, items, trial balance and outstanding are sequential (fast master syncs)
     _sync_ledgers(comp_name, tally, engine)
     _sync_items(comp_name, tally, engine)
     _sync_trial_balance(comp_name, tally, engine, from_date, to_date)
@@ -986,7 +980,7 @@ def sync_all_companies(
     to_date:          str,
     manual_from_date: str = None,
 ):
-    """Sequential company sync (original behaviour, unchanged)."""
+    """Sequential company sync."""
     if not companies:
         logger.warning("sync_all_companies: empty company list")
         return
@@ -1008,22 +1002,16 @@ def sync_all_companies(
 
 
 def sync_all_companies_parallel(
-    companies:         list,
-    tally:             TallyConnector,
+    companies:           list,
+    tally:               TallyConnector,
     engine,
-    to_date:           str,
-    manual_from_date:  str = None,
+    to_date:             str,
+    manual_from_date:    str = None,
     max_company_workers: int = 3,
 ):
     """
     Parallel company sync.
-
-    All HTTP calls to Tally are serialised via _TALLY_SEMAPHORE so Tally is
-    never hit concurrently regardless of how many company threads are running.
-    DB writes to different companies are fully independent and run in parallel.
-
-    max_company_workers: how many companies to process at once.
-        Keep ≤ 3 for Tally Prime (single-user); can raise for Tally Server.
+    All HTTP calls serialised via _TALLY_SEMAPHORE regardless of parallelism.
     """
     if not companies:
         logger.warning("sync_all_companies_parallel: empty company list")
@@ -1059,12 +1047,8 @@ def sync_all_companies_parallel(
             except Exception:
                 logger.error(f"Company '{name}' sync thread raised an exception")
 
-# ── Deep Reconcile — re-runs Phase 3 for full company history ────────────────
-#
-# Since _reconcile_deleted_vouchers now already scans from starting_from → today
-# in 3-month chunks on every normal CDC sync, a separate "deep reconcile" is no
-# longer needed.  This function is kept as a thin public wrapper so sync_page.py
-# and any external callers still work without changes.
+
+# ── Deep Reconcile ────────────────────────────────────────────────────────────
 
 def deep_reconcile_company(
     company:     dict,
@@ -1074,13 +1058,8 @@ def deep_reconcile_company(
     progress_cb  = None,
 ) -> dict:
     """
-    Re-run Phase 3 GUID reconciliation for the full company history
-    (starting_from → to_date) in 3-month chunks.
-
-    Identical to what normal CDC sync already does on every run, but exposed
-    as a standalone callable so the UI "Deep Reconcile" button can trigger it
-    on-demand without running a full sync.
-
+    Re-run Phase 3 GUID reconciliation for the full company history on demand.
+    Exposed for the UI "Deep Reconcile" button.
     Returns dict: { voucher_type: deleted_count, ... }
     """
     comp_name = company.get('name', '').strip()
@@ -1160,7 +1139,5 @@ def _count_active_rows(
             ).count()
         finally:
             db.close()
-    except Exception:
-        return 0
     except Exception:
         return 0

@@ -937,7 +937,16 @@ def parse_ledgers(xml_content, company_name: str) -> list:
                 'export_import_code'   : clean_text(ledger.findtext('EXPORTIMPORTCODE', '')),
                 'msme_reg_number'      : clean_text(ledger.findtext('MSMEREGNUMBER', '')),
                 'is_bill_wise_on'      : clean_text(ledger.findtext('ISBILLWISEON', 'No')),
-                'is_deleted'           : clean_text(ledger.findtext('ISDELETED', 'No')),
+                # FIX: Tally CDC sets ACTION="Delete" on the LEDGER element when
+                # a ledger is deleted. ISDELETED text node is only populated in
+                # full-snapshot responses. Without checking ACTION, CDC deletes
+                # are silently missed and deleted ledgers stay active in the DB.
+                'is_deleted'           : (
+                    'Yes' if (
+                        clean_text(ledger.findtext('ISDELETED', 'No')).lower() in ('yes', 'true', '1')
+                        or ledger.get('ACTION', '') in ('Delete', 'Deleted')
+                    ) else 'No'
+                ),
                 'created_date'         : created_date,
                 'altered_on'           : altered_on,
                 'guid'                 : guid,
@@ -1087,8 +1096,18 @@ def parse_items(xml_content, company_name: str) -> list:
 
             entered_by = clean_text(item.findtext('ENTEREDBY', ''))
 
+            # FIX: Tally CDC sets ACTION="Delete" on the STOCKITEM element when
+            # an item is deleted. ISDELETED text node is only populated in
+            # full-snapshot responses. Without checking ACTION, CDC deletes are
+            # silently missed and deleted items remain active in the DB.
             is_deleted_raw = clean_text(item.findtext('ISDELETED', ''))
-            is_deleted     = 'Yes' if is_deleted_raw.lower() in ('yes', 'true', '1') else 'No'
+            action         = item.get('ACTION', '')
+            is_deleted     = (
+                'Yes' if (
+                    is_deleted_raw.lower() in ('yes', 'true', '1')
+                    or action in ('Delete', 'Deleted')
+                ) else 'No'
+            )
 
             all_rows.append({
                 'company_name'      : company_name,

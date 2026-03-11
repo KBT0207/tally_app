@@ -3,24 +3,25 @@
         <VERSION>1</VERSION>
         <TALLYREQUEST>Export</TALLYREQUEST>
         <TYPE>Collection</TYPE>
-        <ID>CreditNoteVoucherGUIDs</ID>
+        <ID>CreditNoteGUIDs</ID>
     </HEADER>
     <BODY>
         <DESC>
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-                <SVCURRENTCOMPANY>COMPANY_NAME_HERE</SVCURRENTCOMPANY>
-                <SVFROMDATE>PLACEHOLDER_FROM_DATE</SVFROMDATE>
-                <SVTODATE>PLACEHOLDER_TO_DATE</SVTODATE>
+                <SVCURRENTCOMPANY></SVCURRENTCOMPANY>
+                <SVFROMDATE TYPE="Date"></SVFROMDATE>
+                <SVTODATE TYPE="Date"></SVTODATE>
             </STATICVARIABLES>
             <TDL>
                 <TDLMESSAGE>
-                    <COLLECTION NAME="CreditNoteVoucherGUIDs">
+                    <COLLECTION NAME="CreditNoteGUIDs">
                         <TYPE>Voucher</TYPE>
                         <CHILDOF>$$VchTypeCreditNote</CHILDOF>
                         <FETCH>GUID</FETCH>
                         <FETCH>VOUCHERKEY</FETCH>
                         <FETCH>DATE</FETCH>
+                        <FETCH>VOUCHERNUMBER</FETCH>
                     </COLLECTION>
                 </TDLMESSAGE>
             </TDL>

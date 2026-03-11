@@ -746,6 +746,36 @@ class TallyConnector:
             company_name, alter_id=last_alter_id, debug=debug,
         )
 
+    def fetch_item_guids(
+        self,
+        company_name: str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        """
+        Fetch all StockItem GUIDs + ISDELETED for GUID reconciliation.
+        No date range — item masters have no transaction date.
+        Used to detect items deleted in Tally that CDC missed.
+        """
+        return self._fetch(
+            'utils/guid/item_guid.xml', 'Item GUIDs',
+            company_name, debug=debug,
+        )
+
+    def fetch_ledger_guids(
+        self,
+        company_name: str,
+        debug:        bool = False,
+    ) -> Optional[bytes]:
+        """
+        Fetch all Ledger GUIDs + ISDELETED for GUID reconciliation.
+        No date range — ledger masters have no transaction date.
+        Used to detect ledgers deleted in Tally that CDC missed.
+        """
+        return self._fetch(
+            'utils/guid/ledger_guid.xml', 'Ledger GUIDs',
+            company_name, debug=debug,
+        )
+
     # ── Outstanding fetches ───────────────────────────────────────────────────
 
     def fetch_outstanding_debtors(

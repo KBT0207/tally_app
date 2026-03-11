@@ -38,6 +38,7 @@ added_datas = [
     # ── XML request templates ────────────────────────────────────────────────
     ('utils/*.xml',         'utils'),
     ('utils/cdc/*.xml',     'utils/cdc'),
+    ('utils/guid/*.xml',    'utils/guid'),       # ← ADDED: GUID XML templates
     ('utils/reports/*.xml', 'utils/reports'),
 
     # ── PyAutoGUI screen-detection PNG images ────────────────────────────────
@@ -71,6 +72,7 @@ hidden_imports = [
     'database.models.item',
     'database.models.trial_balance',
     'database.models.base',
+    'database.models.outstanding_models',       # ← ADDED: present in tree
 
     # ── SQLAlchemy MySQL dialect — critical for DB connection ─────────────────
     # Without this the engine creation fails silently in frozen mode
@@ -115,11 +117,24 @@ hidden_imports = [
     'gui.components.image_test_overlay',
     'gui.components.voucher_selector',
 
+    # ── GUI core modules ──────────────────────────────────────────────────────
+    'gui.app',
+    'gui.config_manager',
+    'gui.state',
+    'gui.styles',
+    'gui.tray_manager',
+    'gui.scale',                                # ← ADDED: present in tree
+
     # ── Services ──────────────────────────────────────────────────────────────
     'services.tally_connector',
     'services.tally_launcher',
     'services.sync_service',
     'services.data_processor',
+    'services.currency_extractor',              # ← ADDED: present in tree
+
+    # ── Database core ─────────────────────────────────────────────────────────
+    'database.db_connector',
+    'database.database_processor',
 
     # ── System tray (pystray) ─────────────────────────────────────────────────
     'pystray',

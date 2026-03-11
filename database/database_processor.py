@@ -14,8 +14,6 @@ from database.models.outstanding_models import DebtorOutstanding
 from logging_config import logger
 
 # ── Per-company SyncState write locks ────────────────────────────────────────
-# Imported and shared with sync_service via the same module-level dict.
-# sync_service calls _get_db_company_lock() to retrieve the same lock object.
 _DB_COMPANY_LOCKS: dict[str, threading.Lock] = {}
 _DB_COMPANY_LOCKS_MUTEX = threading.Lock()
 
@@ -100,7 +98,6 @@ def _insert_voucher_rows(rows, model_class, db, set_total_amt=True):
             dca_amt          = row.get('dca_amt', 0.0),
             cf_amt           = row.get('cf_amt', 0.0),
             other_amt        = row.get('other_amt', 0.0),
-            # total_amt is a voucher-level value — store only on first item row
             total_amt        = row.get('total_amt', 0.0) if idx == 0 else 0.0,
             currency         = row.get('currency', 'INR'),
             exchange_rate    = row.get('exchange_rate', 1.0),
@@ -110,22 +107,12 @@ def _insert_voucher_rows(rows, model_class, db, set_total_amt=True):
             alter_id         = row.get('alter_id', 0),
             master_id        = row.get('master_id'),
             change_status    = row.get('change_status'),
-            is_deleted       = 'No',    # always No — deleted rows are hard deleted, never inserted
+            is_deleted       = 'No',
         ))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 1 + 2 — Inventory voucher upsert  (Sales / Purchase / Credit / Debit)
-#
-#  Strategy (replaces old Retired/Deleted soft-delete approach):
-#    DELETE signal  → hard DELETE all existing rows for that voucherkey
-#    New voucher    → INSERT fresh rows (is_deleted='No' always)
-#    Altered voucher→ hard DELETE old rows + INSERT fresh rows (clean replace)
-#    Unchanged      → skip
-#
-#  Used by BOTH snapshot chunks (Phase 1) and CDC (Phase 2).
-#  Snapshot calls this via upsert_and_advance_month().
-#  CDC calls this via _upsert_inventory_voucher().
+#  Inventory voucher upsert  (Sales / Purchase / Credit / Debit)
 # ─────────────────────────────────────────────────────────────────────────────
 def _upsert_inventory_voucher_in_session(rows, model_class, db):
     inserted = updated = unchanged = skipped = deleted = 0
@@ -143,12 +130,9 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
         first        = group_rows[0]
         guid         = first.get('guid', '')
         company_name = first.get('company_name', '')
-        # MAX alter_id across all rows in the group — Tally CDC can return
-        # items of the same voucher with different alter_ids in one response.
         new_alter_id = max(int(r.get('alter_id', 0)) for r in group_rows)
         is_del       = first.get('is_deleted', 'No')
 
-        # ── Find existing active rows ──────────────────────────────────────
         lookup_voucherkey = first.get('voucherkey', '')
         if lookup_voucherkey:
             existing_rows = db.query(model_class).filter(
@@ -163,9 +147,7 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
                 model_class.is_deleted   == 'No',
             ).all()
 
-        # ── PHASE 2: CDC delete signal → hard DELETE from DB ──────────────
-        # Tally sets is_deleted='Yes' in CDC response when a voucher is deleted.
-        # We physically remove the rows — no soft-delete flag, no history.
+        # DELETE signal → hard DELETE from DB
         if is_del == 'Yes':
             for rec in existing_rows:
                 db.delete(rec)
@@ -176,24 +158,15 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
             )
             continue
 
-        # ── No existing rows → fresh INSERT ───────────────────────────────
-        # Covers: new voucher in CDC, or first time this chunk runs in snapshot.
+        # No existing rows → fresh INSERT
         if not existing_rows:
             _insert_voucher_rows(group_rows, model_class, db)
             inserted += len(group_rows)
             continue
 
-        # ── Existing rows found — check alter_id to decide action ─────────
-        # MAX across all existing rows — handles mixed alter_ids from
-        # previous partial syncs under the same voucherkey.
         old_alter_id = max(int(r.alter_id or 0) for r in existing_rows)
 
         if new_alter_id > old_alter_id:
-            # Voucher was altered in Tally.
-            # Hard DELETE old rows first, then INSERT fresh.
-            # This is safe because: if commit fails after DELETE but before
-            # INSERT, the next CDC will re-fetch this voucher (alter_id still
-            # > last saved alter_id) and re-insert it correctly.
             for rec in existing_rows:
                 db.delete(rec)
             _insert_voucher_rows(group_rows, model_class, db)
@@ -204,67 +177,30 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
                 f"(alter_id {old_alter_id} → {new_alter_id})"
             )
         else:
-            # alter_id unchanged — voucher not modified since last sync
             unchanged += len(existing_rows)
 
     return inserted, updated, unchanged, skipped, deleted
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 2 — Ledger voucher upsert  (Receipt / Payment / Journal / Contra)
-#
-#  Ledger vouchers are single-row per ledger entry (not multi-row like inventory).
-#  Strategy:
-#    DELETE signal → hard DELETE matching rows
-#    Existing row  → update fields in-place if alter_id is higher
-#    No existing   → INSERT fresh
-#    Unchanged     → skip
-#
-#  Key fixes vs old version:
-#    1. Lookup now filters is_deleted='No' — avoids matching already-deleted rows
-#    2. Delete is now hard DELETE, not soft is_deleted='Yes'
+#  Ledger voucher upsert  (Receipt / Payment / Journal / Contra)
 # ─────────────────────────────────────────────────────────────────────────────
 def _upsert_ledger_voucher_in_session(rows, model_class, db):
     """
-    Upsert ledger voucher rows (Receipt / Payment / Journal / Contra).
+    Upsert ledger voucher rows.
 
-    VOUCHER-NUMBER RENUMBERING FIX
-    ─────────────────────────────────────────────────────────────────────────
-    When a voucher is deleted in Tally, Tally auto-renumbers the remaining
-    vouchers.  Example: vouchers 1, 2, 3 → delete 2 → Tally renames 3 to 2.
-
-    The CDC response contains:
-      • GUID_2  is_deleted=Yes  (the deleted voucher)
-      • GUID_3  alter_id bumped, voucher_number now = "2"  (renumbered)
-
-    Old strategy (field-level UPDATE per row) had two failure modes:
-      1. CDC batch order not guaranteed — if GUID_3 update arrives before
-         GUID_2 delete in the same batch, both voucher_number='2' rows exist
-         in DB simultaneously, risking a unique-constraint violation or
-         wrong data in reports until the delete is processed.
-      2. Per-row lookup by (guid + ledger_name) could miss rows if the
-         same GUID had multiple ledger entries with varying alter_ids from
-         a previous partial sync.
-
-    NEW STRATEGY — mirrors inventory voucher upsert:
-      1. Group all incoming rows by GUID.
-      2. Process ALL DELETES first in a single pass, before any inserts/updates.
-         This ensures the old voucher_number='2' row is gone before we write
-         the renumbered voucher_number='2' for a different GUID.
-      3. For altered vouchers: hard DELETE all existing rows for that GUID,
-         then INSERT fresh rows.  This is safe because:
-         - If the commit fails after DELETE but before INSERT, the next CDC
-           will re-fetch (alter_id still > saved) and re-insert correctly.
-         - No stale field values can survive — the full row is replaced.
-      4. For new vouchers: plain INSERT.
-      5. For unchanged (alter_id same): skip.
-    ─────────────────────────────────────────────────────────────────────────
+    DELETE-first strategy ensures voucher_number renumber safety:
+    1. Group rows by GUID.
+    2. Process ALL DELETES first — removes old voucher_number rows before
+       re-inserting renumbered ones.
+    3. For altered vouchers: hard DELETE old rows + INSERT fresh rows.
+    4. For new vouchers: plain INSERT.
+    5. Unchanged (same alter_id): skip.
     """
     from collections import defaultdict
 
     inserted = updated = unchanged = skipped = deleted = 0
 
-    # ── Step 1: group rows by GUID ─────────────────────────────────────────
     groups: dict[str, list] = defaultdict(list)
     for row in rows:
         if not row.get('guid'):
@@ -272,9 +208,7 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
             continue
         groups[row['guid']].append(row)
 
-    # ── Step 2: process ALL DELETES first ─────────────────────────────────
-    # Critical for renumber safety: removes old voucher_number rows before
-    # we insert/update the renumbered ones.
+    # Step 1: process ALL DELETES first (renumber-safe)
     delete_guids = {
         guid for guid, group in groups.items()
         if group[0].get('is_deleted', 'No') == 'Yes'
@@ -294,16 +228,15 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
             f"for guid={guid} (CDC delete — renumber-safe pass)"
         )
 
-    # ── Step 3: process INSERTS / UPDATES ─────────────────────────────────
+    # Step 2: process INSERTS / UPDATES
     for guid, group_rows in groups.items():
         if guid in delete_guids:
-            continue   # already handled above
+            continue
 
         first        = group_rows[0]
         company_name = first.get('company_name', '')
         new_alter_id = max(int(r.get('alter_id', 0)) for r in group_rows)
 
-        # Find all existing active rows for this GUID (any ledger_name)
         existing_rows = db.query(model_class).filter(
             model_class.guid         == guid,
             model_class.company_name == company_name,
@@ -311,7 +244,6 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
         ).all()
 
         if not existing_rows:
-            # Brand new voucher → INSERT all ledger-entry rows
             for row in group_rows:
                 db.add(model_class(
                     company_name   = company_name,
@@ -337,8 +269,6 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
         old_alter_id = max(int(r.alter_id or 0) for r in existing_rows)
 
         if new_alter_id > old_alter_id:
-            # Voucher altered (includes renumber) → hard DELETE old rows,
-            # INSERT fresh.  Guarantees voucher_number is always current.
             logger.debug(
                 f"[{company_name}] Replacing {len(existing_rows)} ledger rows "
                 f"for guid={guid} "
@@ -367,56 +297,33 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
                 ))
             updated += len(group_rows)
         else:
-            # alter_id unchanged — voucher not modified since last sync
             unchanged += len(existing_rows)
 
     return inserted, updated, unchanged, skipped, deleted
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PHASE 3 — GUID Reconciliation (catch deletes CDC missed)
-#
-#  Called after CDC completes for each voucher type.
-#  Compares GUIDs in DB (last 90 days) vs GUIDs currently in Tally.
-#  Any GUID present in DB but absent from Tally → physically deleted in Tally
-#  → hard DELETE from DB.
-#
-#  SAFE FAILURE CONTRACT:
-#    tally_guids=None   → Tally fetch failed     → skip, return 0
-#    tally_guids=set()  → Tally has 0 vouchers   → skip, return 0
-#    Both cases: NEVER delete when uncertain.
+#  GUID Reconciliation (Phase 3 — catch deletes CDC missed)
 # ─────────────────────────────────────────────────────────────────────────────
 def reconcile_deleted_by_guids(
     company_name: str,
     model_class,
-    tally_guids: dict,   # {guid: voucher_number} — from parse_guids()
-    from_date:   str,    # YYYYMMDD
-    to_date:     str,    # YYYYMMDD
+    tally_guids: dict,
+    from_date:   str,
+    to_date:     str,
     engine,
 ) -> int:
     """
-    Phase 3 reconciliation — two passes for the given date window:
+    Phase 3 reconciliation — two passes for the given date window.
 
     PASS 1 — DELETE:
       Hard delete DB rows whose GUID is absent from Tally entirely.
-      These are vouchers deleted in Tally that CDC missed.
 
     PASS 2 — RENUMBER FIX:
-      For vouchers whose GUID still exists in Tally but voucher_number
-      in DB doesn't match what Tally reports, update all DB rows for
-      that GUID to the correct voucher_number.
+      For vouchers whose GUID still exists but voucher_number in DB
+      doesn't match Tally, update all DB rows for that GUID.
 
-      This catches the case where:
-        - Tally renumbered a voucher (deleted another → auto-renumber)
-        - The app was offline / CDC missed the alter_id bump
-        - GUID still exists in both DB and Tally, so Pass 1 skips it
-        - But DB has stale voucher_number that will never self-correct
-
-      Only applies when tally_guids contains actual voucher_number values
-      (i.e. the GUID template fetches VOUCHERNUMBER). If voucher_number
-      is '' in the dict, the renumber check is skipped for that GUID.
-
-    Returns: total count of rows deleted (Pass 1 only — updates not counted).
+    Returns: count of rows deleted (Pass 1 only).
     tally_guids must be a non-empty dict — caller enforces this.
     """
     from datetime import datetime
@@ -425,7 +332,6 @@ def reconcile_deleted_by_guids(
         fd = datetime.strptime(from_date, '%Y%m%d').date()
         td = datetime.strptime(to_date,   '%Y%m%d').date()
 
-        # Fetch all active rows in the window
         db_rows = db.query(model_class).filter(
             model_class.company_name == company_name,
             model_class.date         >= fd,
@@ -442,7 +348,7 @@ def reconcile_deleted_by_guids(
 
         tally_guid_set = set(tally_guids.keys())
 
-        # ── PASS 1: hard delete rows whose GUID is gone from Tally ────────
+        # PASS 1: hard delete rows whose GUID is gone from Tally
         to_delete = [r for r in db_rows if r.guid not in tally_guid_set]
         for rec in to_delete:
             db.delete(rec)
@@ -455,8 +361,7 @@ def reconcile_deleted_by_guids(
                 f"not found in Tally | window {from_date}→{to_date}"
             )
 
-        # ── PASS 2: fix stale voucher_numbers for renumbered vouchers ─────
-        # Group surviving DB rows by GUID (exclude just-deleted ones)
+        # PASS 2: fix stale voucher_numbers for renumbered vouchers
         surviving_guids = {r.guid for r in db_rows if r.guid in tally_guid_set}
 
         renumber_count = 0
@@ -469,10 +374,8 @@ def reconcile_deleted_by_guids(
         for guid, rows in rows_by_guid.items():
             tally_vnum = tally_guids.get(guid, '')
             if not tally_vnum:
-                # Template didn't fetch VOUCHERNUMBER — skip renumber check
                 continue
 
-            # Check if any row has a different voucher_number than Tally reports
             stale_rows = [r for r in rows if r.voucher_number != tally_vnum]
             if stale_rows:
                 for r in stale_rows:
@@ -513,7 +416,7 @@ def reconcile_deleted_by_guids(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Snapshot chunk helper — called from sync_service._sync_voucher() snapshot path
+#  Snapshot chunk helper
 # ─────────────────────────────────────────────────────────────────────────────
 def upsert_and_advance_month(
     rows, model_class, upsert_fn,
@@ -522,15 +425,6 @@ def upsert_and_advance_month(
 ):
     """
     Upsert voucher rows for one snapshot chunk then atomically advance SyncState.
-
-    The SyncState update is protected by a per-company lock so that two
-    voucher worker threads for the same company cannot overwrite each other's
-    last_synced_month / last_alter_id. The (slow) voucher upsert itself runs
-    outside the lock so other voucher types are not blocked.
-
-    upsert_fn is _upsert_inventory_voucher_in_session or
-    _upsert_ledger_voucher_in_session — both now do hard delete+reinsert,
-    so snapshot chunks are automatically clean (no Retired rows).
     """
     db = _get_session(engine)
     try:
@@ -544,7 +438,6 @@ def upsert_and_advance_month(
     else:
         db.close()
 
-    # Update SyncState in a separate session, protected by the company lock.
     lock = _get_db_company_lock(company_name)
     with lock:
         db2 = _get_session(engine)
@@ -637,9 +530,15 @@ def update_sync_state(
 
 
 def _upsert_inventory(rows, model_class, unique_fields, update_fields, engine):
+    """
+    Generic master upsert for Item / Ledger (alter_id-gated field update).
+    FIX: now returns 5-tuple (ins, upd, unch, skp, 0) to be consistent with
+    all other upsert functions — was returning 4-tuple which caused an unpack
+    error if the caller ever used the 5-value form.
+    """
     if not rows:
         logger.warning(f"No rows to upsert for {model_class.__tablename__}")
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, 0   # FIX: was 4-tuple
 
     db = _get_session(engine)
     inserted = updated = unchanged = skipped = 0
@@ -677,7 +576,7 @@ def _upsert_inventory(rows, model_class, unique_fields, update_fields, engine):
     finally:
         db.close()
 
-    return inserted, updated, unchanged, skipped
+    return inserted, updated, unchanged, skipped, 0   # FIX: 5-tuple
 
 
 def _upsert_inventory_voucher(rows, model_class, engine):
@@ -748,58 +647,66 @@ def upsert_contra_vouchers(rows, engine):
 
 
 def upsert_trial_balance(rows, engine):
+    """
+    Full delete + full re-insert for trial balance.
+
+    Trial balance is a point-in-time report — balances change every time any
+    voucher is posted in Tally. There is no reliable alter_id per row to gate
+    incremental updates on.
+
+    Strategy (mirrors upsert_debtor_outstanding):
+      1. DELETE all existing rows for this company + date window in one shot.
+      2. INSERT all fresh rows from Tally.
+      Both steps in a single transaction — if insert fails, delete rolls back.
+
+    This guarantees balances are always current and removes stale ledger rows
+    (e.g. ledgers deleted in Tally that would otherwise linger in the DB).
+    """
     if not rows:
         logger.warning("No rows to upsert for trial balance")
         return
 
+    company_name = rows[0].get('company_name', '')
+    start_date   = rows[0].get('start_date')
+    end_date     = rows[0].get('end_date')
+
     db = _get_session(engine)
-    inserted = updated = unchanged = skipped = 0
-
-    update_fields = [
-        'parent_group', 'opening_balance', 'net_transactions',
-        'closing_balance', 'start_date', 'end_date',
-        'alter_id', 'master_id',
-    ]
-
+    inserted = 0
     try:
+        # Step 1: delete all existing rows for this company + date window
+        deleted = db.query(TrialBalance).filter_by(
+            company_name = company_name,
+            start_date   = start_date,
+            end_date     = end_date,
+        ).delete(synchronize_session='fetch')
+
+        # Step 2: insert fresh rows
+        skipped = 0
         for row in rows:
             if not row.get('guid'):
                 skipped += 1
                 continue
-
-            existing = db.query(TrialBalance).filter_by(
-                guid         = row['guid'],
-                company_name = row['company_name'],
-                start_date   = row.get('start_date'),
-                end_date     = row.get('end_date'),
-            ).first()
-
-            if existing:
-                if int(row.get('alter_id', 0)) > int(existing.alter_id or 0):
-                    _log_changes("trial_balance UPDATE", existing, update_fields, row)
-                    for field in update_fields:
-                        setattr(existing, field, row.get(field))
-                    updated += 1
-                else:
-                    unchanged += 1
-            else:
-                db.add(TrialBalance(
-                    company_name     = row.get('company_name'),
-                    ledger_name      = row.get('ledger_name'),
-                    parent_group     = row.get('parent_group'),
-                    opening_balance  = row.get('opening_balance', 0.0),
-                    net_transactions = row.get('net_transactions', 0.0),
-                    closing_balance  = row.get('closing_balance', 0.0),
-                    start_date       = row.get('start_date'),
-                    end_date         = row.get('end_date'),
-                    guid             = row.get('guid'),
-                    alter_id         = row.get('alter_id', 0),
-                    master_id        = row.get('master_id'),
-                ))
-                inserted += 1
+            db.add(TrialBalance(
+                company_name     = row.get('company_name'),
+                ledger_name      = row.get('ledger_name'),
+                parent_group     = row.get('parent_group'),
+                opening_balance  = row.get('opening_balance', 0.0),
+                net_transactions = row.get('net_transactions', 0.0),
+                closing_balance  = row.get('closing_balance', 0.0),
+                start_date       = row.get('start_date'),
+                end_date         = row.get('end_date'),
+                guid             = row.get('guid'),
+                alter_id         = row.get('alter_id', 0),
+                master_id        = row.get('master_id'),
+            ))
+            inserted += 1
 
         db.commit()
-        _log_result("Trial balance upsert", inserted, updated, unchanged, skipped)
+        logger.info(
+            f"Trial balance full-replace | company={company_name} | "
+            f"window={start_date}→{end_date} | "
+            f"deleted={deleted} inserted={inserted} skipped={skipped}"
+        )
 
     except Exception:
         db.rollback()
@@ -825,6 +732,17 @@ LEDGER_MODEL_MAP = {
 
 
 def upsert_items(rows, engine):
+    """
+    Upsert StockItem master rows.
+
+    FIX: CDC delete handling — when Tally marks an item is_deleted='Yes'
+    via CDC, the old code simply updated the is_deleted field to 'Yes'
+    (soft-delete via alter_id-gated field update).  This is correct for
+    items (we want to keep the item record for historical voucher display),
+    BUT the alter_id guard was preventing the update if somehow alter_id
+    hadn't advanced.  Now we force-update is_deleted='Yes' regardless of
+    alter_id when the incoming row says the item was deleted.
+    """
     if not rows:
         logger.warning("No rows to upsert for items")
         return
@@ -872,7 +790,14 @@ def upsert_items(rows, engine):
             ).first()
 
             if existing:
-                if int(safe['alter_id']) > int(existing.alter_id or 0):
+                new_alter_id = int(safe['alter_id'])
+                old_alter_id = int(existing.alter_id or 0)
+                incoming_deleted = safe.get('is_deleted') == 'Yes'
+
+                # FIX: always apply delete flag even if alter_id hasn't advanced,
+                # because Tally CDC can sometimes return is_deleted=Yes with the
+                # same alter_id as before (race condition in Tally's CDC response).
+                if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes'):
                     _log_changes(
                         "item UPDATE", existing,
                         [f for f in safe if f not in ('guid', 'company_name')],
@@ -974,6 +899,18 @@ def company_import_db(data, engine):
 
 
 def upsert_ledgers(rows, engine):
+    """
+    Upsert Ledger master rows.
+
+    FIX: CDC delete handling — when Tally marks a ledger is_deleted='Yes'
+    via CDC, the is_deleted field must be written even when alter_id hasn't
+    changed (same fix as items).  Also added ledger_name update support:
+    a ledger rename arrives as an altered row with the same GUID but a new
+    NAME — the old code correctly overwrites ledger_name because it's in the
+    safe dict, but only when alter_id > old.  This is correct; no change
+    needed here for the rename case.  The only new guard is for the delete
+    flag exactly mirroring the item fix above.
+    """
     if not rows:
         logger.warning("No rows to upsert for ledgers")
         return
@@ -1038,7 +975,12 @@ def upsert_ledgers(rows, engine):
             ).first()
 
             if existing:
-                if int(safe['alter_id']) > int(existing.alter_id or 0):
+                new_alter_id     = int(safe['alter_id'])
+                old_alter_id     = int(existing.alter_id or 0)
+                incoming_deleted = safe.get('is_deleted') == 'Yes'
+
+                # FIX: force-update is_deleted flag even if alter_id unchanged
+                if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes'):
                     _log_changes("ledger UPDATE", existing, [f for f in safe if f not in ('guid', 'company_name')], safe)
                     for field, value in safe.items():
                         if field not in ('guid', 'company_name'):
@@ -1061,12 +1003,74 @@ def upsert_ledgers(rows, engine):
         db.close()
 
 
-def upsert_debtor_outstanding(rows, engine):
+def reconcile_deleted_masters_in_db(
+    company_name: str,
+    master_type:  str,   # 'items' or 'ledger'
+    tally_guids:  dict,  # {guid: name} from parse_guids()
+    engine,
+) -> int:
+    """
+    Hard delete master rows (Item or Ledger) whose GUID is no longer in Tally.
+
+    Physically removes the row — same strategy as voucher reconciliation.
+    Called after every CDC sync for items and ledgers.
+
+    SAFE FAILURE CONTRACT:
+      tally_guids must be non-empty — caller enforces this.
+      Returns 0 on any DB error (never raises).
+    """
+    model_class = Item if master_type == 'items' else Ledger
+    db = _get_session(engine)
+    try:
+        tally_guid_set = set(tally_guids.keys())
+
+        # Fetch ALL rows for this company (including any previously soft-deleted)
+        # Hard delete removes the row entirely — no is_deleted filter needed
+        active_rows = db.query(model_class).filter(
+            model_class.company_name == company_name,
+        ).all()
+
+        soft_deleted = 0
+        for row in active_rows:
+            if row.guid and row.guid not in tally_guid_set:
+                db.delete(row)
+                soft_deleted  += 1
+                logger.info(
+                    f"[{company_name}][{master_type}] "
+                    f"Hard deleted master guid={row.guid} "
+                    f"name={getattr(row, 'item_name', None) or getattr(row, 'ledger_name', None)} "
+                    f"(not found in Tally GUID list)"
+                )
+
+        if soft_deleted:
+            db.commit()
+            logger.info(
+                f"[{company_name}][{master_type}] "
+                f"Master GUID reconciliation: hard deleted {soft_deleted} rows not in Tally ✓"
+            )
+        else:
+            logger.debug(
+                f"[{company_name}][{master_type}] "
+                f"Master GUID reconciliation: all {len(active_rows)} rows confirmed in Tally ✓"
+            )
+
+        return soft_deleted
+
+    except Exception:
+        db.rollback()
+        logger.exception(
+            f"[{company_name}][{master_type}] reconcile_deleted_masters_in_db error"
+        )
+        return 0
+    finally:
+        db.close()
+
+
+
     """
     Full-replace for debtor outstanding — point-in-time snapshot.
     Deletes all existing rows for the company then bulk-inserts fresh ones.
     Both in one transaction — if insert fails, delete rolls back too.
-    Paid/closed bills are automatically removed on each sync.
     """
     if not rows:
         logger.warning("No rows to upsert for debtor outstanding")

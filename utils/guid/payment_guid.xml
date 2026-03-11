@@ -9,9 +9,9 @@
         <DESC>
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-                <SVCURRENTCOMPANY>COMPANY_NAME_HERE</SVCURRENTCOMPANY>
-                <SVFROMDATE>PLACEHOLDER_FROM_DATE</SVFROMDATE>
-                <SVTODATE>PLACEHOLDER_TO_DATE</SVTODATE>
+                <SVCURRENTCOMPANY></SVCURRENTCOMPANY>
+                <SVFROMDATE TYPE="Date"></SVFROMDATE>
+                <SVTODATE TYPE="Date"></SVTODATE>
             </STATICVARIABLES>
             <TDL>
                 <TDLMESSAGE>
