@@ -1030,11 +1030,11 @@ def reconcile_deleted_masters_in_db(
             model_class.company_name == company_name,
         ).all()
 
-        soft_deleted = 0
+        hard_deleted = 0
         for row in active_rows:
             if row.guid and row.guid not in tally_guid_set:
                 db.delete(row)
-                soft_deleted  += 1
+                hard_deleted  += 1
                 logger.info(
                     f"[{company_name}][{master_type}] "
                     f"Hard deleted master guid={row.guid} "
@@ -1042,11 +1042,11 @@ def reconcile_deleted_masters_in_db(
                     f"(not found in Tally GUID list)"
                 )
 
-        if soft_deleted:
+        if hard_deleted:
             db.commit()
             logger.info(
                 f"[{company_name}][{master_type}] "
-                f"Master GUID reconciliation: hard deleted {soft_deleted} rows not in Tally ✓"
+                f"Master GUID reconciliation: hard deleted {hard_deleted} rows not in Tally ✓"
             )
         else:
             logger.debug(
@@ -1054,7 +1054,7 @@ def reconcile_deleted_masters_in_db(
                 f"Master GUID reconciliation: all {len(active_rows)} rows confirmed in Tally ✓"
             )
 
-        return soft_deleted
+        return hard_deleted
 
     except Exception:
         db.rollback()
@@ -1066,7 +1066,7 @@ def reconcile_deleted_masters_in_db(
         db.close()
 
 
-
+def upsert_debtor_outstanding(rows, engine):
     """
     Full-replace for debtor outstanding — point-in-time snapshot.
     Deletes all existing rows for the company then bulk-inserts fresh ones.

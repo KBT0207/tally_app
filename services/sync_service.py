@@ -411,14 +411,8 @@ def _reconcile_deleted_masters(
     engine,
 ):
     """
-    Fetch all master GUIDs from Tally and soft-delete (is_deleted='Yes') any
-    DB rows whose GUID is no longer present in Tally.
-
-    WHY SOFT-DELETE (not hard delete) for masters:
-      Vouchers reference ledger_name / item_name by value, not by FK.
-      Hard-deleting a master would not break those references, but keeping
-      the master row as is_deleted='Yes' lets the UI show "deleted" badges
-      and prevents the name from being reused in future syncs incorrectly.
+    Fetch all master GUIDs from Tally and hard delete any DB rows whose
+    GUID is no longer present in Tally.
 
     SAFE FAILURE CONTRACT:
       tally_guids None or empty → skip entirely, never delete.
@@ -600,6 +594,7 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
                 _TALLY_SEMAPHORE.release()
             if not xml:
                 logger.info(f"[{company_name}][items] CDC: no new/changed items")
+                _reconcile_deleted_masters(company_name, 'items', tally, engine)
                 return
 
             rows = parse_items(xml, company_name)
@@ -608,6 +603,7 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
                     f"[{company_name}][items] CDC: 0 rows "
                     f"(nothing changed since AlterID {last_alter_id})"
                 )
+                _reconcile_deleted_masters(company_name, 'items', tally, engine)
                 return
 
             upsert_items(rows, engine)
@@ -672,6 +668,7 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=
                 _TALLY_SEMAPHORE.release()
             if not xml:
                 logger.info(f"[{company_name}][ledger] CDC: no new/changed ledgers")
+                _reconcile_deleted_masters(company_name, 'ledger', tally, engine)
                 return
 
             rows = parse_ledgers(xml, company_name)
@@ -680,6 +677,7 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=
                     f"[{company_name}][ledger] CDC: 0 rows "
                     f"(nothing changed since AlterID {last_alter_id})"
                 )
+                _reconcile_deleted_masters(company_name, 'ledger', tally, engine)
                 return
 
             upsert_ledgers(rows, engine)
