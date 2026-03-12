@@ -310,8 +310,8 @@ class CompanySyncRow(tk.Frame):
         self._bg          = row_bg
         self._show_dates  = show_dates
         self._on_vchange  = on_voucher_change
-        self._date_mode   = "global"   # "global" | "custom"
-        self._dates_saved = False      # True once user clicks Save Dates
+        self._date_mode   = "custom"   # default to custom so each company uses its own start date
+        self._dates_saved = True       # pre-filled dates are already valid
 
         # Custom date StringVars — prefill from company state
         self._cust_from = tk.StringVar()
@@ -392,9 +392,9 @@ class CompanySyncRow(tk.Frame):
 
         self._pill_btn = tk.Button(
             pill_row,
-            text="🌐 Global  ▼",
+            text="✏ Custom  ▼",
             font=(Font.FAMILY, 8, "bold"),
-            bg=_IND_BG, fg=_IND_FG,
+            bg=_AMB_BG, fg=_AMB_FG,
             relief="flat", bd=0, padx=10, pady=4,
             cursor="hand2",
             command=self._toggle_date_mode,
@@ -402,7 +402,7 @@ class CompanySyncRow(tk.Frame):
         self._pill_btn.pack(side="left")
 
         self._pill_hint = tk.Label(
-            pill_row, text="same as global",
+            pill_row, text="",   # updated after entries built
             font=Font.BODY_SM, bg=bg, fg=Color.TEXT_MUTED)
         self._pill_hint.pack(side="left", padx=(8, 0))
 
@@ -415,15 +415,14 @@ class CompanySyncRow(tk.Frame):
         self._global_lbl = tk.Label(
             self._view_box, text="",
             font=Font.BODY_SM, bg=bg, fg=Color.TEXT_SECONDARY, anchor="w")
-        # Packed first → will be at top of view_box
-        self._global_lbl.pack(side="top", anchor="w", padx=(2, 0))
+        # Not packed by default — custom mode is default
         self._refresh_global_label()
         self._gfrom.trace_add("write", lambda *_: self._refresh_global_label())
         self._gto.trace_add("write",   lambda *_: self._refresh_global_label())
 
-        # ── Child B: custom date entries (hidden initially) ────────────────
+        # ── Child B: custom date entries (shown by default) ────────────────
         self._custom_frame = tk.Frame(self._view_box, bg=bg)
-        # NOT packed yet — _switch_to_custom() will pack it
+        # Packed immediately — custom is the default mode
 
         self._cust_entries = []   # keep refs to Entry widgets for focus
         self._dates_saved  = False  # tracks whether user has saved custom dates
@@ -485,6 +484,24 @@ class CompanySyncRow(tk.Frame):
             bg=bg, fg=Color.SUCCESS,
         )
         self._saved_label.pack(side="top", anchor="w")
+
+        # ── Show custom frame immediately (default mode is custom) ─────────
+        self._custom_frame.pack(side="top", anchor="w")
+        # Update pill hint to show pre-filled dates
+        self.after(0, self._update_pill_hint_from_prefill)
+
+    def _update_pill_hint_from_prefill(self):
+        """Update pill hint to show the pre-filled saved dates."""
+        try:
+            fd = _parse_disp(self._cust_from.get())
+            td = _parse_disp(self._cust_to.get())
+            if fd and td:
+                self._pill_hint.configure(
+                    text=f"✓ {_disp(fd)} → {_disp(td)}", fg=Color.SUCCESS)
+                self._saved_label.configure(
+                    text=f"✓ Saved: {_disp(fd)} → {_disp(td)}", fg=Color.SUCCESS)
+        except Exception:
+            pass
 
     def _refresh_global_label(self):
         try:
@@ -1042,6 +1059,34 @@ class SyncPage(tk.Frame):
                  padx=Spacing.LG, pady=7).pack(side="right")
         tk.Frame(self._tbl, bg=Color.BORDER, height=1).pack(fill="x")
 
+        # ── Apply-global-date-to-all row ──────────────────────────────────────
+        if is_snap:
+            apply_strip = tk.Frame(self._tbl, bg="#EFF6FF",
+                                   highlightthickness=1, highlightbackground="#BFDBFE")
+            apply_strip.pack(fill="x", pady=(0, 2))
+            aa = tk.Frame(apply_strip, bg="#EFF6FF", padx=Spacing.LG, pady=7)
+            aa.pack(fill="x")
+            tk.Label(aa, text="📅  Apply date to ALL companies:",
+                     font=Font.BODY_SM_BOLD, bg="#EFF6FF", fg="#1D4ED8").pack(side="left")
+            self._apply_from_var = tk.StringVar(value=self._gfrom_var.get())
+            self._apply_to_var   = tk.StringVar(value=self._gto_var.get())
+            for lbl, var in [("From:", self._apply_from_var), ("To:", self._apply_to_var)]:
+                tk.Label(aa, text=lbl, font=Font.BODY_SM_BOLD,
+                         bg="#EFF6FF", fg="#1D4ED8").pack(side="left", padx=(12, 2))
+                tk.Entry(aa, textvariable=var, font=Font.BODY, width=13,
+                         bg="white", fg="#1E1B4B", relief="solid", bd=1,
+                         ).pack(side="left")
+            tk.Button(
+                aa, text="✓  Apply",
+                font=(Font.FAMILY, 8, "bold"),
+                bg="#2563EB", fg="white",
+                relief="flat", bd=0, padx=10, pady=3,
+                cursor="hand2",
+                command=self._apply_global_dates_to_all,
+            ).pack(side="left", padx=(10, 0))
+            tk.Label(aa, text="DD-Mon-YYYY",
+                     font=Font.BODY_SM, bg="#EFF6FF", fg="#93C5FD").pack(side="left", padx=(8,0))
+
         # Company rows
         for i, name in enumerate(selected):
             if name not in self._per_co_vouchers:
@@ -1126,6 +1171,31 @@ class SyncPage(tk.Frame):
     # ══════════════════════════════════════════════════════════════════════════
     #  PHASE B  —  Progress
     # ══════════════════════════════════════════════════════════════════════════
+    def _apply_global_dates_to_all(self):
+        """Push the apply-strip dates into every visible company row as custom saved dates."""
+        fd = _parse_disp(self._apply_from_var.get().strip())
+        td = _parse_disp(self._apply_to_var.get().strip())
+        if not fd or not td:
+            return
+        if fd > td:
+            return
+        for row in self._company_rows.values():
+            row._cust_from.set(_disp(fd))
+            row._cust_to.set(_disp(td))
+            row._date_mode   = "custom"
+            row._dates_saved = True
+            row._pill_btn.configure(text="✏ Custom  ▼", bg=_AMB_BG, fg=_AMB_FG)
+            row._pill_hint.configure(
+                text=f"✓ {_disp(fd)} → {_disp(td)}", fg=Color.SUCCESS)
+            row._saved_label.configure(
+                text=f"✓ Saved: {_disp(fd)} → {_disp(td)}", fg=Color.SUCCESS)
+            # Make sure custom_frame is visible
+            try:
+                row._global_lbl.pack_forget()
+                row._custom_frame.pack(side="top", anchor="w")
+            except Exception:
+                pass
+
     def _build_progress_frame(self):
         self._prog_frame = tk.Frame(self, bg=Color.BG_ROOT)
         self._prog_frame.grid(row=0, column=0, sticky="nsew")

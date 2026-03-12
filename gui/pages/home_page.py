@@ -106,6 +106,13 @@ class HomePage(tk.Frame):
         )
         self._refresh_btn.pack(side="left", padx=(Spacing.MD, 0))
 
+        tk.Button(
+            right, text="⚙  Global Config", font=Font.BUTTON_SM,
+            bg=Color.BG_CARD, fg=Color.TEXT_PRIMARY,
+            relief="solid", bd=1, padx=Spacing.MD, pady=4,
+            cursor="hand2", command=self._on_global_config,
+        ).pack(side="left", padx=(Spacing.SM, 0))
+
     def _build_list_area(self):
         container = tk.Frame(
             self, bg=Color.BG_CARD, relief="flat",
@@ -233,10 +240,12 @@ class HomePage(tk.Frame):
     # ─────────────────────────────────────────────────────────────────────────
     def refresh_companies(self):
         """Called by app.py after DB + Tally load completes."""
-        self._render_cards()
+        # force_rebuild=True so button layout (Configure vs Sync/Edit/Schedule)
+        # is always rebuilt correctly after a DB reload
+        self._render_cards(force_rebuild=True)
         self._update_summary()
 
-    def _render_cards(self, filter_text: str = ""):
+    def _render_cards(self, filter_text: str = "", force_rebuild: bool = False):
         """
         Smart render:
         - If the set of visible companies has NOT changed → update cards in place
@@ -246,7 +255,7 @@ class HomePage(tk.Frame):
         companies = self._get_filtered_companies(filter_text)
         new_keys  = [c.name for c in companies]
 
-        if new_keys == self._last_rendered_keys:
+        if new_keys == self._last_rendered_keys and not force_rebuild:
             # ── In-place update: only touch status/badge, not widgets ─────────
             for co in companies:
                 if co.name in self._cards:
@@ -362,9 +371,25 @@ class HomePage(tk.Frame):
         self.wait_window(dialog)
 
         if dialog.saved:
-            # Full rebuild needed — company moved from NOT_CONFIGURED to CONFIGURED
-            self._last_rendered_keys = []   # force full rebuild
-            self._render_cards(filter_text=self._filter_var.get().strip())
+            self._render_cards(
+                filter_text=self._filter_var.get().strip(),
+                force_rebuild=True,
+            )
+            self._update_summary()
+
+    def _on_global_config(self):
+        from gui.components.global_config_dialog import GlobalConfigDialog
+        dlg = GlobalConfigDialog(
+            parent = self.winfo_toplevel(),
+            state  = self.state,
+            app    = self.app,
+        )
+        self.wait_window(dlg)
+        if dlg.applied:
+            self._render_cards(
+                filter_text=self._filter_var.get().strip(),
+                force_rebuild=True,
+            )
             self._update_summary()
 
     # ─────────────────────────────────────────────────────────────────────────
