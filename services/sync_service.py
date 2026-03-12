@@ -73,7 +73,32 @@ def _get_company_lock(company_name: str) -> threading.Lock:
         return _SYNC_STATE_LOCKS[company_name]
 
 
-# ── Voucher configuration table ───────────────────────────────────────────────
+# ── Voucher type routing ──────────────────────────────────────────────────────
+#
+# Your XML templates already use Tally's built-in TDL filters:
+#   $$IsSales, $$IsPurchase, $$IsReceipt, $$IsPayment,
+#   $$IsJournal, $$IsContra, $$IsCreditNote, $$IsDebitNote
+#
+# These filters work on Tally's INTERNAL voucher type classification, NOT on
+# the display name.  So a voucher named "Tax Invoice" or "Export Invoice" that
+# is classified as Sales-type WILL be returned by $$IsSales — Tally has already
+# done the routing correctly before the XML reaches Python.
+#
+# Therefore we must NOT filter by VOUCHERTYPENAME in Python — doing so would
+# drop all your custom-named vouchers.  Instead we trust what each XML fetch
+# returns and store whatever VOUCHERTYPENAME Tally gives us directly into DB.
+#
+# The 'allowed_types' key is kept as None for all types (= accept all).
+VOUCHER_TYPE_NAMES = {
+    'sales'       : None,   # Tally $$IsSales filter already correct
+    'purchase'    : None,   # Tally $$IsPurchase filter already correct
+    'credit_note' : None,   # Tally $$IsCreditNote filter already correct
+    'debit_note'  : None,   # Tally $$IsDebitNote filter already correct
+    'receipt'     : None,   # Tally $$IsReceipt filter already correct
+    'payment'     : None,   # Tally $$IsPayment filter already correct
+    'journal'     : None,   # Tally $$IsJournal filter already correct
+    'contra'      : None,   # Tally $$IsContra filter already correct
+}
 VOUCHER_CONFIG = [
     {
         'voucher_type'    : 'sales',
@@ -84,6 +109,7 @@ VOUCHER_CONFIG = [
         'upsert'          : upsert_sales_vouchers,
         'parser_type_name': 'Sales Vouchers',
         'kind'            : 'inventory',
+        'allowed_types'   : VOUCHER_TYPE_NAMES['sales'],
     },
     {
         'voucher_type'    : 'purchase',
@@ -94,6 +120,7 @@ VOUCHER_CONFIG = [
         'upsert'          : upsert_purchase_vouchers,
         'parser_type_name': 'Purchase Vouchers',
         'kind'            : 'inventory',
+        'allowed_types'   : VOUCHER_TYPE_NAMES['purchase'],
     },
     {
         'voucher_type'    : 'credit_note',
@@ -104,6 +131,7 @@ VOUCHER_CONFIG = [
         'upsert'          : upsert_credit_notes,
         'parser_type_name': 'Credit Note',
         'kind'            : 'inventory',
+        'allowed_types'   : VOUCHER_TYPE_NAMES['credit_note'],
     },
     {
         'voucher_type'    : 'debit_note',
@@ -114,6 +142,7 @@ VOUCHER_CONFIG = [
         'upsert'          : upsert_debit_notes,
         'parser_type_name': 'Debit Note',
         'kind'            : 'inventory',
+        'allowed_types'   : VOUCHER_TYPE_NAMES['debit_note'],
     },
     {
         'voucher_type'    : 'receipt',
@@ -124,6 +153,7 @@ VOUCHER_CONFIG = [
         'upsert'          : upsert_receipt_vouchers,
         'parser_type_name': 'Receipt Vouchers',
         'kind'            : 'ledger',
+        'allowed_types'   : VOUCHER_TYPE_NAMES['receipt'],
     },
     {
         'voucher_type'    : 'payment',
@@ -134,6 +164,7 @@ VOUCHER_CONFIG = [
         'upsert'          : upsert_payment_vouchers,
         'parser_type_name': 'Payment Vouchers',
         'kind'            : 'ledger',
+        'allowed_types'   : VOUCHER_TYPE_NAMES['payment'],
     },
     {
         'voucher_type'    : 'journal',
@@ -144,6 +175,7 @@ VOUCHER_CONFIG = [
         'upsert'          : upsert_journal_vouchers,
         'parser_type_name': 'Journal Vouchers',
         'kind'            : 'ledger',
+        'allowed_types'   : VOUCHER_TYPE_NAMES['journal'],
     },
     {
         'voucher_type'    : 'contra',
@@ -154,6 +186,7 @@ VOUCHER_CONFIG = [
         'upsert'          : upsert_contra_vouchers,
         'parser_type_name': 'Contra Vouchers',
         'kind'            : 'ledger',
+        'allowed_types'   : VOUCHER_TYPE_NAMES['contra'],
     },
 ]
 
@@ -303,10 +336,18 @@ def _reconcile_deleted_vouchers(
     Phase 3 — Catch deletes that CDC missed, scanning from_date → to_date
     in 3-month chunks.
 
+    from_date is always company.starting_from (full_from passed by _sync_voucher).
+    to_date   is always today.
+    Every chunk from company start to today is scanned — no date cutoffs.
+
     SAFE FAILURE CONTRACT (never deletes when uncertain):
-      tally_guids is None  → Tally fetch or parse failed → skip that chunk
-      tally_guids is empty dict → skip that chunk
-      Any chunk exception  → log and continue (non-fatal)
+      xml is None/empty   → network or Tally error → skip that chunk
+      tally_guids is None → parse failure          → skip that chunk
+      Any exception       → log and continue (non-fatal)
+
+    TRUST CONTRACT:
+      tally_guids == {} → Tally confirmed 0 vouchers in this window.
+                          This is a valid answer — delete all orphaned DB rows.
     """
     voucher_type = config['voucher_type']
     kind         = config['kind']
@@ -345,27 +386,35 @@ def _reconcile_deleted_vouchers(
                 _TALLY_SEMAPHORE.release()
 
             if not xml:
+                # xml is None → network/Tally error — never delete on a failed fetch
                 logger.debug(
                     f"[{company_name}][{voucher_type}] "
-                    f"Phase 3 chunk {month_str}: no data from Tally — skipping (safe)"
+                    f"Phase 3 chunk {month_str}: no response from Tally — skipping (safe)"
                 )
                 continue
 
             tally_guids = parse_guids(xml)
 
             if tally_guids is None:
+                # parse_guids returns None only on a genuine parse failure —
+                # never delete when we cannot read what Tally returned
                 logger.warning(
                     f"[{company_name}][{voucher_type}] "
                     f"Phase 3 chunk {month_str}: parse_guids failed — skipping chunk (safe)"
                 )
                 continue
 
+            # tally_guids == {} means Tally confirmed 0 vouchers in this window.
+            # This is a valid response — trust it fully.
+            # reconcile_deleted_by_guids will hard-delete any DB rows whose
+            # GUIDs are not present in Tally (i.e. all rows in this window
+            # when tally_guids is empty).
             if len(tally_guids) == 0:
-                logger.debug(
+                logger.info(
                     f"[{company_name}][{voucher_type}] "
-                    f"Phase 3 chunk {month_str}: 0 GUIDs from Tally — skipping (safe)"
+                    f"Phase 3 chunk {month_str}: Tally returned 0 GUIDs "
+                    f"— deleting all orphaned DB rows in this window"
                 )
-                continue
 
             deleted_count = reconcile_deleted_by_guids(
                 company_name = company_name,
@@ -725,8 +774,9 @@ def _sync_voucher(
     config:       dict,
     tally:        TallyConnector,
     engine,
-    from_date:    str,
+    from_date:    str,   # incremental window start (used for snapshot)
     to_date:      str,
+    full_from:    str,   # Issue 1 & 2 fix: full company history start for Phase 3
     progress_cb=None,
 ):
     voucher_type     = config['voucher_type']
@@ -736,6 +786,7 @@ def _sync_voucher(
     upsert           = config['upsert']
     parser_type_name = config['parser_type_name']
     kind             = config['kind']
+    allowed_types    = config.get('allowed_types')   # set of allowed VOUCHERTYPENAME values or None
 
     lock = _get_company_lock(company_name)
     logger.info(f"[{company_name}][{voucher_type}] Starting")
@@ -764,10 +815,11 @@ def _sync_voucher(
                 logger.warning(
                     f"[{company_name}][{voucher_type}] CDC: no response from Tally ({fetch_ms}ms)"
                 )
-                _reconcile_deleted_vouchers(company_name, config, tally, engine, from_date, to_date)
+                # Issue 1 & 2 fix: reconcile full history, not just incremental window
+                _reconcile_deleted_vouchers(company_name, config, tally, engine, full_from, to_date)
                 return
 
-            rows = parser(xml, company_name, parser_type_name)
+            rows = parser(xml, company_name, parser_type_name, allowed_types=allowed_types)
 
             if not rows:
                 logger.info(
@@ -775,7 +827,8 @@ def _sync_voucher(
                     f"(possible delete-only batch) | advancing alter_id from XML"
                 )
                 _advance_alter_id_from_xml(xml, company_name, voucher_type, engine, lock)
-                _reconcile_deleted_vouchers(company_name, config, tally, engine, from_date, to_date)
+                # Issue 1 & 2 fix: reconcile full history, not just incremental window
+                _reconcile_deleted_vouchers(company_name, config, tally, engine, full_from, to_date)
                 return
 
             t1 = datetime.now()
@@ -792,7 +845,8 @@ def _sync_voucher(
             )
 
             # Phase 3: GUID reconciliation (always after CDC)
-            _reconcile_deleted_vouchers(company_name, config, tally, engine, from_date, to_date)
+            # Issue 1 & 2 fix: reconcile full history, not just incremental window
+            _reconcile_deleted_vouchers(company_name, config, tally, engine, full_from, to_date)
             return
 
         # ── PHASE 1: Snapshot mode ────────────────────────────────────────────
@@ -855,7 +909,7 @@ def _sync_voucher(
                 chunks_done += 1
                 continue
 
-            rows = parser(xml, company_name, parser_type_name)
+            rows = parser(xml, company_name, parser_type_name, allowed_types=allowed_types)
 
             if not rows:
                 logger.info(
@@ -983,6 +1037,11 @@ def sync_company(
 
     if active_configs:
         logger.info(f"[{comp_name}] Launching {len(active_configs)} voucher syncs ...")
+        # full_from = earliest possible date for this company — used by Phase 3
+        # so GUID reconciliation always covers the full history, not just the
+        # incremental window.  This fixes Issues 1 & 2 (cancelled vouchers and
+        # new-fiscal-year deletes being missed).
+        full_from = _resolve_from_date(company)
         with ThreadPoolExecutor(max_workers=inner_workers) as executor:
             futures = {
                 executor.submit(
@@ -993,6 +1052,7 @@ def sync_company(
                     engine       = engine,
                     from_date    = from_date,
                     to_date      = to_date,
+                    full_from    = full_from,
                 ): config['voucher_type']
                 for config in active_configs
             }

@@ -115,23 +115,9 @@ def _insert_voucher_rows(rows, model_class, db, set_total_amt=True):
 #  Inventory voucher upsert  (Sales / Purchase / Credit / Debit)
 # ─────────────────────────────────────────────────────────────────────────────
 def _upsert_inventory_voucher_in_session(rows, model_class, db):
-    """
-    Upsert inventory voucher rows with strict 3-phase commit order:
-
-    PHASE 1 — DELETE:  Hard delete all rows marked is_deleted=Yes.
-                        Flush immediately so keys are free.
-    PHASE 2 — UPDATE:  For existing vouchers with a higher alter_id,
-                        delete old rows then flush, then insert new rows, then flush.
-    PHASE 3 — INSERT:  Insert brand-new vouchers.
-
-    Phases never overlap — no interleaved DELETE+INSERT in the same flush.
-    This prevents parallel-run race conditions and FK conflicts.
-    """
-    from collections import defaultdict
-
     inserted = updated = unchanged = skipped = deleted = 0
 
-    # ── Group rows by voucherkey (or guid if no voucherkey) ──────────────────
+    from collections import defaultdict
     groups: dict[str, list] = defaultdict(list)
     for row in rows:
         if not row.get('guid'):
@@ -140,88 +126,58 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
         key = row.get('voucherkey') or row.get('guid', '')
         groups[key].append(row)
 
-    # Pre-fetch existing rows for all keys in ONE query per batch
-    all_keys        = list(groups.keys())
-    company_name_0  = next(iter(groups.values()))[0].get('company_name', '') if groups else ''
-
-    # Build lookup: key → list[existing db rows]
-    existing_map: dict[str, list] = defaultdict(list)
-    if all_keys:
-        has_voucherkey = hasattr(model_class, 'voucherkey')
-        if has_voucherkey:
-            db_rows = db.query(model_class).filter(
-                model_class.company_name.in_(
-                    list({g[0].get('company_name', '') for g in groups.values()})
-                ),
-                model_class.is_deleted == 'No',
-            ).all()
-            for rec in db_rows:
-                k = getattr(rec, 'voucherkey', None) or getattr(rec, 'guid', '')
-                existing_map[k].append(rec)
-        else:
-            db_rows = db.query(model_class).filter(
-                model_class.company_name.in_(
-                    list({g[0].get('company_name', '') for g in groups.values()})
-                ),
-                model_class.is_deleted == 'No',
-            ).all()
-            for rec in db_rows:
-                existing_map[getattr(rec, 'guid', '')].append(rec)
-
-    # ── PHASE 1: Process all DELETEs first ───────────────────────────────────
-    delete_keys = set()
     for key, group_rows in groups.items():
-        if group_rows[0].get('is_deleted', 'No') == 'Yes':
-            delete_keys.add(key)
-            for rec in existing_map.get(key, []):
-                db.delete(rec)
-                deleted += 1
-            company_name = group_rows[0].get('company_name', '')
-            logger.debug(
-                f"[{company_name}] PHASE1 hard deleted "
-                f"{len(existing_map.get(key, []))} rows for key={key}"
-            )
-    if delete_keys:
-        db.flush()   # ← commit deletes to DB before any inserts
-
-    # ── PHASE 2: Process all UPDATEs (delete-old → flush → insert-new) ──────
-    update_keys = set()
-    for key, group_rows in groups.items():
-        if key in delete_keys:
-            continue
-        existing_rows = existing_map.get(key, [])
-        if not existing_rows:
-            continue
-        company_name = group_rows[0].get('company_name', '')
+        first        = group_rows[0]
+        guid         = first.get('guid', '')
+        company_name = first.get('company_name', '')
         new_alter_id = max(int(r.get('alter_id', 0)) for r in group_rows)
-        old_alter_id = max(int(getattr(r, 'alter_id', 0) or 0) for r in existing_rows)
-        if new_alter_id > old_alter_id:
-            update_keys.add(key)
+        is_del       = first.get('is_deleted', 'No')
+
+        lookup_voucherkey = first.get('voucherkey', '')
+        if lookup_voucherkey:
+            existing_rows = db.query(model_class).filter(
+                model_class.company_name == company_name,
+                model_class.voucherkey   == lookup_voucherkey,
+                model_class.is_deleted   == 'No',
+            ).all()
+        else:
+            existing_rows = db.query(model_class).filter(
+                model_class.company_name == company_name,
+                model_class.guid         == guid,
+                model_class.is_deleted   == 'No',
+            ).all()
+
+        # DELETE signal → hard DELETE from DB
+        if is_del == 'Yes':
             for rec in existing_rows:
                 db.delete(rec)
+            deleted += len(existing_rows)
             logger.debug(
-                f"[{company_name}] PHASE2 deleted {len(existing_rows)} old rows "
-                f"for key={key} alter_id {old_alter_id}→{new_alter_id}"
+                f"[{company_name}] Hard deleted {len(existing_rows)} rows "
+                f"for voucherkey={lookup_voucherkey or guid} (CDC delete)"
+            )
+            continue
+
+        # No existing rows → fresh INSERT
+        if not existing_rows:
+            _insert_voucher_rows(group_rows, model_class, db)
+            inserted += len(group_rows)
+            continue
+
+        old_alter_id = max(int(r.alter_id or 0) for r in existing_rows)
+
+        if new_alter_id > old_alter_id:
+            for rec in existing_rows:
+                db.delete(rec)
+            _insert_voucher_rows(group_rows, model_class, db)
+            updated += len(group_rows)
+            logger.debug(
+                f"[{company_name}] Replaced {len(existing_rows)} → {len(group_rows)} rows "
+                f"for voucherkey={lookup_voucherkey or guid} "
+                f"(alter_id {old_alter_id} → {new_alter_id})"
             )
         else:
             unchanged += len(existing_rows)
-
-    if update_keys:
-        db.flush()   # ← old rows gone before we insert new ones
-        for key in update_keys:
-            group_rows = groups[key]
-            _insert_voucher_rows(group_rows, model_class, db)
-            updated += len(group_rows)
-        db.flush()   # ← new rows visible before phase 3
-
-    # ── PHASE 3: Process all INSERTs (brand new vouchers) ───────────────────
-    for key, group_rows in groups.items():
-        if key in delete_keys or key in update_keys:
-            continue
-        if existing_map.get(key):
-            continue   # already handled as unchanged
-        _insert_voucher_rows(group_rows, model_class, db)
-        inserted += len(group_rows)
 
     return inserted, updated, unchanged, skipped, deleted
 
@@ -231,23 +187,20 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
 # ─────────────────────────────────────────────────────────────────────────────
 def _upsert_ledger_voucher_in_session(rows, model_class, db):
     """
-    Upsert ledger voucher rows with strict 3-phase commit order:
+    Upsert ledger voucher rows.
 
-    PHASE 1 — DELETE:  Hard delete all rows marked is_deleted=Yes.
-                        Flush immediately so GUIDs are free.
-    PHASE 2 — UPDATE:  For existing GUIDs with higher alter_id,
-                        delete old rows → flush → insert new rows → flush.
-    PHASE 3 — INSERT:  Insert brand-new GUIDs.
-
-    Phases never overlap.  This is safe for parallel runs because each
-    voucher_type runs in its own thread with its own session and each phase
-    is flushed before the next begins — no interleaved DELETE+INSERT.
+    DELETE-first strategy ensures voucher_number renumber safety:
+    1. Group rows by GUID.
+    2. Process ALL DELETES first — removes old voucher_number rows before
+       re-inserting renumbered ones.
+    3. For altered vouchers: hard DELETE old rows + INSERT fresh rows.
+    4. For new vouchers: plain INSERT.
+    5. Unchanged (same alter_id): skip.
     """
     from collections import defaultdict
 
     inserted = updated = unchanged = skipped = deleted = 0
 
-    # ── Group rows by GUID ───────────────────────────────────────────────────
     groups: dict[str, list] = defaultdict(list)
     for row in rows:
         if not row.get('guid'):
@@ -255,64 +208,74 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
             continue
         groups[row['guid']].append(row)
 
-    if not groups:
-        return inserted, updated, unchanged, skipped, deleted
+    # Step 1: process ALL DELETES first (renumber-safe)
+    delete_guids = {
+        guid for guid, group in groups.items()
+        if group[0].get('is_deleted', 'No') == 'Yes'
+    }
+    for guid in delete_guids:
+        company_name = groups[guid][0].get('company_name', '')
+        affected = db.query(model_class).filter(
+            model_class.guid         == guid,
+            model_class.company_name == company_name,
+            model_class.is_deleted   == 'No',
+        ).all()
+        for rec in affected:
+            db.delete(rec)
+        deleted += len(affected)
+        logger.debug(
+            f"[{company_name}] Hard deleted {len(affected)} ledger rows "
+            f"for guid={guid} (CDC delete — renumber-safe pass)"
+        )
 
-    all_companies = list({g[0].get('company_name', '') for g in groups.values()})
-
-    # Pre-fetch ALL existing rows for these companies in one query
-    existing_map: dict[str, list] = defaultdict(list)
-    db_rows = db.query(model_class).filter(
-        model_class.company_name.in_(all_companies),
-        model_class.is_deleted == 'No',
-    ).all()
-    for rec in db_rows:
-        existing_map[rec.guid].append(rec)
-
-    # ── PHASE 1: DELETE ──────────────────────────────────────────────────────
-    delete_guids = set()
-    for guid, group_rows in groups.items():
-        if group_rows[0].get('is_deleted', 'No') == 'Yes':
-            delete_guids.add(guid)
-            company_name = group_rows[0].get('company_name', '')
-            affected = existing_map.get(guid, [])
-            for rec in affected:
-                db.delete(rec)
-            deleted += len(affected)
-            logger.debug(
-                f"[{company_name}] PHASE1 hard deleted {len(affected)} "
-                f"ledger rows for guid={guid}"
-            )
-    if delete_guids:
-        db.flush()   # ← deletes committed before any insert
-
-    # ── PHASE 2: UPDATE (delete-old → flush → insert-new → flush) ───────────
-    update_guids = set()
+    # Step 2: process INSERTS / UPDATES
     for guid, group_rows in groups.items():
         if guid in delete_guids:
             continue
-        existing_rows = existing_map.get(guid, [])
-        if not existing_rows:
-            continue
-        company_name = group_rows[0].get('company_name', '')
+
+        first        = group_rows[0]
+        company_name = first.get('company_name', '')
         new_alter_id = max(int(r.get('alter_id', 0)) for r in group_rows)
-        old_alter_id = max(int(getattr(r, 'alter_id', 0) or 0) for r in existing_rows)
+
+        existing_rows = db.query(model_class).filter(
+            model_class.guid         == guid,
+            model_class.company_name == company_name,
+            model_class.is_deleted   == 'No',
+        ).all()
+
+        if not existing_rows:
+            for row in group_rows:
+                db.add(model_class(
+                    company_name   = company_name,
+                    date           = row.get('date'),
+                    voucher_type   = row.get('voucher_type'),
+                    voucher_number = row.get('voucher_number'),
+                    reference      = row.get('reference'),
+                    ledger_name    = row.get('ledger_name'),
+                    amount         = row.get('amount', 0.0),
+                    amount_type    = row.get('amount_type'),
+                    currency       = row.get('currency', 'INR'),
+                    exchange_rate  = row.get('exchange_rate', 1.0),
+                    narration      = row.get('narration'),
+                    guid           = guid,
+                    alter_id       = row.get('alter_id', 0),
+                    master_id      = row.get('master_id'),
+                    change_status  = row.get('change_status'),
+                    is_deleted     = 'No',
+                ))
+            inserted += len(group_rows)
+            continue
+
+        old_alter_id = max(int(r.alter_id or 0) for r in existing_rows)
+
         if new_alter_id > old_alter_id:
-            update_guids.add(guid)
+            logger.debug(
+                f"[{company_name}] Replacing {len(existing_rows)} ledger rows "
+                f"for guid={guid} "
+                f"(alter_id {old_alter_id} → {new_alter_id}, voucher_number renumber-safe)"
+            )
             for rec in existing_rows:
                 db.delete(rec)
-            logger.debug(
-                f"[{company_name}] PHASE2 deleted {len(existing_rows)} ledger rows "
-                f"for guid={guid} alter_id {old_alter_id}→{new_alter_id}"
-            )
-        else:
-            unchanged += len(existing_rows)
-
-    if update_guids:
-        db.flush()   # ← old rows gone before inserts
-        for guid in update_guids:
-            group_rows = groups[guid]
-            company_name = group_rows[0].get('company_name', '')
             for row in group_rows:
                 db.add(model_class(
                     company_name   = company_name,
@@ -333,35 +296,8 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
                     is_deleted     = 'No',
                 ))
             updated += len(group_rows)
-        db.flush()   # ← new rows visible before phase 3
-
-    # ── PHASE 3: INSERT (brand-new GUIDs) ────────────────────────────────────
-    for guid, group_rows in groups.items():
-        if guid in delete_guids or guid in update_guids:
-            continue
-        if existing_map.get(guid):
-            continue   # unchanged
-        company_name = group_rows[0].get('company_name', '')
-        for row in group_rows:
-            db.add(model_class(
-                company_name   = company_name,
-                date           = row.get('date'),
-                voucher_type   = row.get('voucher_type'),
-                voucher_number = row.get('voucher_number'),
-                reference      = row.get('reference'),
-                ledger_name    = row.get('ledger_name'),
-                amount         = row.get('amount', 0.0),
-                amount_type    = row.get('amount_type'),
-                currency       = row.get('currency', 'INR'),
-                exchange_rate  = row.get('exchange_rate', 1.0),
-                narration      = row.get('narration'),
-                guid           = guid,
-                alter_id       = row.get('alter_id', 0),
-                master_id      = row.get('master_id'),
-                change_status  = row.get('change_status'),
-                is_deleted     = 'No',
-            ))
-        inserted += len(group_rows)
+        else:
+            unchanged += len(existing_rows)
 
     return inserted, updated, unchanged, skipped, deleted
 
@@ -981,6 +917,8 @@ def upsert_ledgers(rows, engine):
 
     db = _get_session(engine)
     inserted = updated = unchanged = skipped = 0
+    # Issue 3 fix: collect (old_name, new_name, company_name) for cascade
+    _renames: list = []
 
     def _safe(row):
         return {
@@ -1046,6 +984,21 @@ def upsert_ledgers(rows, engine):
                 # FIX: force-update is_deleted flag even if alter_id unchanged
                 if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes'):
                     _log_changes("ledger UPDATE", existing, [f for f in safe if f not in ('guid', 'company_name')], safe)
+                    # Issue 3: track renames before overwriting the field
+                    old_ledger_name = existing.ledger_name
+                    new_ledger_name = safe.get('ledger_name')
+                    if (
+                        new_alter_id > old_alter_id
+                        and old_ledger_name
+                        and new_ledger_name
+                        and old_ledger_name != new_ledger_name
+                    ):
+                        _renames.append((old_ledger_name, new_ledger_name, safe['company_name']))
+                        logger.info(
+                            f"[{safe['company_name']}] Ledger rename detected: "
+                            f"'{old_ledger_name}' → '{new_ledger_name}' "
+                            f"(guid={safe['guid']})"
+                        )
                     for field, value in safe.items():
                         if field not in ('guid', 'company_name'):
                             setattr(existing, field, value)
@@ -1058,6 +1011,10 @@ def upsert_ledgers(rows, engine):
 
         db.commit()
         _log_result("Ledgers upsert", inserted, updated, unchanged, skipped)
+
+        # Issue 3: propagate renames to all voucher tables
+        if _renames:
+            cascade_ledger_renames(_renames, engine)
 
     except Exception:
         db.rollback()
@@ -1126,6 +1083,120 @@ def reconcile_deleted_masters_in_db(
             f"[{company_name}][{master_type}] reconcile_deleted_masters_in_db error"
         )
         return 0
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Ledger rename cascade — Issue 3 fix
+#  When a ledger is renamed in Tally, propagate the new name to party_name
+#  (inventory vouchers) and ledger_name (ledger vouchers) across all tables.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# All voucher models that store the ledger name as a text column
+_INVENTORY_VOUCHER_MODELS = [SalesVoucher, PurchaseVoucher, CreditNote, DebitNote]
+_LEDGER_VOUCHER_MODELS    = [ReceiptVoucher, PaymentVoucher, JournalVoucher, ContraVoucher]
+
+
+def cascade_ledger_renames(renames: list, engine):
+    """
+    After a ledger rename, update the denormalised name columns in all
+    voucher tables so they stay consistent with the ledgers master.
+
+    renames — list of (old_name, new_name, company_name) tuples collected
+              by upsert_ledgers() during the CDC update loop.
+
+    Inventory vouchers  → updates party_name
+    Ledger vouchers     → updates ledger_name
+    TrialBalance        → updates ledger_name
+
+    Uses bulk UPDATE per table — no row-by-row ORM loop.
+    Rolls back all changes if any table update fails.
+    """
+    if not renames:
+        return
+
+    db = _get_session(engine)
+    try:
+        total_updated = 0
+
+        for old_name, new_name, company_name in renames:
+            if not old_name or not new_name or old_name == new_name:
+                continue
+
+            logger.info(
+                f"[{company_name}] Cascade rename: "
+                f"'{old_name}' → '{new_name}'"
+            )
+
+            # Inventory vouchers: party_name column
+            for model in _INVENTORY_VOUCHER_MODELS:
+                n = (
+                    db.query(model)
+                    .filter(
+                        model.company_name == company_name,
+                        model.party_name   == old_name,
+                    )
+                    .update(
+                        {model.party_name: new_name},
+                        synchronize_session=False,
+                    )
+                )
+                if n:
+                    logger.info(
+                        f"[{company_name}] Cascade rename → {model.__tablename__}"
+                        f".party_name: {n} rows updated"
+                    )
+                total_updated += n
+
+            # Ledger vouchers: ledger_name column
+            for model in _LEDGER_VOUCHER_MODELS:
+                n = (
+                    db.query(model)
+                    .filter(
+                        model.company_name == company_name,
+                        model.ledger_name  == old_name,
+                    )
+                    .update(
+                        {model.ledger_name: new_name},
+                        synchronize_session=False,
+                    )
+                )
+                if n:
+                    logger.info(
+                        f"[{company_name}] Cascade rename → {model.__tablename__}"
+                        f".ledger_name: {n} rows updated"
+                    )
+                total_updated += n
+
+            # TrialBalance: ledger_name column
+            n = (
+                db.query(TrialBalance)
+                .filter(
+                    TrialBalance.company_name == company_name,
+                    TrialBalance.ledger_name  == old_name,
+                )
+                .update(
+                    {TrialBalance.ledger_name: new_name},
+                    synchronize_session=False,
+                )
+            )
+            if n:
+                logger.info(
+                    f"[{company_name}] Cascade rename → trial_balance"
+                    f".ledger_name: {n} rows updated"
+                )
+            total_updated += n
+
+        db.commit()
+        logger.info(
+            f"cascade_ledger_renames: committed | "
+            f"{len(renames)} rename(s) | {total_updated} total rows updated"
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception("cascade_ledger_renames: DB error — rolled back all changes")
     finally:
         db.close()
 

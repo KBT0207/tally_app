@@ -335,7 +335,21 @@ def parse_quantity_with_unit(qty_text):
 # Ledger voucher parser  (Receipt / Payment / Journal / Contra)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_ledger_voucher(xml_content, company_name: str, voucher_type_name: str = 'ledger') -> list:
+def parse_ledger_voucher(
+    xml_content,
+    company_name:  str,
+    voucher_type_name: str = 'ledger',
+    allowed_types: set = None,   # UNUSED — Tally TDL filter already routes correctly
+) -> list:
+    """
+    Parse Receipt / Payment / Journal / Contra XML from Tally.
+
+    The XML templates use Tally's own TDL filters ($$IsReceipt, $$IsPayment,
+    $$IsJournal, $$IsContra) which operate on the internal voucher classification,
+    not the display name.  Custom-named voucher types (e.g. "Bank Payment") are
+    correctly included by Tally's filter.  We store whatever VOUCHERTYPENAME
+    Tally returns — no Python-side name filtering.
+    """
     try:
         if not xml_content or (isinstance(xml_content, str) and not xml_content.strip()):
             logger.warning(f"Empty or None XML content for {voucher_type_name}")
@@ -457,7 +471,21 @@ def parse_ledger_voucher(xml_content, company_name: str, voucher_type_name: str 
 # Inventory voucher parser  (Sales / Purchase / Credit Note / Debit Note)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: str = 'inventory') -> list:
+def parse_inventory_voucher(
+    xml_content,
+    company_name:  str,
+    voucher_type_name: str = 'inventory',
+    allowed_types: set = None,   # UNUSED — Tally TDL filter already routes correctly
+) -> list:
+    """
+    Parse Sales / Purchase / Credit Note / Debit Note XML from Tally.
+
+    The XML templates use Tally's own TDL filters ($$IsSales, $$IsPurchase,
+    $$IsCreditNote, $$IsDebitNote) which operate on internal voucher classification,
+    not the display name.  Custom-named voucher types (e.g. "Tax Invoice",
+    "Export Invoice") are correctly included by Tally's filter.  We store
+    whatever VOUCHERTYPENAME Tally returns — no Python-side name filtering.
+    """
     try:
         if not xml_content or (isinstance(xml_content, str) and not xml_content.strip()):
             logger.warning(f"Empty or None XML content for {voucher_type_name}")
