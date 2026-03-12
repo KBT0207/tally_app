@@ -595,11 +595,20 @@ def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: s
                     voucher_charges['other_amt'] += amount
 
             # ── Inventory line items ───────────────────────────────────────────
+            # FIX: also treat qty-only entries (amount=0, qty>0) as real inventory.
+            # Tally allows saving purchase/sale vouchers with quantity but no rate/amount,
+            # which previously caused all items to be dropped and replaced with "No Item".
             has_real_inventory = any(
                 clean_text(inv.findtext('STOCKITEMNAME', ''))
-                and _parse_fcy_amount(
-                    clean_text((inv.find('AMOUNT').text if inv.find('AMOUNT') is not None else ''))
-                ) > 0.01
+                and (
+                    _parse_fcy_amount(
+                        clean_text((inv.find('AMOUNT').text if inv.find('AMOUNT') is not None else ''))
+                    ) > 0.01
+                    or convert_to_float(
+                        re.search(r'[\d,]+\.?\d*', clean_text((inv.find('ACTUALQTY').text if inv.find('ACTUALQTY') is not None else '') or '')).group()
+                        if re.search(r'[\d,]+\.?\d*', clean_text((inv.find('ACTUALQTY').text if inv.find('ACTUALQTY') is not None else '') or '')) else '0'
+                    ) > 0
+                )
                 for inv in inventory_entries
             )
 
@@ -722,7 +731,7 @@ def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: s
                     2,
                 )
 
-            if not temp_item_data or total_item_amount == 0:
+            if not temp_item_data:
                 # No inventory items parsed — emit a summary row
                 all_rows.append({
                     **base,
@@ -752,7 +761,7 @@ def parse_inventory_voucher(xml_content, company_name: str, voucher_type_name: s
                 })
             else:
                 for idx, item in enumerate(temp_item_data):
-                    proportion = item['amount'] / total_item_amount if total_item_amount else 0
+                    proportion = item['amount'] / total_item_amount if total_item_amount > 0 else (1.0 / len(temp_item_data))
                     all_rows.append({
                         **base,
                         'item_name'    : item['item_name'],

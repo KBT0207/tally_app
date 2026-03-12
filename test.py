@@ -27,10 +27,10 @@ for c in companies:
 
     print("Fetching:", name)
 
-    xml_data = tally.fetch_sales(
+    xml_data = tally.fetch_purchase(
         name,
-        from_date='20251201',
-        to_date='20251231',
+        from_date='20220401',
+        to_date='20220401',
         debug=True
     )
 

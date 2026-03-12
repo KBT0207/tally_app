@@ -46,7 +46,10 @@ class ConfigureCompanyDialog(tk.Toplevel):
 
     def __init__(self, parent, company: CompanyState, app, state):
         super().__init__(parent)
-        self.title(f"Configure  —  {company.name}")
+        # Edit mode if company is already configured (has a starting_from date saved)
+        self._is_edit = bool(getattr(company, 'starting_from', None))
+        title_verb    = "Edit" if self._is_edit else "Configure"
+        self.title(f"{title_verb}  —  {company.name}")
         self.resizable(True, True)
         self.grab_set()           # modal
         self.saved    = False
@@ -79,8 +82,9 @@ class ConfigureCompanyDialog(tk.Toplevel):
         pad.pack(fill="both", expand=True)
 
         # ── Title ─────────────────────────────────────────
+        title_text = "Edit Company Configuration" if self._is_edit else "Configure Company"
         tk.Label(
-            pad, text="Configure Company",
+            pad, text=title_text,
             font=Font.HEADING_4, bg=Color.BG_CARD, fg=Color.TEXT_PRIMARY,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
@@ -141,7 +145,7 @@ class ConfigureCompanyDialog(tk.Toplevel):
 
         tk.Label(host_frame, text="Host:", font=Font.BODY, bg=Color.BG_CARD,
                  fg=Color.TEXT_SECONDARY, width=6, anchor="w").pack(side="left")
-        self._host_var = tk.StringVar(value=co.tally_host or "localhost")
+        self._host_var = tk.StringVar(value=getattr(co, 'tally_host', None) or "localhost")
         tk.Entry(
             host_frame, textvariable=self._host_var,
             font=Font.BODY, width=18,
@@ -151,7 +155,7 @@ class ConfigureCompanyDialog(tk.Toplevel):
 
         tk.Label(host_frame, text="Port:", font=Font.BODY, bg=Color.BG_CARD,
                  fg=Color.TEXT_SECONDARY, width=5, anchor="w").pack(side="left")
-        self._port_var = tk.StringVar(value=str(co.tally_port or 9000))
+        self._port_var = tk.StringVar(value=str(getattr(co, 'tally_port', None) or 9000))
         tk.Entry(
             host_frame, textvariable=self._port_var,
             font=Font.BODY, width=7,
@@ -235,8 +239,9 @@ class ConfigureCompanyDialog(tk.Toplevel):
             command=self.destroy,
         ).pack(side="right", padx=(8, 0))
 
+        save_label = "✓  Save Changes" if self._is_edit else "✓  Save & Configure"
         tk.Button(
-            btn_row, text="✓  Save & Configure",
+            btn_row, text=save_label,
             font=Font.BUTTON_SM, bg=Color.PRIMARY, fg=Color.TEXT_WHITE,
             relief="flat", bd=0, padx=16, pady=5, cursor="hand2",
             command=self._on_save,

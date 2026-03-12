@@ -238,33 +238,24 @@ class SyncController:
         selected = voucher_sel.selected_types()
         self._post("log", company_name, f"Syncing: {', '.join(selected)}", "INFO")
 
-        # ── Run sync (all vouchers parallel via sync_company) ────
+        # ── Run sync ──────────────────────────────────────
         try:
             from services.sync_service import sync_company
 
-            # For INCREMENTAL mode from_date is None — pass None so sync_company
-            # uses CDC (alter_id). For SNAPSHOT pass the actual date.
-            # Do NOT fallback to starting_from here — that forces a full snapshot
-            # on every incremental run.
-            fd = from_date  # None = CDC/incremental, date string = snapshot
+            # None = CDC/incremental (alter_id gated), date string = snapshot
+            fd = from_date
 
             self._post("progress", company_name, 10.0, "Syncing...")
             self._post("log",      company_name,
-                       f"→ Syncing {len(selected)} voucher types in parallel", "INFO")
+                       f"→ Syncing: {', '.join(sorted(selected))}", "INFO")
 
-            # sync_company() runs ledgers/items/trial_balance first (sequential),
-            # then fires ALL voucher types together via ThreadPoolExecutor.
-            # VOUCHER_WORKERS in sync_service.py controls how many run at once.
-            # Tally HTTP calls are serialised by _TALLY_SEMAPHORE internally.
-            # Note: sync_company() runs all VOUCHER_CONFIG types regardless of
-            # `selected` — voucher filtering happens inside sync_service via CDC
-            # (unchanged vouchers return 0 rows instantly so cost is minimal).
             sync_company(
-                company          = company_dict,
-                tally            = tally,
-                engine           = engine,
-                to_date          = to_date,
-                manual_from_date = fd,
+                company           = company_dict,
+                tally             = tally,
+                engine            = engine,
+                to_date           = to_date,
+                manual_from_date  = fd,
+                voucher_selection = set(selected),
             )
 
             # ── Done ──────────────────────────────────────

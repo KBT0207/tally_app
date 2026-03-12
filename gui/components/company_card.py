@@ -246,8 +246,13 @@ class CompanyCard(tk.Frame):
             )
             self._sync_btn.pack(pady=(0, Spacing.XS))
 
+            # Bottom row: Schedule + Edit side by side
+            sub_row = tk.Frame(btn_wrap, bg=Color.BG_CARD)
+            sub_row.pack()
+            self._bg_frames.append(sub_row)
+
             tk.Button(
-                btn_wrap,
+                sub_row,
                 text="⏰",
                 font=Font.BUTTON_SM,
                 bg=Color.INFO_BG, fg=Color.INFO_FG,
@@ -255,7 +260,18 @@ class CompanyCard(tk.Frame):
                 padx=Spacing.SM, pady=Spacing.XS,
                 cursor="hand2",
                 command=self._on_sched_click,
-            ).pack()
+            ).pack(side="left", padx=(0, 4))
+
+            tk.Button(
+                sub_row,
+                text="✎",
+                font=Font.BUTTON_SM,
+                bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                relief="solid", bd=1,
+                padx=Spacing.SM, pady=Spacing.XS,
+                cursor="hand2",
+                command=self._on_configure_click,
+            ).pack(side="left")
         else:
             # Configure button — highlighted more when Tally is open
             cfg_bg = Color.PRIMARY      if tally_open else Color.WARNING_BG

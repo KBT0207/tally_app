@@ -916,6 +916,7 @@ def sync_company(
     to_date:              str,
     manual_from_date:     str  = None,
     parallel_company_mode: bool = False,
+    voucher_selection:    set  = None,   # set of voucher type strings to run; None = all
 ):
     """
     Sync a single company — all 3 phases.
@@ -923,49 +924,90 @@ def sync_company(
     Phase 1 (Snapshot): runs on first sync, chunked 3-month fetches
     Phase 2 (CDC):      runs on every subsequent sync, alter_id gated
     Phase 3 (Reconcile): runs after every CDC sync, full-history GUID diff
+
+    voucher_selection: optional set of type names to run, e.g.
+        {"sales", "purchase", "ledgers", "trial_balance"}
+        Pass None (default) to run everything — preserves existing behaviour.
+        Names match VoucherSelection attribute names used in the GUI.
     """
-    comp_name    = company.get('name', '').strip()
-    from_date    = manual_from_date if manual_from_date else _resolve_from_date(company)
+    comp_name     = company.get('name', '').strip()
+    from_date     = manual_from_date if manual_from_date else _resolve_from_date(company)
     inner_workers = 1 if parallel_company_mode else VOUCHER_WORKERS
+
+    # Normalise selection to a set for O(1) lookup; None means run all
+    sel = set(voucher_selection) if voucher_selection is not None else None
+
+    def _selected(name: str) -> bool:
+        return sel is None or name in sel
 
     logger.info('=' * 60)
     logger.info(f'Syncing company  : {comp_name}')
-    logger.info(f'Date range       : {from_date} → {to_date}')
+    logger.info(f'Date range       : {from_date} -> {to_date}')
     logger.info(f'Chunk size       : {SNAPSHOT_CHUNK_MONTHS} months per API call')
     logger.info(f'Voucher workers  : {inner_workers} (parallel_company_mode={parallel_company_mode})')
+    logger.info(f'Voucher filter   : {sorted(sel) if sel is not None else "all"}')
     logger.info('=' * 60)
 
     start_time = datetime.now()
 
-    _sync_ledgers(comp_name, tally, engine)
-    _sync_items(comp_name, tally, engine)
-    _sync_trial_balance(comp_name, tally, engine, from_date, to_date)
-    _sync_outstanding_debtors(comp_name, tally, engine, from_date, to_date)
+    # Masters & reports (only if selected)
+    if _selected('ledger'):
+        _sync_ledgers(comp_name, tally, engine)
+    else:
+        logger.info(f"[{comp_name}] Skipping ledgers (not selected)")
 
-    logger.info(f"[{comp_name}] Launching {len(VOUCHER_CONFIG)} voucher syncs …")
-    with ThreadPoolExecutor(max_workers=inner_workers) as executor:
-        futures = {
-            executor.submit(
-                _sync_voucher,
-                company_name = comp_name,
-                config       = config,
-                tally        = tally,
-                engine       = engine,
-                from_date    = from_date,
-                to_date      = to_date,
-            ): config['voucher_type']
-            for config in VOUCHER_CONFIG
-        }
+    if _selected('items'):
+        _sync_items(comp_name, tally, engine)
+    else:
+        logger.info(f"[{comp_name}] Skipping items (not selected)")
 
-        for future in as_completed(futures):
-            vt = futures[future]
-            try:
-                future.result()
-                logger.info(f"[{comp_name}][{vt}] Thread finished ✓")
-            except Exception:
-                logger.error(
-                    f"[{comp_name}][{vt}] Thread raised an exception (other types continue)"
-                )
+    if _selected('trial_balance'):
+        _sync_trial_balance(comp_name, tally, engine, from_date, to_date)
+    else:
+        logger.info(f"[{comp_name}] Skipping trial_balance (not selected)")
+
+    if _selected('outstanding_debtors'):
+        _sync_outstanding_debtors(comp_name, tally, engine, from_date, to_date)
+    else:
+        logger.info(f"[{comp_name}] Skipping outstanding_debtors (not selected)")
+
+    # Voucher types (filter by selection)
+    active_configs = [
+        config for config in VOUCHER_CONFIG
+        if _selected(config['voucher_type'])
+    ]
+
+    skipped = [c['voucher_type'] for c in VOUCHER_CONFIG if c not in active_configs]
+    if skipped:
+        logger.info(f"[{comp_name}] Skipping voucher types: {skipped}")
+
+    if active_configs:
+        logger.info(f"[{comp_name}] Launching {len(active_configs)} voucher syncs ...")
+        with ThreadPoolExecutor(max_workers=inner_workers) as executor:
+            futures = {
+                executor.submit(
+                    _sync_voucher,
+                    company_name = comp_name,
+                    config       = config,
+                    tally        = tally,
+                    engine       = engine,
+                    from_date    = from_date,
+                    to_date      = to_date,
+                ): config['voucher_type']
+                for config in active_configs
+            }
+
+            for future in as_completed(futures):
+                vt = futures[future]
+                try:
+                    future.result()
+                    logger.info(f"[{comp_name}][{vt}] Thread finished OK")
+                except Exception:
+                    logger.error(
+                        f"[{comp_name}][{vt}] Thread raised an exception (other types continue)"
+                    )
+    else:
+        logger.info(f"[{comp_name}] No voucher types to run after filtering")
 
     elapsed = (datetime.now() - start_time).total_seconds()
     logger.info(f"[{comp_name}] Sync completed in {elapsed:.1f}s")
