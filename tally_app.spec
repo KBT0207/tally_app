@@ -10,6 +10,22 @@
 #   3. Output EXE is at:      dist\TallySyncManager\TallySyncManager.exe
 #
 # IMPORTANT: Run this from the project root directory (where main.py lives).
+#
+# CHANGELOG:
+#   - global_config_dialog now supports tally_host / tally_port bulk-apply
+#   - app.py save_company_to_db() now accepts tally_host + tally_port params
+#   - hooks/hook-cryptography.py overrides the broken _pyinstaller_hooks_contrib
+#     hook that crashes on machines with AppLocker/WDAC Application Control
+#     policies (DLL load blocked in isolated subprocess).
+#     The local hook skips OpenSSL detection entirely; binaries are collected
+#     binaries are collected by hooks/hook-cryptography.py instead.
+#
+# FOLDER LAYOUT REQUIRED:
+#   tally_app/
+#   ├── main.py
+#   ├── tally_app.spec
+#   └── hooks/
+#       └── hook-cryptography.py   ← must exist (create alongside this spec)
 
 import os
 from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_data_files
@@ -38,7 +54,7 @@ added_datas = [
     # ── XML request templates ────────────────────────────────────────────────
     ('utils/*.xml',         'utils'),
     ('utils/cdc/*.xml',     'utils/cdc'),
-    ('utils/guid/*.xml',    'utils/guid'),       # ← ADDED: GUID XML templates
+    ('utils/guid/*.xml',    'utils/guid'),
     ('utils/reports/*.xml', 'utils/reports'),
 
     # ── PyAutoGUI screen-detection PNG images ────────────────────────────────
@@ -72,10 +88,9 @@ hidden_imports = [
     'database.models.item',
     'database.models.trial_balance',
     'database.models.base',
-    'database.models.outstanding_models',       # ← ADDED: present in tree
+    'database.models.outstanding_models',
 
     # ── SQLAlchemy MySQL dialect — critical for DB connection ─────────────────
-    # Without this the engine creation fails silently in frozen mode
     'sqlalchemy.dialects.mysql',
     'sqlalchemy.dialects.mysql.pymysql',
     'pymysql',
@@ -109,6 +124,7 @@ hidden_imports = [
     # ── GUI components ────────────────────────────────────────────────────────
     'gui.components.company_card',
     'gui.components.configure_company_dialog',
+    'gui.components.global_config_dialog',       # ← bulk host/port/creds/type dialog
     'gui.components.setup_wizard',
     'gui.components.initial_snapshot_dialog',
     'gui.components.status_badge',
@@ -123,14 +139,14 @@ hidden_imports = [
     'gui.state',
     'gui.styles',
     'gui.tray_manager',
-    'gui.scale',                                # ← ADDED: present in tree
+    'gui.scale',
 
     # ── Services ──────────────────────────────────────────────────────────────
     'services.tally_connector',
     'services.tally_launcher',
     'services.sync_service',
     'services.data_processor',
-    'services.currency_extractor',              # ← ADDED: present in tree
+    'services.currency_extractor',
 
     # ── Database core ─────────────────────────────────────────────────────────
     'database.db_connector',
@@ -155,10 +171,27 @@ hidden_imports = [
     'keyring.backends.Windows',
     'keyring.backends.fail',
 
-    # ── cryptography (used by keyring) ────────────────────────────────────────
+    # ── cryptography (used by keyring) ──────────────────────────────────────
+    # _rust.pyd is collected as a binary above; these cover the pure-Python
+    # wrapper layer that imports it at runtime.
     'cryptography',
+    'cryptography.fernet',
+    'cryptography.hazmat',
     'cryptography.hazmat.primitives',
+    'cryptography.hazmat.primitives.ciphers',
+    'cryptography.hazmat.primitives.ciphers.algorithms',
+    'cryptography.hazmat.primitives.ciphers.modes',
+    'cryptography.hazmat.primitives.hashes',
+    'cryptography.hazmat.primitives.hmac',
+    'cryptography.hazmat.primitives.padding',
+    'cryptography.hazmat.primitives.serialization',
+    'cryptography.hazmat.primitives.asymmetric',
+    'cryptography.hazmat.primitives.asymmetric.rsa',
     'cryptography.hazmat.backends',
+    'cryptography.hazmat.backends.openssl',
+    'cryptography.hazmat.bindings._rust',          # the Rust extension itself
+    'cryptography.hazmat.bindings._rust.openssl',  # loaded lazily at runtime
+    'cryptography.x509',
 
     # ── tkinter (must be explicitly included on some Python builds) ───────────
     'tkinter',
@@ -201,7 +234,7 @@ a = Analysis(
     binaries=sqlalchemy_binaries + apscheduler_binaries + pillow_binaries + keyring_binaries,
     datas=added_datas,
     hiddenimports=hidden_imports,
-    hookspath=[],
+    hookspath=['hooks'],   # local hooks/ overrides broken _pyinstaller_hooks_contrib hooks
     hooksconfig={},
     runtime_hooks=[],
     excludes=[

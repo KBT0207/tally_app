@@ -5,10 +5,11 @@ Bulk-configure multiple Tally companies at once.
 
 Lets the user:
   1. Pick which companies to apply settings to (checkbox list — all/some)
-  2. Choose what fields to overwrite  (credentials / company type / both)
+  2. Choose what fields to overwrite  (credentials / host+port / company type / all)
   3. Enter shared Username + Password
-  4. Select company type  (Local / Remote / TDS)
-  5. Click Apply — writes to DB + updates in-memory CompanyState for each
+  4. Set shared Tally Host + Port  (default: localhost / 9000)
+  5. Select company type  (Local / Remote / TDS)
+  6. Click Apply — writes to DB + updates in-memory CompanyState for each
      selected company, then emits  company_updated  so cards refresh.
 
 Usage (from home_page.py):
@@ -84,8 +85,9 @@ class GlobalConfigDialog(tk.Toplevel):
         scope_row = tk.Frame(root, bg=Color.BG_CARD)
         scope_row.pack(anchor="w", pady=(6, 10))
 
-        self._apply_creds_var = tk.BooleanVar(value=True)
-        self._apply_type_var  = tk.BooleanVar(value=True)
+        self._apply_creds_var     = tk.BooleanVar(value=True)
+        self._apply_host_port_var = tk.BooleanVar(value=False)
+        self._apply_type_var      = tk.BooleanVar(value=True)
 
         tk.Checkbutton(
             scope_row, text="Credentials  (username / password)",
@@ -94,6 +96,14 @@ class GlobalConfigDialog(tk.Toplevel):
             fg=Color.TEXT_PRIMARY,
             command=self._on_scope_change,
         ).pack(side="left")
+
+        tk.Checkbutton(
+            scope_row, text="Host / Port",
+            variable=self._apply_host_port_var,
+            font=Font.BODY, bg=Color.BG_CARD, activebackground=Color.BG_CARD,
+            fg=Color.TEXT_PRIMARY,
+            command=self._on_scope_change,
+        ).pack(side="left", padx=(20, 0))
 
         tk.Checkbutton(
             scope_row, text="Company Type  (Local / Remote / TDS)",
@@ -144,6 +154,45 @@ class GlobalConfigDialog(tk.Toplevel):
             fg=Color.TEXT_MUTED,
             command=self._toggle_pw,
         ).pack(side="left", padx=(6, 0))
+
+        # ── Host / Port ───────────────────────────────────────────────────────
+        self._host_port_frame = tk.Frame(root, bg=Color.BG_CARD)
+        self._host_port_frame.pack(fill="x", pady=(10, 0))
+
+        self._add_section(self._host_port_frame, "Tally Connection  (Host / Port)")
+
+        hp_row = tk.Frame(self._host_port_frame, bg=Color.BG_CARD)
+        hp_row.pack(anchor="w", pady=(6, 0))
+
+        tk.Label(hp_row, text="Host:", font=Font.BODY,
+                 bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                 width=6, anchor="w").pack(side="left")
+        self._host_var = tk.StringVar(value="localhost")
+        self._host_entry = tk.Entry(
+            hp_row, textvariable=self._host_var,
+            font=Font.BODY, width=20,
+            bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+            relief="solid", bd=1,
+        )
+        self._host_entry.pack(side="left", padx=(4, 20))
+
+        tk.Label(hp_row, text="Port:", font=Font.BODY,
+                 bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+                 width=5, anchor="w").pack(side="left")
+        self._port_var = tk.StringVar(value="9000")
+        self._port_entry = tk.Entry(
+            hp_row, textvariable=self._port_var,
+            font=Font.BODY, width=7,
+            bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+            relief="solid", bd=1,
+        )
+        self._port_entry.pack(side="left", padx=(4, 0))
+
+        tk.Label(
+            self._host_port_frame,
+            text="Note: applies the same host and port to every selected company.",
+            font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+        ).pack(anchor="w")
 
         # ── Company Type ──────────────────────────────────────────────────────
         self._type_frame = tk.Frame(root, bg=Color.BG_CARD)
@@ -352,22 +401,26 @@ class GlobalConfigDialog(tk.Toplevel):
         )
 
     def _on_scope_change(self):
-        """Grey out credential / type sections based on checkboxes."""
+        """Grey out credential / host-port / type sections based on checkboxes."""
         def _set_frame_state(frame, enabled: bool):
-            fg = Color.TEXT_SECONDARY if enabled else Color.TEXT_MUTED
             bg_in = Color.BG_INPUT if enabled else Color.BG_CARD
             for w in frame.winfo_children():
                 try:
                     if isinstance(w, tk.Entry):
                         w.configure(state="normal" if enabled else "disabled",
                                     bg=bg_in)
-                    elif isinstance(w, (tk.Label, tk.Frame)):
-                        pass
+                    elif isinstance(w, tk.Frame):
+                        # Recurse into nested frames (e.g. hp_row inside host_port_frame)
+                        for child in w.winfo_children():
+                            if isinstance(child, tk.Entry):
+                                child.configure(state="normal" if enabled else "disabled",
+                                                bg=bg_in)
                 except Exception:
                     pass
 
-        _set_frame_state(self._creds_frame, self._apply_creds_var.get())
-        _set_frame_state(self._type_frame,  self._apply_type_var.get())
+        _set_frame_state(self._creds_frame,     self._apply_creds_var.get())
+        _set_frame_state(self._host_port_frame,  self._apply_host_port_var.get())
+        _set_frame_state(self._type_frame,       self._apply_type_var.get())
 
     def _toggle_pw(self):
         show = self._show_pw_var.get()
@@ -378,9 +431,9 @@ class GlobalConfigDialog(tk.Toplevel):
         apply_creds = self._apply_creds_var.get()
         apply_type  = self._apply_type_var.get()
 
-        if not apply_creds and not apply_type:
+        if not apply_creds and not apply_host_port and not apply_type:
             self._feedback.configure(
-                text="Please select at least one thing to apply  (Credentials or Company Type).",
+                text="Please select at least one thing to apply  (Credentials, Host/Port, or Company Type).",
                 fg=Color.DANGER,
             )
             return
@@ -395,6 +448,17 @@ class GlobalConfigDialog(tk.Toplevel):
 
         username = self._username_var.get().strip()
         password = self._password_var.get().strip()
+        host     = self._host_var.get().strip() or "localhost"
+        try:
+            port = int(self._port_var.get().strip() or "9000")
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            self._feedback.configure(
+                text="Port must be a number between 1 and 65535.",
+                fg=Color.DANGER,
+            )
+            return
         ctype    = self._type_var.get()
 
         ok_count  = 0
@@ -411,9 +475,11 @@ class GlobalConfigDialog(tk.Toplevel):
                 guid          = co.guid or "",
                 starting_from = co.starting_from or "",
                 books_from    = co.books_from or co.starting_from or "",
-                tally_username= username  if apply_creds else (getattr(co, "tally_username", "") or ""),
-                tally_password= password  if apply_creds else (getattr(co, "tally_password", "") or ""),
-                company_type  = ctype     if apply_type  else (getattr(co, "company_type", "local") or "local"),
+                tally_username= username  if apply_creds     else (getattr(co, "tally_username", "") or ""),
+                tally_password= password  if apply_creds     else (getattr(co, "tally_password", "") or ""),
+                tally_host    = host      if apply_host_port else (getattr(co, "tally_host", "localhost") or "localhost"),
+                tally_port    = port      if apply_host_port else int(getattr(co, "tally_port", 9000) or 9000),
+                company_type  = ctype     if apply_type      else (getattr(co, "company_type", "local") or "local"),
                 data_path     = getattr(co, "data_path",   "") or "",
                 tds_path      = getattr(co, "tds_path",    "") or "",
                 drive_letter  = getattr(co, "drive_letter","") or "",
@@ -428,6 +494,9 @@ class GlobalConfigDialog(tk.Toplevel):
                 if apply_creds:
                     co.tally_username = username
                     co.tally_password = password
+                if apply_host_port:
+                    co.tally_host = host
+                    co.tally_port = port
                 if apply_type:
                     co.company_type = ctype
                 ok_count += 1
@@ -440,6 +509,9 @@ class GlobalConfigDialog(tk.Toplevel):
                 if apply_creds:
                     co.tally_username = username
                     co.tally_password = password
+                if apply_host_port:
+                    co.tally_host = host
+                    co.tally_port = port
                 if apply_type:
                     co.company_type = ctype
                 ok_count += 1

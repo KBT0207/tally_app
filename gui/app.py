@@ -774,6 +774,7 @@ class TallySyncApp:
     def save_company_to_db(self, company_name: str, guid: str,
                            starting_from: str, books_from: str = None,
                            tally_username: str = "", tally_password: str = "",
+                           tally_host: str = "localhost", tally_port: int = 9000,
                            company_type: str = "local", data_path: str = "",
                            tds_path: str = "", drive_letter: str = ""):
         from sqlalchemy.orm import sessionmaker
@@ -792,6 +793,10 @@ class TallySyncApp:
                 existing.starting_from  = starting_from
                 existing.tally_username = tally_username
                 existing.tally_password = tally_password
+                if hasattr(existing, 'tally_host'):
+                    existing.tally_host = tally_host or "localhost"
+                if hasattr(existing, 'tally_port'):
+                    existing.tally_port = int(tally_port or 9000)
                 existing.company_type   = company_type
                 existing.data_path      = data_path or None
                 existing.tds_path       = tds_path  or None
@@ -810,6 +815,10 @@ class TallySyncApp:
                     tds_path       = tds_path    or None,
                     drive_letter   = drive_letter or None,
                 )
+                if hasattr(Company, 'tally_host'):
+                    co.tally_host = tally_host or "localhost"
+                if hasattr(Company, 'tally_port'):
+                    co.tally_port = int(tally_port or 9000)
                 if books_from and hasattr(Company, 'books_from'):
                     co.books_from = books_from
                 db.add(co)
