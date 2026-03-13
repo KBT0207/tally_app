@@ -795,6 +795,142 @@ LEDGER_MODEL_MAP = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Ledger rename cascade
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _propagate_ledger_rename(
+    db,
+    company_name: str,
+    old_name:     str,
+    new_name:     str,
+) -> int:
+    """
+    Cascade a ledger rename to EVERY table that stores a ledger name as text.
+
+    Called INSIDE the upsert_ledgers session so the propagation is atomic with
+    the ledger master update — if anything rolls back, all voucher table updates
+    roll back too.
+
+    Column mapping (derived from models):
+      party_name  column:
+        • SalesVoucher        — customer/supplier ledger on inventory vouchers
+        • PurchaseVoucher
+        • CreditNote
+        • DebitNote
+        • DebtorOutstanding   — party ledger on outstanding receivables
+
+      ledger_name column:
+        • ReceiptVoucher      — every entry row (party + non-party)
+        • PaymentVoucher
+        • JournalVoucher
+        • ContraVoucher
+        • TrialBalance        — ledger row in trial balance snapshot
+
+    Returns the total number of rows updated across all tables.
+    """
+    total = 0
+
+    # ── Tables with party_name ────────────────────────────────────────────────
+    # Inventory vouchers store the party (customer/supplier) ledger name here.
+    # DebtorOutstanding also uses party_name for the receivable party.
+    for model, col_attr in (
+        (SalesVoucher,      SalesVoucher.party_name),
+        (PurchaseVoucher,   PurchaseVoucher.party_name),
+        (CreditNote,        CreditNote.party_name),
+        (DebitNote,         DebitNote.party_name),
+        (DebtorOutstanding, DebtorOutstanding.party_name),
+    ):
+        filters = [
+            model.company_name == company_name,
+            col_attr           == old_name,
+        ]
+        # Voucher tables have is_deleted; DebtorOutstanding is always fresh (no flag)
+        if hasattr(model, 'is_deleted'):
+            filters.append(model.is_deleted == 'No')
+
+        count = (
+            db.query(model)
+            .filter(*filters)
+            .update({'party_name': new_name}, synchronize_session='fetch')
+        )
+        if count:
+            logger.info(
+                f"[{company_name}] ledger rename cascade | "
+                f"{model.__tablename__}.party_name | "
+                f"'{old_name}' → '{new_name}' | rows={count}"
+            )
+        total += count
+
+    # ── Tables with ledger_name ───────────────────────────────────────────────
+    # Ledger vouchers store ALL entry ledger names (party + non-party) here.
+    # TrialBalance stores each ledger as its own row keyed by ledger_name.
+    for model, col_attr in (
+        (ReceiptVoucher, ReceiptVoucher.ledger_name),
+        (PaymentVoucher, PaymentVoucher.ledger_name),
+        (JournalVoucher, JournalVoucher.ledger_name),
+        (ContraVoucher,  ContraVoucher.ledger_name),
+        (TrialBalance,   TrialBalance.ledger_name),
+    ):
+        filters = [
+            model.company_name == company_name,
+            col_attr           == old_name,
+        ]
+        if hasattr(model, 'is_deleted'):
+            filters.append(model.is_deleted == 'No')
+
+        count = (
+            db.query(model)
+            .filter(*filters)
+            .update({'ledger_name': new_name}, synchronize_session='fetch')
+        )
+        if count:
+            logger.info(
+                f"[{company_name}] ledger rename cascade | "
+                f"{model.__tablename__}.ledger_name | "
+                f"'{old_name}' → '{new_name}' | rows={count}"
+            )
+        total += count
+
+    return total
+
+
+def _propagate_item_rename(
+    db,
+    company_name: str,
+    old_name:     str,
+    new_name:     str,
+) -> int:
+    """
+    Cascade a stock item rename to every inventory voucher table that stores
+    item_name as plain text.
+
+    Called INSIDE the upsert_items session — atomic with the Item master update.
+
+    Column mapping:
+      item_name → SalesVoucher, PurchaseVoucher, CreditNote, DebitNote
+    """
+    total = 0
+    for model in (SalesVoucher, PurchaseVoucher, CreditNote, DebitNote):
+        count = (
+            db.query(model)
+            .filter(
+                model.company_name == company_name,
+                model.item_name    == old_name,
+                model.is_deleted   == 'No',
+            )
+            .update({'item_name': new_name}, synchronize_session='fetch')
+        )
+        if count:
+            logger.info(
+                f"[{company_name}] item rename cascade | "
+                f"{model.__tablename__}.item_name | "
+                f"'{old_name}' → '{new_name}' | rows={count}"
+            )
+        total += count
+    return total
+
+
 def upsert_items(rows, engine):
     """
     Upsert StockItem master rows.
@@ -854,14 +990,39 @@ def upsert_items(rows, engine):
             ).first()
 
             if existing:
-                new_alter_id = int(safe['alter_id'])
-                old_alter_id = int(existing.alter_id or 0)
+                new_alter_id     = int(safe['alter_id'])
+                old_alter_id     = int(existing.alter_id or 0)
                 incoming_deleted = safe.get('is_deleted') == 'Yes'
+
+                # ── Rename cascade (checked ALWAYS, independent of alter_id) ──
+                # Tally does not always advance alter_id on a rename.  We check
+                # every time the item row is seen so no rename is ever missed.
+                old_item_name = existing.item_name
+                new_item_name = safe.get('item_name', '')
+                name_changed = (
+                    old_item_name
+                    and new_item_name
+                    and old_item_name != new_item_name
+                    and not incoming_deleted
+                )
+                if name_changed:
+                    renamed = _propagate_item_rename(
+                        db           = db,
+                        company_name = safe['company_name'],
+                        old_name     = old_item_name,
+                        new_name     = new_item_name,
+                    )
+                    logger.info(
+                        f"[{safe['company_name']}] Item rename detected | "
+                        f"guid={safe['guid']} | "
+                        f"'{old_item_name}' → '{new_item_name}' | "
+                        f"voucher rows updated={renamed}"
+                    )
 
                 # FIX: always apply delete flag even if alter_id hasn't advanced,
                 # because Tally CDC can sometimes return is_deleted=Yes with the
                 # same alter_id as before (race condition in Tally's CDC response).
-                if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes'):
+                if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes') or name_changed:
                     _log_changes(
                         "item UPDATE", existing,
                         [f for f in safe if f not in ('guid', 'company_name')],
@@ -1043,8 +1204,33 @@ def upsert_ledgers(rows, engine):
                 old_alter_id     = int(existing.alter_id or 0)
                 incoming_deleted = safe.get('is_deleted') == 'Yes'
 
+                # ── Rename cascade (checked ALWAYS, independent of alter_id) ──
+                # Tally does not always advance alter_id on a rename.  We check
+                # every time the ledger row is seen so no rename is ever missed.
+                old_ledger_name = existing.ledger_name
+                new_ledger_name = safe.get('ledger_name', '')
+                name_changed = (
+                    old_ledger_name
+                    and new_ledger_name
+                    and old_ledger_name != new_ledger_name
+                    and not incoming_deleted
+                )
+                if name_changed:
+                    renamed = _propagate_ledger_rename(
+                        db           = db,
+                        company_name = safe['company_name'],
+                        old_name     = old_ledger_name,
+                        new_name     = new_ledger_name,
+                    )
+                    logger.info(
+                        f"[{safe['company_name']}] Ledger rename detected | "
+                        f"guid={safe['guid']} | "
+                        f"'{old_ledger_name}' → '{new_ledger_name}' | "
+                        f"voucher rows updated={renamed}"
+                    )
+
                 # FIX: force-update is_deleted flag even if alter_id unchanged
-                if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes'):
+                if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes') or name_changed:
                     _log_changes("ledger UPDATE", existing, [f for f in safe if f not in ('guid', 'company_name')], safe)
                     for field, value in safe.items():
                         if field not in ('guid', 'company_name'):
