@@ -218,7 +218,7 @@ class GlobalConfigDialog(tk.Toplevel):
             font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
         ).pack(anchor="w")
 
-        # ── Company picker ────────────────────────────────────────────────────
+        # ── Company picker section header ─────────────────────────────────────
         tk.Frame(root, bg=Color.BORDER, height=1).pack(fill="x", pady=(14, 0))
         self._add_section(root, "Apply To")
 
@@ -251,7 +251,40 @@ class GlobalConfigDialog(tk.Toplevel):
         )
         self._count_lbl.pack(side="right")
 
-        # Scrollable company list
+        # ── Buttons + Feedback pinned at bottom ───────────────────────────────
+        # IMPORTANT: pack side="bottom" widgets BEFORE the expand=True list
+        # widget, otherwise the list claims all remaining space and the buttons
+        # get pushed out of view.
+        tk.Frame(root, bg=Color.BORDER, height=1).pack(side="bottom", fill="x")
+
+        btn_row = tk.Frame(root, bg=Color.BG_CARD)
+        btn_row.pack(side="bottom", fill="x")
+
+        tk.Button(
+            btn_row, text="Cancel",
+            font=Font.BUTTON_SM, bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
+            relief="solid", bd=1, padx=14, pady=5, cursor="hand2",
+            command=self.destroy,
+        ).pack(side="right", padx=(8, 8), pady=10)
+
+        tk.Button(
+            btn_row, text="✓  Apply to Selected",
+            font=Font.BUTTON_SM, bg=Color.PRIMARY, fg=Color.TEXT_WHITE,
+            relief="flat", bd=0, padx=16, pady=5, cursor="hand2",
+            command=self._on_apply,
+        ).pack(side="right", pady=10)
+
+        # Feedback label sits on left side of the same button bar row
+        self._feedback = tk.Label(
+            btn_row, text="",
+            font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.DANGER,
+            wraplength=380, justify="left",
+        )
+        self._feedback.pack(side="left", padx=(8, 0), pady=10)
+
+        # ── Scrollable company list ───────────────────────────────────────────
+        # Packed LAST so expand=True only fills the remaining space above the
+        # already-reserved button row.
         list_border = tk.Frame(
             root, bg=Color.BG_CARD,
             highlightthickness=1, highlightbackground=Color.BORDER,
@@ -284,34 +317,6 @@ class GlobalConfigDialog(tk.Toplevel):
 
         self._company_vars: dict[str, tk.BooleanVar] = {}
         self._rebuild_company_list()
-
-        # ── Feedback ──────────────────────────────────────────────────────────
-        self._feedback = tk.Label(
-            root, text="",
-            font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.DANGER,
-            wraplength=520, justify="left",
-        )
-        self._feedback.pack(anchor="w", pady=(8, 0))
-
-        # ── Buttons ───────────────────────────────────────────────────────────
-        tk.Frame(root, bg=Color.BORDER, height=1).pack(fill="x", pady=(10, 0))
-
-        btn_row = tk.Frame(root, bg=Color.BG_CARD)
-        btn_row.pack(fill="x", pady=(12, 0))
-
-        tk.Button(
-            btn_row, text="Cancel",
-            font=Font.BUTTON_SM, bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
-            relief="solid", bd=1, padx=14, pady=5, cursor="hand2",
-            command=self.destroy,
-        ).pack(side="right", padx=(8, 0))
-
-        tk.Button(
-            btn_row, text="✓  Apply to Selected",
-            font=Font.BUTTON_SM, bg=Color.PRIMARY, fg=Color.TEXT_WHITE,
-            relief="flat", bd=0, padx=16, pady=5, cursor="hand2",
-            command=self._on_apply,
-        ).pack(side="right")
 
     # ─────────────────────────────────────────────────────────────────────────
     def _add_section(self, parent, text: str):
@@ -418,9 +423,9 @@ class GlobalConfigDialog(tk.Toplevel):
                 except Exception:
                     pass
 
-        _set_frame_state(self._creds_frame,     self._apply_creds_var.get())
-        _set_frame_state(self._host_port_frame,  self._apply_host_port_var.get())
-        _set_frame_state(self._type_frame,       self._apply_type_var.get())
+        _set_frame_state(self._creds_frame,      self._apply_creds_var.get())
+        _set_frame_state(self._host_port_frame,   self._apply_host_port_var.get())
+        _set_frame_state(self._type_frame,        self._apply_type_var.get())
 
     def _toggle_pw(self):
         show = self._show_pw_var.get()
@@ -428,8 +433,9 @@ class GlobalConfigDialog(tk.Toplevel):
 
     # ─────────────────────────────────────────────────────────────────────────
     def _on_apply(self):
-        apply_creds = self._apply_creds_var.get()
-        apply_type  = self._apply_type_var.get()
+        apply_creds     = self._apply_creds_var.get()
+        apply_host_port = self._apply_host_port_var.get()
+        apply_type      = self._apply_type_var.get()
 
         if not apply_creds and not apply_host_port and not apply_type:
             self._feedback.configure(
