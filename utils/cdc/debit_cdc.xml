@@ -19,6 +19,7 @@
                         <TYPE>Voucher</TYPE>
                         <CHILDOF>$$VchTypeDebitNote</CHILDOF>
                         <FILTER>AlterIdFilter</FILTER>
+                        <FILTER>IsDebitNoteFilter</FILTER>
 
                         <FETCH>GUID</FETCH>
                         <FETCH>ALTERID</FETCH>
@@ -26,17 +27,17 @@
                         <FETCH>VOUCHERNUMBER</FETCH>
                         <FETCH>VOUCHERTYPENAME</FETCH>
                         <FETCH>DATE</FETCH>
-                        <FETCH>PARTYNAME</FETCH>
                         <FETCH>REFERENCE</FETCH>
                         <FETCH>NARRATION</FETCH>
+                        <FETCH>PARTYNAME</FETCH>
                         <FETCH>PARTYGSTIN</FETCH>
                         <FETCH>IRNACKNO</FETCH>
                         <FETCH>TEMPGSTEWAYBILLNUMBER</FETCH>
                         <FETCH>ISDELETED</FETCH>
-
                         <!-- Ledger Entry Fields -->
                         <FETCH>ALLLEDGERENTRIES.LEDGERNAME</FETCH>
                         <FETCH>ALLLEDGERENTRIES.AMOUNT</FETCH>
+                        <FETCH>ALLLEDGERENTRIES.ISPARTYLEDGER</FETCH>
 
                         <!-- Inventory Entry Fields -->
                         <FETCH>ALLINVENTORYENTRIES.STOCKITEMNAME</FETCH>
@@ -55,7 +56,10 @@
                         <FETCH>ALLINVENTORYENTRIES.ACCOUNTINGALLOCATIONS.GSTHSNSACCODE</FETCH>
                     </COLLECTION>
                     <SYSTEM TYPE="Formulae" NAME="AlterIdFilter">
-                        $ALTERID > PLACEHOLDER_ALTER_ID
+                        $ALTERID &gt; PLACEHOLDER_ALTER_ID
+                    </SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="IsDebitNoteFilter">
+                        $$IsDebitNote:$VoucherTypeName
                     </SYSTEM>
                 </TDLMESSAGE>
             </TDL>

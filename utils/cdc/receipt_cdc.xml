@@ -19,6 +19,7 @@
                         <TYPE>Voucher</TYPE>
                         <CHILDOF>$$VchTypeReceipt</CHILDOF>
                         <FILTER>AlterIdFilter</FILTER>
+                        <FILTER>IsReceiptFilter</FILTER>
 
                         <FETCH>GUID</FETCH>
                         <FETCH>ALTERID</FETCH>
@@ -28,13 +29,15 @@
                         <FETCH>DATE</FETCH>
                         <FETCH>REFERENCE</FETCH>
                         <FETCH>NARRATION</FETCH>
-
+                        <!-- Ledger Entry Fields -->
                         <FETCH>ALLLEDGERENTRIES.LEDGERNAME</FETCH>
                         <FETCH>ALLLEDGERENTRIES.AMOUNT</FETCH>
                     </COLLECTION>
-                    
                     <SYSTEM TYPE="Formulae" NAME="AlterIdFilter">
-                        $ALTERID > PLACEHOLDER_ALTER_ID
+                        $ALTERID &gt; PLACEHOLDER_ALTER_ID
+                    </SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="IsReceiptFilter">
+                        $$IsReceipt:$VoucherTypeName
                     </SYSTEM>
                 </TDLMESSAGE>
             </TDL>
