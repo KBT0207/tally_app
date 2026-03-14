@@ -363,6 +363,7 @@ class TallyConnector:
             sanitized = self.sanitize_xml(response.content)
             root      = ET.fromstring(sanitized)
             companies = [self._parse_company(c) for c in root.findall('.//COMPANY')]
+            companies = [c for c in companies if c.get('guid') and c.get('name')]
             logger.info(f'Found {len(companies)} companies in Tally')
             return companies
 
@@ -373,15 +374,14 @@ class TallyConnector:
     @staticmethod
     def _parse_company(company: ET.Element) -> Dict[str, Any]:
         return {
-            'guid'          : company.findtext('GUID', '').strip(),
-            'name'          : company.findtext('NAME', '').strip(),
-            'formal_name'   : company.findtext('BASICCOMPANYFORMALNAME', '').strip(),
-            'company_number': company.findtext('COMPANYNUMBER', '').strip(),
-            'starting_from' : company.findtext('STARTINGFROM', '').strip(),
-            'books_from'    : company.findtext('BOOKSFROM', '').strip(),
-            'audited_upto'  : company.findtext('AUDITEDUPTO', '').strip(),
-    }
-
+            'guid'          : (company.findtext('GUID',                   '') or '').strip(),
+            'name'          : (company.findtext('NAME',                   '') or '').strip(),
+            'formal_name'   : (company.findtext('BASICCOMPANYFORMALNAME', '') or '').strip(),
+            'company_number': (company.findtext('COMPANYNUMBER',          '') or '').strip(),
+            'starting_from' : (company.findtext('STARTINGFROM',           '') or '').strip(),
+            'books_from'    : (company.findtext('BOOKSFROM',              '') or '').strip(),
+            'audited_upto'  : (company.findtext('AUDITEDUPTO',            '') or '').strip(),
+        }
     # ── Master fetches ────────────────────────────────────────────────────────
 
     def fetch_ledgers(

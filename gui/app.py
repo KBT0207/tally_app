@@ -740,6 +740,18 @@ class TallySyncApp:
             )
             if tally.status == "Connected":
                 tally_companies = tally.fetch_all_companies()
+
+                # ── Save company master fields to DB (formal_name, company_number, audited_upto) ──
+                if tally_companies and engine:
+                    try:
+                        from database.database_processor import company_import_db
+                        company_import_db(tally_companies, engine)
+                        from logging_config import logger
+                        logger.info(f"[App] company_import_db: saved {len(tally_companies)} companies")
+                    except Exception as _e:
+                        from logging_config import logger
+                        logger.warning(f"[App] company_import_db failed: {_e}")
+
         except Exception as e:
             from logging_config import logger
             logger.warning(f"[App] Could not fetch Tally company list: {e}")
