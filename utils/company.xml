@@ -12,7 +12,13 @@
                     <COLLECTION NAME="DetailedCompanyList">
                         <TYPE>Company</TYPE>
                         <FETCH>
-                            *
+                            GUID,
+                            NAME,
+                            BASICCOMPANYFORMALNAME,
+                            COMPANYNUMBER,
+                            STARTINGFROM,
+                            BOOKSFROM,
+                            AUDITEDUPTO
                         </FETCH>
                     </COLLECTION>
                 </TDLMESSAGE>
