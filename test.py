@@ -15,29 +15,31 @@ tally = TallyConnector()
 
 
 
-companies = tally.fetch_all_companies()
+companies = tally.fetch_all_companies(debug=True)
+df = pd.DataFrame(companies)
+xw.view(df)
 
 
-for c in companies:
+# for c in companies:
 
-    name = c.get("name")
+#     name = c.get("name")
 
-    if not name:
-        continue
+#     if not name:
+#         continue
 
-    print("Fetching:", name)
+#     print("Fetching:", name)
 
-    xml_data = tally.fetch_purchase_cdc(
-        name,
-        last_alter_id=467,
-        debug=True
-    )
+#     xml_data = tally.fetch_purchase_cdc(
+#         name,
+#         last_alter_id=467,
+#         debug=True
+#     )
 
-    rec = parse_inventory_voucher(
-        xml_content=xml_data,
-        company_name=name
-    )
+#     rec = parse_inventory_voucher(
+#         xml_content=xml_data,
+#         company_name=name
+#     )
 
  
-    df = pd.DataFrame(rec)
-    xw.view(df)
+    # df = pd.DataFrame(rec)
+    # xw.view(df)

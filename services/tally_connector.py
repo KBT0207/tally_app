@@ -373,14 +373,14 @@ class TallyConnector:
     @staticmethod
     def _parse_company(company: ET.Element) -> Dict[str, Any]:
         return {
-            'guid'          : company.findtext('GUID',                   ''),
-            'name'          : company.findtext('NAME',                   ''),
-            'formal_name'   : company.findtext('BASICCOMPANYFORMALNAME', ''),
-            'company_number': company.findtext('COMPANYNUMBER',          ''),
-            'starting_from' : company.findtext('STARTINGFROM',           ''),
-            'books_from'    : company.findtext('BOOKSFROM',              ''),
-            'audited_upto'  : company.findtext('AUDITEDUPTO',            ''),
-        }
+            'guid'          : company.findtext('GUID', '').strip(),
+            'name'          : company.findtext('NAME', '').strip(),
+            'formal_name'   : company.findtext('BASICCOMPANYFORMALNAME', '').strip(),
+            'company_number': company.findtext('COMPANYNUMBER', '').strip(),
+            'starting_from' : company.findtext('STARTINGFROM', '').strip(),
+            'books_from'    : company.findtext('BOOKSFROM', '').strip(),
+            'audited_upto'  : company.findtext('AUDITEDUPTO', '').strip(),
+    }
 
     # ── Master fetches ────────────────────────────────────────────────────────
 
