@@ -113,7 +113,20 @@ def parse_expiry_date(exp_date_text):
 # Currency symbols Tally uses in FCY strings
 _CURRENCY_SYMBOLS = r'[\$€£¥₹₨₩₱₽₺₪₦฿₫]'
 
-# Map of symbol → ISO code
+# Compound dollar prefixes Tally prints for dollar-denominated currencies.
+# MUST be checked BEFORE the bare '$' entry in _SYMBOL_TO_ISO, otherwise
+# "AU$28.00" is misdetected as USD.
+_COMPOUND_DOLLAR_SYMBOLS = [
+    ('AU$', 'AUD'),   # Australian Dollar  - "AU$28.00"
+    ('NZ$', 'NZD'),   # New Zealand Dollar - "NZ$50.00"
+    ('HK$', 'HKD'),   # Hong Kong Dollar   - "HK$100.00"
+    ('SG$', 'SGD'),   # Singapore Dollar   - "SG$75.00"
+    ('CA$', 'CAD'),   # Canadian Dollar    - "CA$50.00" (alternate Tally format)
+]
+_COMPOUND_DOLLAR_PATTERN = r'(' + '|'.join(re.escape(s) for s, _ in _COMPOUND_DOLLAR_SYMBOLS) + r')'
+_COMPOUND_DOLLAR_MAP = {sym: iso for sym, iso in _COMPOUND_DOLLAR_SYMBOLS}
+
+# Map of symbol -> ISO code  (bare $ is USD -- checked AFTER compound symbols)
 _SYMBOL_TO_ISO = {
     '$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY',
     '₹': 'INR', '₨': 'INR', '₩': 'KRW', '₱': 'PHP',
@@ -121,14 +134,49 @@ _SYMBOL_TO_ISO = {
     '฿': 'THB', '₫': 'VND',
 }
 
+# ISO text codes Tally prints as prefixes when no symbol is defined
+# e.g. "CAD50.00 = ? 47.93/box"  or  "CAD350.00 @ ? 0.9585/CAD = ? 335.48"
+_ISO_TEXT_CODES = [
+    'CAD', 'AUD', 'NZD', 'SGD', 'HKD', 'CHF', 'SEK', 'NOK', 'DKK',
+    'MYR', 'IDR', 'AED', 'SAR', 'QAR', 'KWD', 'BHD', 'OMR',
+    'ZAR', 'EGP', 'PKR', 'BDT', 'LKR', 'NPR', 'MMK', 'KES',
+    'CNY', 'CNH', 'TWD', 'MXN', 'BRL', 'ARS', 'CLP', 'COP',
+    'EUR', 'GBP', 'JPY', 'USD',   # also listed here for text-prefix fallback
+]
+# Build a regex that matches an ISO code even when immediately followed by digits
+# (e.g. "CAD50.00") but NOT when preceded by a word char (e.g. avoids "CANADA").
+# The lookahead (?=[\d\s\-]) matches: "CAD50", "CAD 50", "CAD-50", "/CAD "
+_ISO_TEXT_PATTERN = r'(?<!\w)(' + '|'.join(_ISO_TEXT_CODES) + r')(?=[\d\s\-/])'
+
 
 def _detect_currency(text: str) -> str:
-    """Return ISO currency code from a Tally amount/rate string. Defaults to INR."""
+    """
+    Return ISO currency code from a Tally amount/rate string. Defaults to INR.
+
+    Detection order (most-specific first to avoid false matches):
+      1. Compound dollar prefixes: AU$, NZ$, HK$, SG$, CA$  -> AUD, NZD, HKD, SGD, CAD
+      2. Single-char symbols: $->USD, EUR, GBP, etc.
+      3. ISO text-code prefix: "CAD50.00", "SGD 50"
+      4. ISO text-code denominator: "? 0.9585/CAD"
+    """
     if not text:
         return 'INR'
+    # 1. Compound dollar symbols (must be before bare '$' check)
+    for sym, iso in _COMPOUND_DOLLAR_SYMBOLS:
+        if sym in text:
+            return iso
+    # 2. Single-char symbol match
     for sym, iso in _SYMBOL_TO_ISO.items():
         if sym in text and iso != 'INR':
             return iso
+    # 3. ISO text-code as prefix: "CAD50.00" or "CAD 50"
+    m = re.search(_ISO_TEXT_PATTERN, text)
+    if m:
+        return m.group(1)
+    # 4. ISO text-code as denominator: "? 0.9585/CAD"
+    m = re.search(r'/(' + '|'.join(_ISO_TEXT_CODES) + r')\b', text)
+    if m and m.group(1) != 'INR':
+        return m.group(1)
     return 'INR'
 
 
@@ -141,30 +189,41 @@ def _parse_fcy_rate(raw: str) -> float:
       "$14.00 = ? 1/$ = ? 14.00/box"   → 14.0  (exchange rate = 1)
       "$14.00 = ? 84.5/$ = ? 1183/box" → 14.0  (exchange rate = 84.5, home = 1183)
       "14.00/box"                       → 14.0  (plain INR rate)
+      "CAD50.00 = ? 47.93/box"          → 50.0  (CAD text-prefix format)
 
     BUG FIXED: The old regex r'(-?[\d,]+\.?\d*)\s*/\s*\w' matched "1183/box" on
     FCY strings like "$14.00 = ? 84.5/$ = ? 1183/box", returning the INR
     home-rate (1183) instead of the correct FCY per-unit rate ($14.00).
-    Root cause: \w skips '$' (not a word char), so the regex found the last
-    /alphabetic match instead of the first /currency match.
 
     Fix strategy:
-      1. FCY  → take the number immediately after the currency symbol ($14.00 → 14.0)
-      2. INR  → take the number immediately before /alphabetic-unit (14.00/box → 14.0)
-      3. Fallback → first number in string
+      1. FCY symbol  → take the number immediately after the currency symbol ($14.00 → 14.0)
+      2. FCY ISO text→ take the number immediately after the ISO code (CAD50.00 → 50.0)
+      3. INR         → take the number immediately before /alphabetic-unit (14.00/box → 14.0)
+      4. Fallback    → first number in string
     """
     if not raw:
         return 0.0
     raw = str(raw).strip()
 
-    # Step 1: FCY — number immediately after currency symbol
-    #   "$14.00 = ? 84.5/$ = ? 1183/box"  →  grabs 14.0  ✓
-    #   "$14.00/box"                        →  grabs 14.0  ✓
+    # Step 1a: Compound dollar symbol (AU$, NZ$, HK$, SG$, CA$) — check BEFORE bare $
+    #   "AU$28.00 = ? 28.00/box"  ->  28.0  (AUD)
+    m = re.search(_COMPOUND_DOLLAR_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
+    if m:
+        return abs(convert_to_float(m.group(2)))
+
+    # Step 1b: Single-char FCY symbol -- number immediately after symbol
+    #   "$14.00 = ? 84.5/$ = ? 1183/box"  ->  14.0  (USD)
     m = re.search(_CURRENCY_SYMBOLS + r'\s*([\d,]+\.?\d*)', raw)
     if m:
         return abs(convert_to_float(m.group(1)))
 
-    # Step 2: INR — number immediately before /alphabetic-unit
+    # Step 2: FCY ISO text-prefix — number immediately after code
+    #   "CAD50.00 = ? 47.93/box"  →  grabs 50.0  ✓
+    m = re.search(_ISO_TEXT_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
+    if m:
+        return abs(convert_to_float(m.group(2)))
+
+    # Step 3: INR — number immediately before /alphabetic-unit
     #   "14.00/box"  →  14.0  ✓
     m = re.search(r'([\d,]+\.?\d*)\s*/\s*[a-zA-Z]', raw)
     if m:
@@ -183,18 +242,30 @@ def _parse_fcy_amount(raw: str) -> float:
     Extract the FCY (foreign currency) amount from a Tally AMOUNT field.
     Always returns an absolute value — sign is handled by the caller.
 
-    "$61600.00 @ ? 1/$ = ? 61600.00"    → 61600.0
-    "-$61600.00 @ ? 1/$ = -? 61600.00"  → 61600.0
-    "61600.00"                           → 61600.0
+    "$61600.00 @ ? 1/$ = ? 61600.00"       → 61600.0
+    "-$61600.00 @ ? 1/$ = -? 61600.00"     → 61600.0
+    "CAD350.00 @ ? 0.9585/CAD = ? 335.48"  → 350.0  (CAD text-prefix format)
+    "61600.00"                              → 61600.0
     """
     if not raw:
         return 0.0
     raw = str(raw).strip()
 
-    # First number after optional '-' and optional currency symbol
-    m = re.search(r'-?\s*' + _CURRENCY_SYMBOLS + r'?\s*([\d,]+\.?\d*)', raw)
+    # Compound dollar symbol: -?AU$<number>
+    #   "AU$16800.00 @ ? 1/AU$ = ? 16800.00"  ->  16800.0
+    m = re.search(r'-?\s*' + _COMPOUND_DOLLAR_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
+    if m:
+        return abs(convert_to_float(m.group(2)))
+
+    # Single-char symbol-prefixed FCY: -?<symbol><number>
+    m = re.search(r'-?\s*' + _CURRENCY_SYMBOLS + r'\s*([\d,]+\.?\d*)', raw)
     if m:
         return abs(convert_to_float(m.group(1)))
+
+    # ISO text-prefix FCY: -?<CODE><number>  e.g. "CAD350.00" or "-CAD350.00"
+    m = re.search(r'-?\s*' + _ISO_TEXT_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
+    if m:
+        return abs(convert_to_float(m.group(2)))
 
     # Fallback: just first number
     m = re.search(r'([\d,]+\.?\d*)', raw)
@@ -208,15 +279,27 @@ def _parse_fcy_exchange_rate(raw_amount: str) -> float:
     """
     Extract exchange rate embedded in Tally FCY amount/rate string.
 
-    "$61600.00 @ ? 1/$ = ? 61600.00"       → 1.0
-    "$615.00 @ ? 84.5/$ = ? 51997.50"      → 84.5
-    "$14.00 = ? 84.5/$ = ? 1183/box"       → 84.5
+    "$61600.00 @ ? 1/$ = ? 61600.00"           → 1.0
+    "$615.00 @ ? 84.5/$ = ? 51997.50"          → 84.5
+    "$14.00 = ? 84.5/$ = ? 1183/box"           → 84.5
+    "CAD350.00 @ ? 0.9585/CAD = ? 335.48"      → 0.9585  (ISO text-code denominator)
+    "CAD50.00 = ? 47.93/box"                   → 1.0     (no /CODE pattern → default)
     Returns 1.0 if not found.
     """
     if not raw_amount:
         return 1.0
-    # Pattern: ? <number>/<currency-symbol>
+    # Pattern 1a: ? <number>/<compound-dollar>  e.g.  ? 1/AU$
+    m = re.search(r'\?\s*([\d,]+\.?\d*)\s*/' + _COMPOUND_DOLLAR_PATTERN, raw_amount)
+    if m:
+        rate = convert_to_float(m.group(1))
+        return rate if rate > 0 else 1.0
+    # Pattern 1b: ? <number>/<single-symbol>    e.g.  ? 84.5/$
     m = re.search(r'\?\s*([\d,]+\.?\d*)\s*/' + _CURRENCY_SYMBOLS, raw_amount)
+    if m:
+        rate = convert_to_float(m.group(1))
+        return rate if rate > 0 else 1.0
+    # Pattern 2: ? <number>/<ISO-code>           e.g.  ? 0.9585/CAD
+    m = re.search(r'\?\s*([\d,]+\.?\d*)\s*/' + _ISO_TEXT_PATTERN, raw_amount)
     if m:
         rate = convert_to_float(m.group(1))
         return rate if rate > 0 else 1.0
@@ -224,12 +307,19 @@ def _parse_fcy_exchange_rate(raw_amount: str) -> float:
 
 
 def _is_fcy_string(text: str) -> bool:
-    """True if the text contains a foreign-currency symbol (not INR/?)."""
+    """True if the text contains a foreign-currency symbol or ISO text code (not INR)."""
     if not text:
         return False
+    # Compound dollar symbols first (AU$, NZ$, etc.)
+    for sym in _COMPOUND_DOLLAR_MAP:
+        if sym in text:
+            return True
     for sym in _SYMBOL_TO_ISO:
         if sym in text and _SYMBOL_TO_ISO[sym] != 'INR':
             return True
+    m = re.search(_ISO_TEXT_PATTERN, text)
+    if m and m.group(1) not in ('INR',):
+        return True
     return False
 
 
@@ -1251,7 +1341,12 @@ def parse_outstanding_debtors(xml_content, company_name: str, material_centre: s
                 bd      = clean_text(le.findtext('BILLDATE',      ''))
 
                 if isparty == 'Yes' and le_name == party:
-                    amount        = abs(_parse_fcy_amount(amt_raw))
+                    # FIX: preserve sign — negative = money owed TO us (receivable),
+                    # positive = credit note / overpayment.  Do NOT use abs() here.
+                    raw_str       = str(amt_raw).strip()
+                    is_negative   = raw_str.startswith('-')
+                    parsed_amount = _parse_fcy_amount(amt_raw)   # always positive magnitude
+                    amount        = -parsed_amount if is_negative else parsed_amount
                     exchange_rate = _parse_fcy_exchange_rate(amt_raw)
                     currency      = _detect_currency(amt_raw)
                     if bn:
@@ -1263,20 +1358,20 @@ def parse_outstanding_debtors(xml_content, company_name: str, material_centre: s
                     break
 
             all_rows.append({
-                'company_name'  : company_name,
-                'party_name'    : party,
-                'voucher_number': vnum,
-                'voucher_type'  : vtype,
-                'bill_name'     : bill_name,
-                'bill_type'     : bill_type,
-                'date'          : txn_date,
-                'bill_date'     : bill_date,
-                'due_date'      : due_date,
-                'reference'     : ref,
-                'currency'      : currency,
-                'exchange_rate' : exchange_rate,
-                'amount'        : amount,
-                'narration'     : narr,
+                'company_name'   : company_name,
+                'party_name'     : party,
+                'voucher_number' : vnum,
+                'voucher_type'   : vtype,
+                'bill_name'      : bill_name,
+                'bill_type'      : bill_type,
+                'date'           : txn_date,
+                'bill_date'      : bill_date,
+                'due_date'       : due_date,
+                'reference'      : ref,
+                'currency'       : currency,
+                'exchange_rate'  : exchange_rate,
+                'amount'         : amount,
+                'narration'      : narr,
                 'material_centre': material_centre,
             })
 
@@ -1287,7 +1382,6 @@ def parse_outstanding_debtors(xml_content, company_name: str, material_centre: s
         logger.error(f"Error parsing outstanding debtors [{company_name}]: {e}")
         logger.error(traceback.format_exc())
         return []
-
 # ──────────────────────────────────────────────────────────────────────────────
 # GUID reconciliation parser  (Phase 3)
 # ──────────────────────────────────────────────────────────────────────────────
