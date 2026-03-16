@@ -1,10 +1,9 @@
-<?xml version="1.0" encoding="utf-8"?>
 <ENVELOPE>
     <HEADER>
         <VERSION>1</VERSION>
         <TALLYREQUEST>Export</TALLYREQUEST>
         <TYPE>Collection</TYPE>
-        <ID>StockItemCDC</ID>
+        <ID>IncrementalStockItems</ID>
     </HEADER>
     <BODY>
         <DESC>
@@ -14,25 +13,26 @@
             </STATICVARIABLES>
             <TDL>
                 <TDLMESSAGE>
-                    <COLLECTION NAME="StockItemCDC">
+                    <COLLECTION NAME="IncrementalStockItems" ISMODIFY="No">
                         <TYPE>StockItem</TYPE>
+                        <FILTER>AlterIdFilter</FILTER>
+
+                        <FETCH>GUID</FETCH>
+                        <FETCH>ALTERID</FETCH>
+                        <FETCH>REMOTEALTGUID</FETCH>
                         <FETCH>NAME</FETCH>
-                        <FETCH>BASEUNITS</FETCH>
                         <FETCH>PARENT</FETCH>
                         <FETCH>CATEGORY</FETCH>
+                        <FETCH>BASEUNITS</FETCH>
                         <FETCH>GSTTYPEOFSUPPLY</FETCH>
-                        <FETCH>OPENINGVALUE</FETCH>
                         <FETCH>OPENINGBALANCE</FETCH>
                         <FETCH>OPENINGRATE</FETCH>
+                        <FETCH>OPENINGVALUE</FETCH>
                         <FETCH>ENTEREDBY</FETCH>
-                        <FETCH>ALTERID</FETCH>
-                        <FETCH>GUID</FETCH>
-                        <FETCH>REMOTEALTGUID</FETCH>
                         <FETCH>ISDELETED</FETCH>
-                        <FILTER>StockItemCDCFilter</FILTER>
                     </COLLECTION>
-                    <SYSTEM TYPE="Formulae" NAME="StockItemCDCFilter">
-                        $$IsNumeric:$ALTERID AND $$Number:$ALTERID > PLACEHOLDER_ALTER_ID
+                    <SYSTEM TYPE="Formulae" NAME="AlterIdFilter">
+                        $ALTERID > PLACEHOLDER_ALTER_ID
                     </SYSTEM>
                 </TDLMESSAGE>
             </TDL>

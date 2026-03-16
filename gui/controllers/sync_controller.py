@@ -322,7 +322,8 @@ class SyncController:
         co = self._state.get_company(name)
         if co:
             return {
-                "name":          co.name,
-                "starting_from": co.starting_from or "20240401",
+                "name":           co.name,
+                "starting_from":  co.starting_from or "20240401",
+                "material_centre": getattr(co, 'material_centre', '') or '',
             }
-        return {"name": name, "starting_from": "20240401"}
+        return {"name": name, "starting_from": "20240401", "material_centre": ""}

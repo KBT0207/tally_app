@@ -27,6 +27,7 @@
                         <FETCH>ENTEREDBY</FETCH>
                         <FETCH>GUID</FETCH>
                         <FETCH>REMOTEALTGUID</FETCH>
+                        <FETCH>ALTERID</FETCH>
                         <FETCH>ISDELETED</FETCH>
                     </COLLECTION>
                 </TDLMESSAGE>

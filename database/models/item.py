@@ -29,6 +29,7 @@ class Item(Base):
     # ── Audit / soft-delete ──────────────────────────────────────────────────
     entered_by        = Column(String(255),  nullable=False, default='')
     is_deleted        = Column(String(10),   nullable=False, default='No')
+    material_centre   = Column(String(255),  nullable=True)
 
     # ── CDC / change-tracking keys ───────────────────────────────────────────
     guid              = Column(String(100),  nullable=False, default='')

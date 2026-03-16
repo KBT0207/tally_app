@@ -108,6 +108,7 @@ def _insert_voucher_rows(rows, model_class, db, set_total_amt=True):
             master_id        = row.get('master_id'),
             change_status    = row.get('change_status'),
             is_deleted       = 'No',
+            material_centre  = row.get('material_centre', ''),
         ))
 
 
@@ -331,6 +332,7 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
                     master_id      = row.get('master_id'),
                     change_status  = row.get('change_status'),
                     is_deleted     = 'No',
+                    material_centre= row.get('material_centre', ''),
                 ))
             updated += len(group_rows)
         db.flush()   # ← new rows visible before phase 3
@@ -762,6 +764,7 @@ def upsert_trial_balance(rows, engine):
                 guid             = row.get('guid'),
                 alter_id         = row.get('alter_id', 0),
                 master_id        = row.get('master_id'),
+                material_centre  = row.get('material_centre', ''),
             ))
             inserted += 1
 
@@ -935,111 +938,164 @@ def upsert_items(rows, engine):
     """
     Upsert StockItem master rows.
 
-    FIX: CDC delete handling — when Tally marks an item is_deleted='Yes'
-    via CDC, the old code simply updated the is_deleted field to 'Yes'
-    (soft-delete via alter_id-gated field update).  This is correct for
-    items (we want to keep the item record for historical voucher display),
-    BUT the alter_id guard was preventing the update if somehow alter_id
-    hadn't advanced.  Now we force-update is_deleted='Yes' regardless of
-    alter_id when the incoming row says the item was deleted.
+    Strategy:
+      PHASE 1 — DELETE:  Hard delete rows marked is_deleted=Yes. Flush.
+      PHASE 2a — RENAME: item_name changed → rename cascade → delete old →
+                        flush → insert new → flush.
+      PHASE 2b — UPDATE: item_name unchanged, alter_id advanced → setattr
+                        in-place (safe: no UniqueConstraint conflict).
+      PHASE 3 — INSERT: Brand-new GUIDs.
     """
     if not rows:
         logger.warning("No rows to upsert for items")
         return
 
     db = _get_session(engine)
-    inserted = updated = unchanged = skipped = 0
-
-    update_fields = [
-        'item_name', 'parent_group', 'category',
-        'base_units', 'gst_type_of_supply',
-        'opening_balance', 'opening_rate', 'opening_value',
-        'entered_by', 'is_deleted',
-        'guid', 'remote_alt_guid', 'alter_id',
-    ]
-
-    def _safe(row):
-        return {
-            'company_name'       : _t(row.get('company_name'),        255),
-            'item_name'          : _t(row.get('item_name'),           500),
-            'parent_group'       : _t(row.get('parent_group'),        255),
-            'category'           : _t(row.get('category'),            255),
-            'base_units'         : _t(row.get('base_units'),          100),
-            'gst_type_of_supply' : _t(row.get('gst_type_of_supply'),  100),
-            'opening_balance'    : row.get('opening_balance',  0.0),
-            'opening_rate'       : row.get('opening_rate',     0.0),
-            'opening_value'      : row.get('opening_value',    0.0),
-            'entered_by'         : _t(row.get('entered_by'),          255),
-            'is_deleted'         : _t(row.get('is_deleted'),           10),
-            'guid'               : _t(row.get('guid'),                100),
-            'remote_alt_guid'    : _t(row.get('remote_alt_guid'),     100),
-            'alter_id'           : row.get('alter_id', 0),
-        }
+    inserted = updated = unchanged = skipped = deleted = 0
 
     try:
+        # ── Group by GUID (one master row per GUID) ────────────────────────────────────────────
+        groups: dict[str, dict] = {}
         for row in rows:
             if not row.get('guid'):
                 skipped += 1
                 continue
+            groups[row['guid']] = row
 
-            safe = _safe(row)
+        if not groups:
+            db.close()
+            return
 
-            existing = db.query(Item).filter_by(
-                guid         = safe['guid'],
-                company_name = safe['company_name'],
-            ).first()
+        all_companies = list({r.get('company_name', '') for r in groups.values()})
 
-            if existing:
-                new_alter_id     = int(safe['alter_id'])
-                old_alter_id     = int(existing.alter_id or 0)
-                incoming_deleted = safe.get('is_deleted') == 'Yes'
+        existing_map: dict[str, object] = {}
+        for rec in db.query(Item).filter(Item.company_name.in_(all_companies)).all():
+            existing_map[rec.guid] = rec
 
-                # ── Rename cascade (checked ALWAYS, independent of alter_id) ──
-                # Tally does not always advance alter_id on a rename.  We check
-                # every time the item row is seen so no rename is ever missed.
-                old_item_name = existing.item_name
-                new_item_name = safe.get('item_name', '')
-                name_changed = (
-                    old_item_name
-                    and new_item_name
-                    and old_item_name != new_item_name
-                    and not incoming_deleted
-                )
-                if name_changed:
-                    renamed = _propagate_item_rename(
-                        db           = db,
-                        company_name = safe['company_name'],
-                        old_name     = old_item_name,
-                        new_name     = new_item_name,
-                    )
-                    logger.info(
-                        f"[{safe['company_name']}] Item rename detected | "
-                        f"guid={safe['guid']} | "
-                        f"'{old_item_name}' → '{new_item_name}' | "
-                        f"voucher rows updated={renamed}"
-                    )
+        # ── PHASE 1: DELETE ───────────────────────────────────────────────────────────────────────────────────
+        delete_guids = set()
+        for guid, row in groups.items():
+            if row.get('is_deleted', 'No') == 'Yes':
+                delete_guids.add(guid)
+                rec = existing_map.get(guid)
+                if rec:
+                    db.delete(rec)
+                    deleted += 1
+                    logger.debug(f"[{row.get('company_name')}] PHASE1 hard deleted item guid={guid}")
+        if delete_guids:
+            db.flush()
 
-                # FIX: always apply delete flag even if alter_id hasn't advanced,
-                # because Tally CDC can sometimes return is_deleted=Yes with the
-                # same alter_id as before (race condition in Tally's CDC response).
-                if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes') or name_changed:
-                    _log_changes(
-                        "item UPDATE", existing,
-                        [f for f in safe if f not in ('guid', 'company_name')],
-                        safe,
-                    )
-                    for field, value in safe.items():
-                        if field not in ('guid', 'company_name'):
-                            setattr(existing, field, value)
-                    updated += 1
-                else:
-                    unchanged += 1
+        # ── PHASE 2: classify updates into rename vs in-place ────────────────────────────────────────────────
+        rename_guids  = set()
+        inplace_guids = set()
+        for guid, row in groups.items():
+            if guid in delete_guids:
+                continue
+            existing = existing_map.get(guid)
+            if not existing:
+                continue
+            new_alter_id = int(row.get('alter_id', 0))
+            old_alter_id = int(existing.alter_id or 0)
+            if new_alter_id <= old_alter_id:
+                unchanged += 1
+                continue
+            old_name = existing.item_name or ''
+            new_name = row.get('item_name', '') or ''
+            if old_name and new_name and old_name != new_name:
+                rename_guids.add(guid)
             else:
-                db.add(Item(**safe))
-                inserted += 1
+                inplace_guids.add(guid)
+
+        # ── PHASE 2a: RENAME (cascade → delete-old → flush → insert-new → flush) ────────────────────────────────────────
+        if rename_guids:
+            for guid in rename_guids:
+                row          = groups[guid]
+                existing     = existing_map[guid]
+                company_name = row.get('company_name', '')
+                old_name     = existing.item_name
+                new_name     = row.get('item_name', '')
+                renamed = _propagate_item_rename(
+                    db=db, company_name=company_name,
+                    old_name=old_name, new_name=new_name,
+                )
+                logger.info(
+                    f"[{company_name}] Item rename | guid={guid} | "
+                    f"'{old_name}' → '{new_name}' | voucher rows={renamed}"
+                )
+                db.delete(existing)
+                logger.debug(f"[{company_name}] PHASE2a deleted old item guid={guid}")
+            db.flush()
+            for guid in rename_guids:
+                row          = groups[guid]
+                company_name = row.get('company_name', '')
+                db.add(Item(
+                    company_name       = _t(company_name,                   255),
+                    item_name          = _t(row.get('item_name'),           500),
+                    parent_group       = _t(row.get('parent_group'),        255),
+                    category           = _t(row.get('category'),            255),
+                    base_units         = _t(row.get('base_units'),          100),
+                    gst_type_of_supply = _t(row.get('gst_type_of_supply'),  100),
+                    opening_balance    = row.get('opening_balance',  0.0),
+                    opening_rate       = row.get('opening_rate',     0.0),
+                    opening_value      = row.get('opening_value',    0.0),
+                    entered_by         = _t(row.get('entered_by'),          255),
+                    is_deleted         = _t(row.get('is_deleted', 'No'),     10),
+                    guid               = _t(row.get('guid'),                100),
+                    remote_alt_guid    = _t(row.get('remote_alt_guid'),     100),
+                    alter_id           = row.get('alter_id', 0),
+                    material_centre    = _t(row.get('material_centre'),     255),
+                ))
+                updated += 1
+            db.flush()
+
+        # ── PHASE 2b: IN-PLACE update (setattr — same name, no UniqueConstraint conflict) ─────────────────────────
+        for guid in inplace_guids:
+            row      = groups[guid]
+            existing = existing_map[guid]
+            for field in [
+                'item_name', 'parent_group', 'category', 'base_units',
+                'gst_type_of_supply', 'opening_balance', 'opening_rate',
+                'opening_value', 'entered_by', 'is_deleted',
+                'remote_alt_guid', 'alter_id', 'material_centre',
+            ]:
+                val = row.get(field)
+                if val is not None:
+                    setattr(existing, field, val)
+            updated += 1
+            logger.debug(
+                f"[{row.get('company_name')}] PHASE2b in-place updated item "
+                f"guid={guid} alter_id→{row.get('alter_id', 0)}"
+            )
+
+        # ── PHASE 3: INSERT brand-new GUIDs ───────────────────────────────────────────────────────────────────────────────────
+        all_update_guids = rename_guids | inplace_guids
+        for guid, row in groups.items():
+            if guid in delete_guids or guid in all_update_guids:
+                continue
+            if existing_map.get(guid):
+                continue
+            company_name = row.get('company_name', '')
+            db.add(Item(
+                company_name       = _t(company_name,                   255),
+                item_name          = _t(row.get('item_name'),           500),
+                parent_group       = _t(row.get('parent_group'),        255),
+                category           = _t(row.get('category'),            255),
+                base_units         = _t(row.get('base_units'),          100),
+                gst_type_of_supply = _t(row.get('gst_type_of_supply'),  100),
+                opening_balance    = row.get('opening_balance',  0.0),
+                opening_rate       = row.get('opening_rate',     0.0),
+                opening_value      = row.get('opening_value',    0.0),
+                entered_by         = _t(row.get('entered_by'),          255),
+                is_deleted         = _t(row.get('is_deleted', 'No'),     10),
+                guid               = _t(row.get('guid'),                100),
+                remote_alt_guid    = _t(row.get('remote_alt_guid'),     100),
+                alter_id           = row.get('alter_id', 0),
+                material_centre    = _t(row.get('material_centre'),     255),
+            ))
+            inserted += 1
 
         db.commit()
-        _log_result("Items upsert", inserted, updated, unchanged, skipped)
+        _log_result("Items upsert", inserted, updated, unchanged, skipped, deleted)
 
     except Exception:
         db.rollback()
@@ -1184,6 +1240,7 @@ def upsert_ledgers(rows, engine):
             'altered_on'            : _t(row.get('altered_on'),              20),
             'guid'                  : _t(row.get('guid'),                   255),
             'alter_id'              : row.get('alter_id', 0),
+            'material_centre'       : _t(row.get('material_centre'), 255),
         }
 
     try:
@@ -1352,6 +1409,7 @@ def upsert_debtor_outstanding(rows, engine):
                 exchange_rate  = row.get('exchange_rate', 1.0),
                 amount         = row.get('amount', 0.0),
                 narration      = row.get('narration'),
+                material_centre= row.get('material_centre', ''),
             ))
             inserted += 1
 

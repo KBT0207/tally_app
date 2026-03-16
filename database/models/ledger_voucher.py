@@ -21,6 +21,7 @@ class _LedgerVoucherMixin:
     master_id      = Column(String(255),  nullable=True)
     change_status  = Column(String(50),   nullable=True)
     is_deleted     = Column(String(3),    nullable=False, default='No')
+    material_centre= Column(String(255),  nullable=True)
     created_at     = Column(DateTime,     server_default=func.now())
     updated_at     = Column(DateTime,     server_default=func.now(), onupdate=func.now())
 

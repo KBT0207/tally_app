@@ -500,12 +500,13 @@ def _reconcile_deleted_masters(
 
 
 def _sync_trial_balance(
-    company_name: str,
-    tally:        TallyConnector,
+    company_name:    str,
+    tally:           TallyConnector,
     engine,
-    from_date:    str,
-    to_date:      str,
+    from_date:       str,
+    to_date:         str,
     progress_cb=None,
+    material_centre: str = '',
 ):
     """
     Sync trial balance for the given date window.
@@ -563,12 +564,13 @@ def _sync_trial_balance(
 
 
 def _sync_outstanding_debtors(
-    company_name: str,
-    tally:        TallyConnector,
+    company_name:    str,
+    tally:           TallyConnector,
     engine,
-    from_date:    str,
-    to_date:      str,
+    from_date:       str,
+    to_date:         str,
     progress_cb=None,
+    material_centre: str = '',
 ):
     """
     Fetch and full-replace Sundry Debtors outstanding.
@@ -617,7 +619,7 @@ def _sync_outstanding_debtors(
         logger.exception(f"[{company_name}] Outstanding Debtors sync failed")
 
 
-def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=None):
+def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=None, material_centre: str = ''):
     """
     Sync the StockItem master.
     First run → full snapshot.  Subsequent → CDC using stored alter_id.
@@ -646,17 +648,18 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
                 _reconcile_deleted_masters(company_name, 'items', tally, engine)
                 return
 
-            rows = parse_items(xml, company_name)
+            rows = parse_items(xml, company_name, material_centre=material_centre)
             if not rows:
                 logger.info(
                     f"[{company_name}][items] CDC: 0 rows "
                     f"(nothing changed since AlterID {last_alter_id})"
                 )
+                _advance_alter_id_from_xml(xml, company_name, 'items', engine, lock)
                 _reconcile_deleted_masters(company_name, 'items', tally, engine)
                 return
 
-            upsert_items(rows, engine)
             new_max = _get_max_alter_id(rows)
+            upsert_items(rows, engine)
             with lock:
                 update_sync_state(company_name, 'items', new_max, engine, is_initial_done=True)
             logger.info(
@@ -677,13 +680,13 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
             logger.warning(f"[{company_name}][items] No item data from Tally")
             return
 
-        rows = parse_items(xml, company_name)
+        rows = parse_items(xml, company_name, material_centre=material_centre)
         if not rows:
             logger.warning(f"[{company_name}][items] Snapshot parsed 0 rows")
             return
 
-        upsert_items(rows, engine)
         max_alter_id = _get_max_alter_id(rows)
+        upsert_items(rows, engine)
         with lock:
             update_sync_state(company_name, 'items', max_alter_id, engine, is_initial_done=True)
         logger.info(
@@ -695,7 +698,7 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
         logger.exception(f"[{company_name}] Item sync failed")
 
 
-def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=None):
+def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=None, material_centre: str = ''):
     logger.info(f"[{company_name}] Syncing Ledgers")
     lock = _get_company_lock(company_name)
     try:
@@ -720,12 +723,13 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=
                 _reconcile_deleted_masters(company_name, 'ledger', tally, engine)
                 return
 
-            rows = parse_ledgers(xml, company_name)
+            rows = parse_ledgers(xml, company_name, material_centre=material_centre)
             if not rows:
                 logger.info(
                     f"[{company_name}][ledger] CDC: 0 rows "
                     f"(nothing changed since AlterID {last_alter_id})"
                 )
+                _advance_alter_id_from_xml(xml, company_name, 'ledger', engine, lock)
                 _reconcile_deleted_masters(company_name, 'ledger', tally, engine)
                 return
 
@@ -751,7 +755,7 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=
             logger.warning(f"[{company_name}][ledger] No ledger data from Tally")
             return
 
-        rows = parse_ledgers(xml, company_name)
+        rows = parse_ledgers(xml, company_name, material_centre=material_centre)
         if not rows:
             logger.warning(f"[{company_name}][ledger] Snapshot parsed 0 rows")
             return
@@ -778,6 +782,7 @@ def _sync_voucher(
     to_date:      str,
     full_from:    str,   # Issue 1 & 2 fix: full company history start for Phase 3
     progress_cb=None,
+    material_centre: str = '',
 ):
     voucher_type     = config['voucher_type']
     snapshot_fetch   = config['snapshot_fetch']
@@ -819,7 +824,7 @@ def _sync_voucher(
                 _reconcile_deleted_vouchers(company_name, config, tally, engine, full_from, to_date)
                 return
 
-            rows = parser(xml, company_name, parser_type_name, allowed_types=allowed_types)
+            rows = parser(xml, company_name, parser_type_name, allowed_types=allowed_types, material_centre=material_centre)
 
             if not rows:
                 logger.info(
@@ -831,11 +836,10 @@ def _sync_voucher(
                 _reconcile_deleted_vouchers(company_name, config, tally, engine, full_from, to_date)
                 return
 
+            new_max = _get_max_alter_id(rows)
             t1 = datetime.now()
             upsert(rows, engine)
             upsert_ms = int((datetime.now() - t1).total_seconds() * 1000)
-
-            new_max = _get_max_alter_id(rows)
             with lock:
                 update_sync_state(company_name, voucher_type, new_max, engine, is_initial_done=True)
             logger.info(
@@ -909,7 +913,7 @@ def _sync_voucher(
                 chunks_done += 1
                 continue
 
-            rows = parser(xml, company_name, parser_type_name, allowed_types=allowed_types)
+            rows = parser(xml, company_name, parser_type_name, allowed_types=allowed_types, material_centre=material_centre)
 
             if not rows:
                 logger.info(
@@ -985,6 +989,7 @@ def sync_company(
         Names match VoucherSelection attribute names used in the GUI.
     """
     comp_name     = company.get('name', '').strip()
+    mat_centre    = company.get('material_centre', '') or ''
     from_date     = manual_from_date if manual_from_date else _resolve_from_date(company)
     inner_workers = 1 if parallel_company_mode else VOUCHER_WORKERS
 
@@ -1006,22 +1011,22 @@ def sync_company(
 
     # Masters & reports (only if selected)
     if _selected('ledger'):
-        _sync_ledgers(comp_name, tally, engine)
+        _sync_ledgers(comp_name, tally, engine, material_centre=mat_centre)
     else:
         logger.info(f"[{comp_name}] Skipping ledgers (not selected)")
 
     if _selected('items'):
-        _sync_items(comp_name, tally, engine)
+        _sync_items(comp_name, tally, engine, material_centre=mat_centre)
     else:
         logger.info(f"[{comp_name}] Skipping items (not selected)")
 
     if _selected('trial_balance'):
-        _sync_trial_balance(comp_name, tally, engine, from_date, to_date)
+        _sync_trial_balance(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre)
     else:
         logger.info(f"[{comp_name}] Skipping trial_balance (not selected)")
 
     if _selected('outstanding_debtors'):
-        _sync_outstanding_debtors(comp_name, tally, engine, from_date, to_date)
+        _sync_outstanding_debtors(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre)
     else:
         logger.info(f"[{comp_name}] Skipping outstanding_debtors (not selected)")
 
@@ -1050,9 +1055,10 @@ def sync_company(
                     config       = config,
                     tally        = tally,
                     engine       = engine,
-                    from_date    = from_date,
-                    to_date      = to_date,
-                    full_from    = full_from,
+                    from_date       = from_date,
+                    to_date         = to_date,
+                    full_from       = full_from,
+                    material_centre = mat_centre,
                 ): config['voucher_type']
                 for config in active_configs
             }

@@ -18,6 +18,7 @@ class TrialBalance(Base):
     guid             = Column(String(255), nullable=False, index=True)
     alter_id         = Column(BigInteger,  nullable=False, default=0)
     master_id        = Column(String(255), nullable=True)
+    material_centre  = Column(String(255), nullable=True)
     created_at       = Column(DateTime,    server_default=func.now())
     updated_at       = Column(DateTime,    server_default=func.now(), onupdate=func.now())
 

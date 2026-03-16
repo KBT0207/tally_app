@@ -19,6 +19,7 @@ class _OutstandingMixin:
     exchange_rate  = Column(Float,       nullable=True,  default=1.0)
     amount         = Column(Float,       nullable=True,  default=0.0)
     narration      = Column(Text,        nullable=True)
+    material_centre= Column(String(255), nullable=True)
     created_at     = Column(DateTime,    server_default=func.now())
     updated_at     = Column(DateTime,    server_default=func.now(), onupdate=func.now())
 

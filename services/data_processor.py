@@ -340,6 +340,7 @@ def parse_ledger_voucher(
     company_name:  str,
     voucher_type_name: str = 'ledger',
     allowed_types: set = None,   # UNUSED — Tally TDL filter already routes correctly
+    material_centre: str = '',
 ) -> list:
     """
     Parse Receipt / Payment / Journal / Contra XML from Tally.
@@ -407,6 +408,7 @@ def parse_ledger_voucher(
                     'master_id'     : master_id,
                     'change_status' : change_status,
                     'is_deleted'    : 'Yes',
+                    'material_centre': material_centre,
                 })
                 continue
 
@@ -453,6 +455,7 @@ def parse_ledger_voucher(
                     'master_id'     : master_id,
                     'change_status' : change_status,
                     'is_deleted'    : is_deleted_flag,
+                    'material_centre': material_centre,
                 })
 
         logger.info(f"Parsed {len(all_rows)} rows for {voucher_type_name} [{company_name}]")
@@ -476,6 +479,7 @@ def parse_inventory_voucher(
     company_name:  str,
     voucher_type_name: str = 'inventory',
     allowed_types: set = None,   # UNUSED — Tally TDL filter already routes correctly
+    material_centre: str = '',
 ) -> list:
     """
     Parse Sales / Purchase / Credit Note / Debit Note XML from Tally.
@@ -740,6 +744,7 @@ def parse_inventory_voucher(
                 'voucherkey'      : voucherkey,
                 'alter_id'        : int(alter_id) if alter_id else 0,
                 'master_id'       : master_id,
+                'material_centre' : material_centre,
             }
 
             # Sort items by name — makes idx==0 deterministic across re-syncs
@@ -878,6 +883,7 @@ def _deleted_inventory_stub(
         'master_id'       : master_id,
         'change_status'   : change_status,
         'is_deleted'      : 'Yes',
+        'material_centre' : '',
     }
 
 
@@ -885,7 +891,7 @@ def _deleted_inventory_stub(
 # Ledger master parser
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_ledgers(xml_content, company_name: str) -> list:
+def parse_ledgers(xml_content, company_name: str, material_centre: str = '') -> list:
     try:
         if not xml_content or (isinstance(xml_content, str) and not xml_content.strip()):
             logger.warning("Empty or None XML content for ledgers")
@@ -988,6 +994,7 @@ def parse_ledgers(xml_content, company_name: str) -> list:
                 'altered_on'           : altered_on,
                 'guid'                 : guid,
                 'alter_id'             : int(alter_id) if alter_id else 0,
+                'material_centre'      : material_centre,
             })
 
         logger.info(f"Parsed {len(all_rows)} ledgers [{company_name}]")
@@ -1006,7 +1013,7 @@ def parse_ledgers(xml_content, company_name: str) -> list:
 # Trial Balance parser
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_trial_balance(xml_content, company_name: str, start_date: str, end_date: str) -> list:
+def parse_trial_balance(xml_content, company_name: str, start_date: str, end_date: str, material_centre: str = '') -> list:
     try:
         if not xml_content or (isinstance(xml_content, str) and not xml_content.strip()):
             logger.warning("Empty or None XML content for trial balance")
@@ -1056,6 +1063,7 @@ def parse_trial_balance(xml_content, company_name: str, start_date: str, end_dat
                 'guid'            : guid,
                 'alter_id'        : int(alter_id) if alter_id else 0,
                 'master_id'       : master_id,
+                'material_centre' : material_centre,
             })
 
         logger.info(f"Parsed {len(all_rows)} trial balance rows [{company_name}]")
@@ -1073,7 +1081,7 @@ def parse_trial_balance(xml_content, company_name: str, start_date: str, end_dat
 # Stock Item (Item) master parser
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_items(xml_content, company_name: str) -> list:
+def parse_items(xml_content, company_name: str, material_centre: str = '') -> list:
     """
     Parse Tally StockItem XML (full snapshot or CDC).
 
@@ -1161,6 +1169,7 @@ def parse_items(xml_content, company_name: str) -> list:
                 'guid'              : guid,
                 'remote_alt_guid'   : remote_alt_guid,
                 'alter_id'          : int(alter_id_raw) if alter_id_raw else 0,
+                'material_centre'   : material_centre,
             })
 
         logger.info(f"Parsed {len(all_rows)} stock items (skipped {skipped} empty nodes) [{company_name}]")
@@ -1178,7 +1187,7 @@ def parse_items(xml_content, company_name: str) -> list:
 # Outstanding — Debtors parser
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_outstanding_debtors(xml_content, company_name: str) -> list:
+def parse_outstanding_debtors(xml_content, company_name: str, material_centre: str = '') -> list:
     """
     Parse Sundry Debtors (Receivables) outstanding vouchers.
 
@@ -1268,6 +1277,7 @@ def parse_outstanding_debtors(xml_content, company_name: str) -> list:
                 'exchange_rate' : exchange_rate,
                 'amount'        : amount,
                 'narration'     : narr,
+                'material_centre': material_centre,
             })
 
         logger.info(f"Parsed {len(all_rows)} debtors rows [{company_name}]")
