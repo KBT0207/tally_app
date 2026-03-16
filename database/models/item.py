@@ -29,12 +29,12 @@ class Item(Base):
     # ── Audit / soft-delete ──────────────────────────────────────────────────
     entered_by        = Column(String(255),  nullable=False, default='')
     is_deleted        = Column(String(10),   nullable=False, default='No')
-    material_centre   = Column(String(255),  nullable=True)
 
     # ── CDC / change-tracking keys ───────────────────────────────────────────
     guid              = Column(String(100),  nullable=False, default='')
     remote_alt_guid   = Column(String(100),  nullable=False, default='')
     alter_id          = Column(Integer,      nullable=False, default=0, index=True)
+    material_centre   = Column(String(255),  nullable=True)
 
     # ── Row timestamps ───────────────────────────────────────────────────────
     created_at        = Column(DateTime, server_default=func.now(), nullable=False)

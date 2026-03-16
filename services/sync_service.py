@@ -539,7 +539,7 @@ def _sync_trial_balance(
             logger.warning(f"[{company_name}] No trial balance data from Tally")
             return
 
-        rows = parse_trial_balance(xml, company_name, from_date, to_date)
+        rows = parse_trial_balance(xml, company_name, from_date, to_date, material_centre=material_centre)
         if not rows:
             logger.warning(f"[{company_name}] Trial balance parsed 0 rows")
             return
@@ -594,7 +594,7 @@ def _sync_outstanding_debtors(
             logger.warning(f"[{company_name}] No outstanding debtors data from Tally")
             return
 
-        rows = parse_outstanding_debtors(xml, company_name)
+        rows = parse_outstanding_debtors(xml, company_name, material_centre=material_centre)
         if not rows:
             logger.warning(f"[{company_name}] Outstanding debtors parsed 0 rows")
             return

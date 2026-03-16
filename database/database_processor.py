@@ -108,6 +108,7 @@ def _insert_voucher_rows(rows, model_class, db, set_total_amt=True):
             master_id        = row.get('master_id'),
             change_status    = row.get('change_status'),
             is_deleted       = 'No',
+            material_centre  = row.get('material_centre', ''),
         ))
 
 
@@ -331,6 +332,7 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
                     master_id      = row.get('master_id'),
                     change_status  = row.get('change_status'),
                     is_deleted     = 'No',
+                    material_centre= row.get('material_centre', ''),
                 ))
             updated += len(group_rows)
         db.flush()   # ← new rows visible before phase 3
@@ -360,6 +362,7 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
                 master_id      = row.get('master_id'),
                 change_status  = row.get('change_status'),
                 is_deleted     = 'No',
+                material_centre= row.get('material_centre', ''),
             ))
         inserted += len(group_rows)
 
@@ -768,6 +771,7 @@ def upsert_trial_balance(rows, engine):
                 guid             = row.get('guid'),
                 alter_id         = row.get('alter_id', 0),
                 master_id        = row.get('master_id'),
+                material_centre  = row.get('material_centre', ''),
             ))
             inserted += 1
 
@@ -980,6 +984,7 @@ def upsert_items(rows, engine):
             'guid'               : _t(row.get('guid'),                100),
             'remote_alt_guid'    : _t(row.get('remote_alt_guid'),     100),
             'alter_id'           : row.get('alter_id', 0),
+            'material_centre'    : _t(row.get('material_centre'), 255),
         }
 
     try:
@@ -1190,6 +1195,7 @@ def upsert_ledgers(rows, engine):
             'altered_on'            : _t(row.get('altered_on'),              20),
             'guid'                  : _t(row.get('guid'),                   255),
             'alter_id'              : row.get('alter_id', 0),
+            'material_centre'       : _t(row.get('material_centre'), 255),
         }
 
     try:
@@ -1358,6 +1364,7 @@ def upsert_debtor_outstanding(rows, engine):
                 exchange_rate  = row.get('exchange_rate', 1.0),
                 amount         = row.get('amount', 0.0),
                 narration      = row.get('narration'),
+                material_centre= row.get('material_centre', ''),
             ))
             inserted += 1
 
