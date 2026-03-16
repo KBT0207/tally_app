@@ -25,6 +25,8 @@ class Company(Base):
     tds_path         = Column(String(255), nullable=True)
     # Network drive letter              e.g. Z:
     drive_letter     = Column(String(5),   nullable=True)
+    material_centre  = Column(String(255), nullable=True)
+    default_currency = Column(String(10),  nullable=True, default='INR')
 
     created_at       = Column(DateTime,    default=datetime.utcnow)
     updated_at       = Column(DateTime,    default=datetime.utcnow, onupdate=datetime.utcnow)

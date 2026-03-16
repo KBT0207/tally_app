@@ -106,12 +106,6 @@ class HomePage(tk.Frame):
         )
         self._refresh_btn.pack(side="left", padx=(Spacing.MD, 0))
 
-        tk.Button(
-            right, text="⚙  Global Config", font=Font.BUTTON_SM,
-            bg=Color.BG_CARD, fg=Color.TEXT_PRIMARY,
-            relief="solid", bd=1, padx=Spacing.MD, pady=4,
-            cursor="hand2", command=self._on_global_config,
-        ).pack(side="left", padx=(Spacing.SM, 0))
 
     def _build_list_area(self):
         container = tk.Frame(
@@ -371,21 +365,6 @@ class HomePage(tk.Frame):
         self.wait_window(dialog)
 
         if dialog.saved:
-            self._render_cards(
-                filter_text=self._filter_var.get().strip(),
-                force_rebuild=True,
-            )
-            self._update_summary()
-
-    def _on_global_config(self):
-        from gui.components.global_config_dialog import GlobalConfigDialog
-        dlg = GlobalConfigDialog(
-            parent = self.winfo_toplevel(),
-            state  = self.state,
-            app    = self.app,
-        )
-        self.wait_window(dlg)
-        if dlg.applied:
             self._render_cards(
                 filter_text=self._filter_var.get().strip(),
                 force_rebuild=True,

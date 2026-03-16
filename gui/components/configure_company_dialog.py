@@ -46,8 +46,9 @@ class ConfigureCompanyDialog(tk.Toplevel):
 
     def __init__(self, parent, company: CompanyState, app, state):
         super().__init__(parent)
-        # Edit mode if company is already configured (has a starting_from date saved)
-        self._is_edit = bool(getattr(company, 'starting_from', None))
+        # Edit mode only if user already configured this company.
+        # Do NOT use starting_from — auto-imported Tally companies already have it.
+        self._is_edit = (company.status == CompanyStatus.CONFIGURED)
         title_verb    = "Edit" if self._is_edit else "Configure"
         self.title(f"{title_verb}  —  {company.name}")
         self.resizable(True, True)
@@ -219,17 +220,48 @@ class ConfigureCompanyDialog(tk.Toplevel):
 
         self._build_loc_fields()   # render correct fields for current type
 
+        # ── Additional Settings ───────────────────────────
+        self._add_section_label(pad, row=13, text="Additional Settings")
+
+        add_frame = tk.Frame(pad, bg=Color.BG_CARD)
+        add_frame.grid(row=14, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        tk.Label(add_frame, text="Material Centre:", font=Font.BODY, bg=Color.BG_CARD,
+                 fg=Color.TEXT_SECONDARY, width=16, anchor="w").pack(side="left")
+        self._material_centre_var = tk.StringVar(value=getattr(co, 'material_centre', '') or '')
+        tk.Entry(
+            add_frame, textvariable=self._material_centre_var,
+            font=Font.BODY, width=20,
+            bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+            relief="solid", bd=1,
+        ).pack(side="left", padx=(4, 20))
+
+        tk.Label(add_frame, text="Default Currency:", font=Font.BODY, bg=Color.BG_CARD,
+                 fg=Color.TEXT_SECONDARY, width=16, anchor="w").pack(side="left")
+        self._default_currency_var = tk.StringVar(value=getattr(co, 'default_currency', 'INR') or 'INR')
+        tk.Entry(
+            add_frame, textvariable=self._default_currency_var,
+            font=Font.BODY, width=8,
+            bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+            relief="solid", bd=1,
+        ).pack(side="left", padx=(4, 0))
+
+        tk.Label(
+            pad, text="e.g. Material Centre: Main Warehouse   Currency: INR / USD / EUR",
+            font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
+        ).grid(row=15, column=0, columnspan=2, sticky="w")
+
         # ── Feedback label ────────────────────────────────
         self._feedback = tk.Label(
             pad, text="",
             font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.DANGER,
             wraplength=420, justify="left",
         )
-        self._feedback.grid(row=13, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self._feedback.grid(row=16, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         # ── Buttons ───────────────────────────────────────
         btn_row = tk.Frame(pad, bg=Color.BG_CARD)
-        btn_row.grid(row=14, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        btn_row.grid(row=17, column=0, columnspan=2, sticky="ew", pady=(16, 0))
         btn_row.columnconfigure(0, weight=1)
 
         tk.Button(
@@ -396,7 +428,7 @@ class ConfigureCompanyDialog(tk.Toplevel):
         password      = self._password_var.get().strip()
         company_type  = self._type_var.get()
         data_path     = self._data_path_var.get().strip() if company_type != "tds" else ""
-        tds_path      = self._tds_path_var.get().strip()  if company_type != "tds" else ""
+        tds_path      = self._tds_path_var.get().strip()  if company_type == "tds" else ""
         drive_letter  = self._drive_var.get().strip()
 
         # ── Detect start-date change on an already-synced company ────────────
@@ -422,16 +454,18 @@ class ConfigureCompanyDialog(tk.Toplevel):
 
         # Save to DB
         ok, detail = self._app.save_company_to_db(
-            company_name   = co.name,
-            guid           = co.guid or "",
-            starting_from  = starting_from,
-            books_from     = books_from,
-            tally_username = username,
-            tally_password = password,
-            company_type   = company_type,
-            data_path      = data_path,
-            tds_path       = tds_path,
-            drive_letter   = drive_letter,
+            company_name     = co.name,
+            guid             = co.guid or "",
+            starting_from    = starting_from,
+            books_from       = books_from,
+            tally_username   = username,
+            tally_password   = password,
+            company_type     = company_type,
+            data_path        = data_path,
+            tds_path         = tds_path,
+            drive_letter     = drive_letter,
+            material_centre  = self._material_centre_var.get().strip(),
+            default_currency = self._default_currency_var.get().strip() or 'INR',
         )
 
         if not ok:
@@ -451,7 +485,9 @@ class ConfigureCompanyDialog(tk.Toplevel):
         co.company_type   = company_type
         co.data_path      = data_path
         co.tds_path       = tds_path
-        co.drive_letter   = drive_letter
+        co.drive_letter       = drive_letter
+        co.material_centre    = self._material_centre_var.get().strip()
+        co.default_currency   = self._default_currency_var.get().strip() or 'INR'
 
         if reset_initial:
             co.is_initial_done = False

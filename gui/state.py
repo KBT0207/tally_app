@@ -57,6 +57,8 @@ class CompanyState:
     data_path:         str                  = ""        # C:\TallyData\CompanyA
     tds_path:          str                  = ""        # 192.168.1.10
     drive_letter:      str                  = ""        # Z:
+    material_centre:   str                  = ""        # e.g. Main Location
+    default_currency:  str                  = "INR"     # e.g. INR, USD
     # runtime progress (not persisted)
     progress_pct:      float                = 0.0
     progress_label:    str                  = ""

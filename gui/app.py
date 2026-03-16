@@ -709,7 +709,7 @@ class TallySyncApp:
                 cs = CompanyState(
                     name              = name,
                     guid              = co.guid or "",
-                    status            = CompanyStatus.CONFIGURED,
+                    status            = CompanyStatus.CONFIGURED if co.tally_username is not None else CompanyStatus.NOT_CONFIGURED,
                     last_sync_time    = last_sync,
                     last_alter_id     = last_alter,
                     last_synced_month = last_month,
@@ -725,6 +725,8 @@ class TallySyncApp:
                     data_path         = getattr(co, 'data_path',     '') or '',
                     tds_path          = getattr(co, 'tds_path',      '') or '',
                     drive_letter      = getattr(co, 'drive_letter',  '') or '',
+                    material_centre   = getattr(co, 'material_centre',  '') or '',
+                    default_currency  = getattr(co, 'default_currency', 'INR') or 'INR',
                 )
                 self.state.companies[name] = cs
         finally:
@@ -741,16 +743,7 @@ class TallySyncApp:
             if tally.status == "Connected":
                 tally_companies = tally.fetch_all_companies()
 
-                # ── Save company master fields to DB (formal_name, company_number, audited_upto) ──
-                if tally_companies and engine:
-                    try:
-                        from database.database_processor import company_import_db
-                        company_import_db(tally_companies, engine)
-                        from logging_config import logger
-                        logger.info(f"[App] company_import_db: saved {len(tally_companies)} companies")
-                    except Exception as _e:
-                        from logging_config import logger
-                        logger.warning(f"[App] company_import_db failed: {_e}")
+                # Tally companies stay in-memory only until user clicks Configure.
 
         except Exception as e:
             from logging_config import logger
@@ -788,7 +781,8 @@ class TallySyncApp:
                            tally_username: str = "", tally_password: str = "",
                            tally_host: str = "localhost", tally_port: int = 9000,
                            company_type: str = "local", data_path: str = "",
-                           tds_path: str = "", drive_letter: str = ""):
+                           tds_path: str = "", drive_letter: str = "",
+                           material_centre: str = "", default_currency: str = "INR"):
         from sqlalchemy.orm import sessionmaker
         from database.models.company import Company
 
@@ -813,19 +807,25 @@ class TallySyncApp:
                 existing.data_path      = data_path or None
                 existing.tds_path       = tds_path  or None
                 existing.drive_letter   = drive_letter or None
+                if hasattr(existing, 'material_centre'):
+                    existing.material_centre  = material_centre or None
+                if hasattr(existing, 'default_currency'):
+                    existing.default_currency = default_currency or 'INR'
                 if books_from:
                     existing.books_from = books_from
             else:
                 co = Company(
-                    name           = company_name,
-                    guid           = guid,
-                    starting_from  = starting_from,
-                    tally_username = tally_username,
-                    tally_password = tally_password,
-                    company_type   = company_type,
-                    data_path      = data_path   or None,
-                    tds_path       = tds_path    or None,
-                    drive_letter   = drive_letter or None,
+                    name             = company_name,
+                    guid             = guid,
+                    starting_from    = starting_from,
+                    tally_username   = tally_username,
+                    tally_password   = tally_password,
+                    company_type     = company_type,
+                    data_path        = data_path        or None,
+                    tds_path         = tds_path         or None,
+                    drive_letter     = drive_letter     or None,
+                    material_centre  = material_centre  or None,
+                    default_currency = default_currency or 'INR',
                 )
                 if hasattr(Company, 'tally_host'):
                     co.tally_host = tally_host or "localhost"
