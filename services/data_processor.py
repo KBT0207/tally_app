@@ -158,6 +158,10 @@ def _detect_currency(text: str) -> str:
       2. Single-char symbols: $->USD, EUR, GBP, etc.
       3. ISO text-code prefix: "CAD50.00", "SGD 50"
       4. ISO text-code denominator: "? 0.9585/CAD"
+      5. Corrupted EUR: digit immediately followed by '?' or U+FFFD (with optional space)
+         "18.00? = ? 1606.10/Box"   -- RATE: no space between digit and corrupt char
+         "7429.97 ? @ ? 105.18/..."  -- AMOUNT: space before corrupt char then '@'
+         Both arise when Tally's euro sign (Windows-1252 0x80) is lost in XML transit.
     """
     if not text:
         return 'INR'
@@ -177,6 +181,9 @@ def _detect_currency(text: str) -> str:
     m = re.search(r'/(' + '|'.join(_ISO_TEXT_CODES) + r')\b', text)
     if m and m.group(1) != 'INR':
         return m.group(1)
+    # 5. Corrupted EUR: digit(s) followed (with optional single space) by '?' or U+FFFD
+    if re.search(r'\d\s?[?\ufffd]', text):
+        return 'EUR'
     return 'INR'
 
 
@@ -205,6 +212,14 @@ def _parse_fcy_rate(raw: str) -> float:
         return 0.0
     raw = str(raw).strip()
 
+    # Step 0: Corrupted EUR -- "18.00? = ? 1606.10/Box"
+    # When Tally's euro sign is lost in transit it becomes '?' or U+FFFD sitting
+    # directly after the FCY amount (no space for RATE strings).
+    # Pattern: <digits>?<optional-space>=  ->  grab the digits before the corrupt char.
+    m = re.search(r'([\d,]+\.?\d*)[?\ufffd]\s*=', raw)
+    if m:
+        return abs(convert_to_float(m.group(1)))
+
     # Step 1a: Compound dollar symbol (AU$, NZ$, HK$, SG$, CA$) — check BEFORE bare $
     #   "AU$28.00 = ? 28.00/box"  ->  28.0  (AUD)
     m = re.search(_COMPOUND_DOLLAR_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
@@ -214,6 +229,12 @@ def _parse_fcy_rate(raw: str) -> float:
     # Step 1b: Single-char FCY symbol -- number immediately after symbol
     #   "$14.00 = ? 84.5/$ = ? 1183/box"  ->  14.0  (USD)
     m = re.search(_CURRENCY_SYMBOLS + r'\s*([\d,]+\.?\d*)', raw)
+    if m:
+        return abs(convert_to_float(m.group(1)))
+
+    # Step 1c: Single-char FCY symbol -- number immediately BEFORE symbol
+    #   "30.58 £ = ? 3216.40/Box"  ->  30.58  (GBP RATE: FCY qty precedes the symbol)
+    m = re.search(r'([\d,]+\.?\d*)\s*' + _CURRENCY_SYMBOLS, raw)
     if m:
         return abs(convert_to_float(m.group(1)))
 
@@ -251,6 +272,12 @@ def _parse_fcy_amount(raw: str) -> float:
         return 0.0
     raw = str(raw).strip()
 
+    # Corrupted EUR -- "7429.97 ? @ ? 105.18/? = ? 112427.03"
+    # When euro sign is lost, it becomes '?' or U+FFFD after the FCY amount then ' @'.
+    m = re.search(r'-?\s*([\d,]+\.?\d*)[\s]*[?\ufffd]\s*@', raw)
+    if m:
+        return abs(convert_to_float(m.group(1)))
+
     # Compound dollar symbol: -?AU$<number>
     #   "AU$16800.00 @ ? 1/AU$ = ? 16800.00"  ->  16800.0
     m = re.search(r'-?\s*' + _COMPOUND_DOLLAR_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
@@ -279,33 +306,51 @@ def _parse_fcy_exchange_rate(raw_amount: str) -> float:
     """
     Extract exchange rate embedded in Tally FCY amount/rate string.
 
-    "$61600.00 @ ? 1/$ = ? 61600.00"           → 1.0
-    "$615.00 @ ? 84.5/$ = ? 51997.50"          → 84.5
-    "$14.00 = ? 84.5/$ = ? 1183/box"           → 84.5
-    "CAD350.00 @ ? 0.9585/CAD = ? 335.48"      → 0.9585  (ISO text-code denominator)
-    "CAD50.00 = ? 47.93/box"                   → 1.0     (no /CODE pattern → default)
+    "$61600.00 @ ? 1/$ = ? 61600.00"               -> 1.0
+    "$615.00 @ ? 84.5/$ = ? 51997.50"              -> 84.5
+    "7429.97 £ @ ? 105.18/ £ = ? 781484.24"        -> 105.18  (GBP: space before £)
+    "CAD350.00 @ ? 0.9585/CAD = ? 335.48"          -> 0.9585  (ISO text-code denominator)
+    "1260.00? @ ? 89.2278/? = ? 112427.03"         -> 89.2278 (EUR corrupt: /? denominator)
+    "CAD50.00 = ? 47.93/box"                       -> 1.0     (no /CODE pattern, default)
     Returns 1.0 if not found.
+
+    BUG FIXES applied (discovered from real XML):
+      GBP: Tally writes "/ £" with a space before the symbol. Old Pattern 1b used
+           r'/' + _CURRENCY_SYMBOLS requiring the symbol immediately after '/'.
+           Fix: added \s* between '/' and the symbol.
+      EUR: When euro sign is corrupted to '?', the denominator becomes '/?' which
+           is not in _CURRENCY_SYMBOLS. New Pattern 3 handles this explicitly.
     """
     if not raw_amount:
         return 1.0
+
+    def _ret(m, group=1):
+        rate = convert_to_float(m.group(group))
+        return rate if rate > 0 else 1.0
+
     # Pattern 1a: ? <number>/<compound-dollar>  e.g.  ? 1/AU$
     m = re.search(r'\?\s*([\d,]+\.?\d*)\s*/' + _COMPOUND_DOLLAR_PATTERN, raw_amount)
     if m:
-        rate = convert_to_float(m.group(1))
-        return rate if rate > 0 else 1.0
-    # Pattern 1b: ? <number>/<single-symbol>    e.g.  ? 84.5/$
-    m = re.search(r'\?\s*([\d,]+\.?\d*)\s*/' + _CURRENCY_SYMBOLS, raw_amount)
+        return _ret(m, 1)
+
+    # Pattern 1b: ? <number>/ <single-symbol>   e.g.  ? 84.5/$  or  ? 105.18/ £
+    # FIX: \s* added before symbol to handle Tally's "/ £" (space before pound sign)
+    m = re.search(r'\?\s*([\d,]+\.?\d*)\s*/\s*' + _CURRENCY_SYMBOLS, raw_amount)
     if m:
-        rate = convert_to_float(m.group(1))
-        return rate if rate > 0 else 1.0
-    # Pattern 2: ? <number>/<ISO-code>           e.g.  ? 0.9585/CAD
+        return _ret(m, 1)
+
+    # Pattern 2: ? <number>/<ISO-code>          e.g.  ? 0.9585/CAD
     m = re.search(r'\?\s*([\d,]+\.?\d*)\s*/' + _ISO_TEXT_PATTERN, raw_amount)
     if m:
-        rate = convert_to_float(m.group(1))
-        return rate if rate > 0 else 1.0
+        return _ret(m, 1)
+
+    # Pattern 3: EUR corrupt -- denominator is '/?' or '/U+FFFD' (euro lost in transit)
+    # "1260.00? @ ? 89.2278/? = ? 112427.03"  ->  89.2278
+    m = re.search(r'\?\s*([\d,]+\.?\d*)\s*/\s*[?\ufffd]', raw_amount)
+    if m:
+        return _ret(m, 1)
+
     return 1.0
-
-
 def _is_fcy_string(text: str) -> bool:
     """True if the text contains a foreign-currency symbol or ISO text code (not INR)."""
     if not text:
