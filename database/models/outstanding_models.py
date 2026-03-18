@@ -6,6 +6,7 @@ class _OutstandingMixin:
     id              = Column(BigInteger,  primary_key=True, autoincrement=True)
     company_name    = Column(String(255), nullable=False, index=True)
     party_name      = Column(String(255), nullable=True,  index=True) # From <PARENT>
+    parent_group    = Column(String(255), nullable=True,  index=True) # Looked up from Ledger.parent_group
     bill_name       = Column(String(255), nullable=True)             # From <NAME>
     bill_id         = Column(BigInteger,  nullable=True)             # From <BILLID>
     
@@ -22,29 +23,15 @@ class _OutstandingMixin:
     created_at      = Column(DateTime,    server_default=func.now())
     updated_at      = Column(DateTime,    server_default=func.now(), onupdate=func.now())
 
-class DebtorOutstanding(_OutstandingMixin, Base):
-    """Sundry Debtors — Updated for Bill-wise XML."""
-    __tablename__ = 'debtor_outstanding'
+class OutstandingData(_OutstandingMixin, Base):
+    """Sundry Debtors — Bill-wise outstanding receivables."""
+    __tablename__ = 'outstanding_data'
 
     def __repr__(self):
         return (
-            f"<DebtorOutstanding("
+            f"<OutstandingData("
             f"party='{self.party_name}', "
             f"bill='{self.bill_name}', "
             f"amount={self.amount} {self.currency}"
             f")>"
         )
-
-# class CreditorOutstanding(_OutstandingMixin, Base):
-#     """Sundry Creditors — Payables outstanding."""
-#     __tablename__ = 'creditor_outstanding'
-
-#     def __repr__(self):
-#         return (
-#             f"<CreditorOutstanding("
-#             f"company='{self.company_name}', "
-#             f"party='{self.party_name}', "
-#             f"bill='{self.bill_name}', "
-#             f"amount={self.amount}"
-#             f")>"
-#         )

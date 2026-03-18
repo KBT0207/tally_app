@@ -9,7 +9,7 @@ from database.models.item import Item
 from database.models.inventory_voucher import SalesVoucher, PurchaseVoucher, CreditNote, DebitNote
 from database.models.ledger_voucher import ReceiptVoucher, PaymentVoucher, JournalVoucher, ContraVoucher
 from database.models.trial_balance import TrialBalance
-from database.models.outstanding_models import DebtorOutstanding
+from database.models.outstanding_models import OutstandingData
 
 from logging_config import logger
 
@@ -727,7 +727,7 @@ def upsert_trial_balance(rows, engine):
     voucher is posted in Tally. There is no reliable alter_id per row to gate
     incremental updates on.
 
-    Strategy (mirrors upsert_debtor_outstanding):
+    Strategy (mirrors upsert_outstanding):
       1. DELETE all existing rows for this company + date window in one shot.
       2. INSERT all fresh rows from Tally.
       Both steps in a single transaction — if insert fails, delete rolls back.
@@ -828,7 +828,7 @@ def _propagate_ledger_rename(
         • PurchaseVoucher
         • CreditNote
         • DebitNote
-        • DebtorOutstanding   — party ledger on outstanding receivables
+        • OutstandingData   — party ledger on outstanding receivables
 
       ledger_name column:
         • ReceiptVoucher      — every entry row (party + non-party)
@@ -843,19 +843,19 @@ def _propagate_ledger_rename(
 
     # ── Tables with party_name ────────────────────────────────────────────────
     # Inventory vouchers store the party (customer/supplier) ledger name here.
-    # DebtorOutstanding also uses party_name for the receivable party.
+    # OutstandingData also uses party_name for the receivable party.
     for model, col_attr in (
         (SalesVoucher,      SalesVoucher.party_name),
         (PurchaseVoucher,   PurchaseVoucher.party_name),
         (CreditNote,        CreditNote.party_name),
         (DebitNote,         DebitNote.party_name),
-        (DebtorOutstanding, DebtorOutstanding.party_name),
+        (OutstandingData, OutstandingData.party_name),
     ):
         filters = [
             model.company_name == company_name,
             col_attr           == old_name,
         ]
-        # Voucher tables have is_deleted; DebtorOutstanding is always fresh (no flag)
+        # Voucher tables have is_deleted; OutstandingData is always fresh (no flag)
         if hasattr(model, 'is_deleted'):
             filters.append(model.is_deleted == 'No')
 
@@ -1328,30 +1328,58 @@ def reconcile_deleted_masters_in_db(
         db.close()
 
 
-def upsert_debtor_outstanding(rows, engine):
+def upsert_outstanding(rows, engine):
     """
-    Full-replace for debtor outstanding — point-in-time snapshot.
+    Full-replace for outstanding — point-in-time snapshot.
     Deletes all existing rows for the company then bulk-inserts fresh ones.
     Both in one transaction — if insert fails, delete rolls back too.
+
+    parent_group is enriched from the Ledger table at upsert time:
+      Ledger(company_name, ledger_name) → parent_group
+    A single pre-fetch builds a lookup dict so there is only ONE extra
+    query per upsert call regardless of how many rows are inserted.
     """
     if not rows:
-        logger.warning("No rows to upsert for debtor outstanding")
+        logger.warning("No rows to upsert for outstanding")
         return
 
     company_name = rows[0].get('company_name', '')
     db = _get_session(engine)
     inserted = 0
     try:
-        db.query(DebtorOutstanding).filter_by(
+        # ── Pre-fetch parent_group from Ledger for all unique party names ──
+        party_names = {r['party_name'] for r in rows if r.get('party_name')}
+        ledger_rows = (
+            db.query(Ledger.ledger_name, Ledger.parent_group)
+            .filter(
+                Ledger.company_name == company_name,
+                Ledger.ledger_name.in_(party_names),
+            )
+            .all()
+        )
+        # ledger_name → parent_group lookup (empty string if not found)
+        parent_group_map: dict[str, str] = {
+            row.ledger_name: (row.parent_group or '') for row in ledger_rows
+        }
+        logger.info(
+            f"Outstanding upsert | company={company_name} | "
+            f"ledger parent_group lookup: {len(party_names)} parties → "
+            f"{len(parent_group_map)} matched"
+        )
+
+        # ── Full-replace: delete then insert ──────────────────────────────
+        db.query(OutstandingData).filter_by(
             company_name=company_name
         ).delete(synchronize_session='fetch')
 
         for row in rows:
             if not row.get('party_name'):
                 continue
-            db.add(DebtorOutstanding(
+            party = row.get('party_name', '')
+            db.add(OutstandingData(
                 company_name    = row.get('company_name'),
-                party_name      = row.get('party_name'),
+                party_name      = party,
+                parent_group    = parent_group_map.get(party, ''),
                 bill_name       = row.get('bill_name'),
                 bill_id         = row.get('bill_id'),
                 bill_date       = row.get('bill_date'),
@@ -1364,11 +1392,11 @@ def upsert_debtor_outstanding(rows, engine):
             inserted += 1
 
         db.commit()
-        logger.info(f"Debtor outstanding full-replace | company={company_name} | inserted={inserted}")
+        logger.info(f"Outstanding full-replace | company={company_name} | inserted={inserted}")
 
     except Exception:
         db.rollback()
-        logger.exception("Error upserting debtor outstanding")
+        logger.exception("Error upserting outstanding")
         raise
     finally:
         db.close()

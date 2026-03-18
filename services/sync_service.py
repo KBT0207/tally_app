@@ -14,7 +14,7 @@ from services.data_processor import (
     parse_ledgers,
     parse_items,
     parse_trial_balance,
-    parse_outstanding_debtors,
+    parse_outstanding,
     parse_guids,
     sanitize_xml_content,
 )
@@ -33,7 +33,7 @@ from database.database_processor import (
     upsert_journal_vouchers,
     upsert_contra_vouchers,
     upsert_trial_balance,
-    upsert_debtor_outstanding,
+    upsert_outstanding,
     reconcile_deleted_by_guids,
     reconcile_deleted_masters_in_db,
     INVENTORY_MODEL_MAP,
@@ -563,7 +563,7 @@ def _sync_trial_balance(
         logger.exception(f"[{company_name}] Trial Balance sync failed")
 
 
-def _sync_outstanding_debtors(
+def _sync_outstanding(
     company_name:    str,
     tally:           TallyConnector,
     engine,
@@ -581,10 +581,10 @@ def _sync_outstanding_debtors(
         if progress_cb:
             progress_cb(0.0, "Fetching outstanding debtors from Tally...")
 
-        if not _tally_semaphore_acquire('outstanding_debtors'):
+        if not _tally_semaphore_acquire('outstanding'):
             raise RuntimeError("Tally semaphore timeout — Tally may be hung")
         try:
-            xml = tally.fetch_outstanding_debtors(
+            xml = tally.fetch_outstanding(
                 company_name=company_name, from_date=from_date, to_date=to_date
             )
         finally:
@@ -594,18 +594,18 @@ def _sync_outstanding_debtors(
             logger.warning(f"[{company_name}] No outstanding debtors data from Tally")
             return
 
-        rows = parse_outstanding_debtors(xml, company_name, material_centre=material_centre)
+        rows = parse_outstanding(xml, company_name, material_centre=material_centre)
         if not rows:
             logger.warning(f"[{company_name}] Outstanding debtors parsed 0 rows")
             return
 
-        upsert_debtor_outstanding(rows, engine)
+        upsert_outstanding(rows, engine)
 
         lock = _get_company_lock(company_name)
         with lock:
             update_sync_state(
                 company_name    = company_name,
-                voucher_type    = 'outstanding_debtors',
+                voucher_type    = 'outstanding',
                 last_alter_id   = 0,
                 engine          = engine,
                 is_initial_done = True,
@@ -1025,10 +1025,10 @@ def sync_company(
     else:
         logger.info(f"[{comp_name}] Skipping trial_balance (not selected)")
 
-    if _selected('outstanding_debtors'):
-        _sync_outstanding_debtors(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre)
+    if _selected('outstanding'):
+        _sync_outstanding(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre)
     else:
-        logger.info(f"[{comp_name}] Skipping outstanding_debtors (not selected)")
+        logger.info(f"[{comp_name}] Skipping outstanding (not selected)")
 
     # Voucher types (filter by selection)
     active_configs = [

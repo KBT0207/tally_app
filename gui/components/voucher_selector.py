@@ -23,7 +23,7 @@ VOUCHER_ITEMS = [
     ("Journal",                "journal",              "📓"),
     ("Contra",                 "contra",               "🔄"),
     ("Trial Balance",          "trial_balance",        "⚖️"),
-    ("Outstanding Receivable", "outstanding_debtors",  "📊"),
+    ("Outstanding Receivable", "outstanding",          "📊"),
 ]
 
 

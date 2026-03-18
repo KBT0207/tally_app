@@ -87,7 +87,7 @@ class VoucherSelection:
     journal:              bool = True
     contra:               bool = True
     trial_balance:        bool = True
-    outstanding_debtors:  bool = True
+    outstanding:          bool = True
 
     def selected_types(self) -> list:
         """Return list of selected voucher_type strings matching VOUCHER_CONFIG keys."""
@@ -103,7 +103,7 @@ class VoucherSelection:
             'journal':             'journal',
             'contra':              'contra',
             'trial_balance':       'trial_balance',
-            'outstanding_debtors': 'outstanding_debtors',
+            'outstanding':         'outstanding',
         }
         return [v for k, v in mapping.items() if getattr(self, k)]
 
@@ -111,7 +111,7 @@ class VoucherSelection:
         return all([
             self.ledgers, self.items, self.sales, self.purchase, self.credit_note,
             self.debit_note, self.receipt, self.payment, self.journal,
-            self.contra, self.trial_balance, self.outstanding_debtors,
+            self.contra, self.trial_balance, self.outstanding,
         ])
 
 

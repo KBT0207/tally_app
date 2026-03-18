@@ -1322,7 +1322,7 @@ def parse_items(xml_content, company_name: str, material_centre: str = '') -> li
 # Outstanding — Debtors parser
 # ──────────────────────────────────────────────────────────────────────────────
 
-def parse_outstanding_debtors(xml_content, company_name: str, material_centre: str = '') -> list:
+def parse_outstanding(xml_content, company_name: str, material_centre: str = '') -> list:
     """
     Parse Sundry Debtors (Receivables) mapping Closing Balance to 'amount'.
     """
@@ -1330,7 +1330,7 @@ def parse_outstanding_debtors(xml_content, company_name: str, material_centre: s
         from lxml import etree as _lxml
 
         if not xml_content:
-            logger.warning(f"Empty XML for outstanding debtors [{company_name}]")
+            logger.warning(f"Empty XML for outstanding [{company_name}]")
             return []
 
         raw = xml_content if isinstance(xml_content, bytes) else xml_content.encode('utf-8')
@@ -1385,7 +1385,7 @@ def parse_outstanding_debtors(xml_content, company_name: str, material_centre: s
         return all_rows
 
     except Exception as e:
-        logger.error(f"Error parsing outstanding debtors [{company_name}]: {e}")
+        logger.error(f"Error parsing outstanding [{company_name}]: {e}")
         logger.error(traceback.format_exc())
         return []
 # ──────────────────────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ from .scheduler_config      import CompanySchedulerConfig
 # ── Phase 1: New models ───────────────────────────────────────────────────────
 from .tally_settings        import TallySettings
 from .automation_settings   import AutomationSettings
-from .outstanding_models import DebtorOutstanding
+from .outstanding_models import OutstandingData
 
 __all__ = [
     'Base',
@@ -38,7 +38,7 @@ __all__ = [
     'TrialBalance',
     'CompanySchedulerConfig',
 
-    'DebtorOutstanding',
+    'OutstandingData',
     # phase 1
     'TallySettings',
     'AutomationSettings',

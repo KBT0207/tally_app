@@ -37,7 +37,7 @@ VOUCHER_COLS = [
     ("Jn", "journal",              "Journal",               "📓"),
     ("Co", "contra",               "Contra",                "🔄"),
     ("TB", "trial_balance",        "Trial Balance",         "⚖️"),
-    ("Od", "outstanding_debtors",  "Outstanding Receivable","📊"),
+    ("Od", "outstanding",          "Outstanding Receivable","📊"),
 ]
 
 # Colour tokens

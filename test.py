@@ -2,7 +2,7 @@ import os
 import pandas as pd
 import xlwings as xw
 
-from services.data_processor import parse_inventory_voucher, parse_outstanding_debtors
+from services.data_processor import parse_inventory_voucher, parse_outstanding, parse_ledger_voucher
 from services.tally_connector import TallyConnector
 
 
@@ -26,12 +26,14 @@ for c in companies:
 
     print("Fetching:", name)
 
-    xml_data = tally.fetch_outstanding_creditors(
+    xml_data = tally.fetch_credit_note(
         name,
+        from_date='20250401',
+        to_date='20250430',
         debug=True
     )
 
-    rec = parse_outstanding_debtors(
+    rec = parse_inventory_voucher(
         xml_content=xml_data,
         company_name=name
     )
