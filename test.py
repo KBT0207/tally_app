@@ -26,7 +26,7 @@ for c in companies:
 
     print("Fetching:", name)
 
-    xml_data = tally.fetch_outstanding_debtors(
+    xml_data = tally.fetch_outstanding_creditors(
         name,
         debug=True
     )
@@ -38,6 +38,6 @@ for c in companies:
 
  
     df = pd.DataFrame(rec)
-    file_name = f'{name}.xlsx'
-    df.to_excel(file_name)
+    # file_name = f'{name}.xlsx'
+    # df.to_excel(file_name)
     xw.view(df)

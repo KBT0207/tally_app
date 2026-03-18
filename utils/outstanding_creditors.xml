@@ -1,4 +1,3 @@
-<?xml version="1.0" encoding="UTF-8"?>
 <ENVELOPE>
     <HEADER>
         <VERSION>1</VERSION>
@@ -17,22 +16,13 @@
             <TDL>
                 <TDLMESSAGE>
                     <COLLECTION NAME="CreditorsOutstanding" ISMODIFY="No">
-                        <TYPE>Voucher</TYPE>
+                        <TYPE>Bill</TYPE>
                         <CHILDOF>$$GroupSundryCreditors</CHILDOF>
-                        <FETCH>DATE</FETCH>
-                        <FETCH>VOUCHERNUMBER</FETCH>
-                        <FETCH>VOUCHERTYPENAME</FETCH>
-                        <FETCH>PARTYLEDGERNAME</FETCH>
-                        <FETCH>REFERENCE</FETCH>
-                        <FETCH>NARRATION</FETCH>
-                        <FETCH>BASICDUEDATEOFPYMT</FETCH>
-                        <FETCH>ALLLEDGERENTRIES.LEDGERNAME</FETCH>
-                        <FETCH>ALLLEDGERENTRIES.AMOUNT</FETCH>
-                        <FETCH>ALLLEDGERENTRIES.ISPARTYLEDGER</FETCH>
-                        <FETCH>ALLLEDGERENTRIES.ISDEEMEDPOSITIVE</FETCH>
-                        <FETCH>ALLLEDGERENTRIES.NAME</FETCH>
-                        <FETCH>ALLLEDGERENTRIES.BILLTYPE</FETCH>
-                        <FETCH>ALLLEDGERENTRIES.BILLDATE</FETCH>
+                        <FETCH>NAME</FETCH>
+                        <FETCH>BILLDATE</FETCH>
+                        <FETCH>PARENT</FETCH>
+                        <FETCH>CLOSINGBALANCE</FETCH>
+                        <FETCH>BILLDUEDATE</FETCH>
                     </COLLECTION>
                 </TDLMESSAGE>
             </TDL>
