@@ -1347,24 +1347,19 @@ def upsert_debtor_outstanding(rows, engine):
         ).delete(synchronize_session='fetch')
 
         for row in rows:
-            if not row.get('voucher_number'):
+            if not row.get('party_name'):
                 continue
             db.add(DebtorOutstanding(
-                company_name   = row.get('company_name'),
-                party_name     = row.get('party_name'),
-                voucher_number = row.get('voucher_number'),
-                voucher_type   = row.get('voucher_type'),
-                bill_name      = row.get('bill_name'),
-                bill_type      = row.get('bill_type'),
-                date           = row.get('date'),
-                bill_date      = row.get('bill_date'),
-                due_date       = row.get('due_date'),
-                reference      = row.get('reference'),
-                currency       = row.get('currency', 'INR'),
-                exchange_rate  = row.get('exchange_rate', 1.0),
-                amount         = row.get('amount', 0.0),
-                narration      = row.get('narration'),
-                material_centre= row.get('material_centre', ''),
+                company_name    = row.get('company_name'),
+                party_name      = row.get('party_name'),
+                bill_name       = row.get('bill_name'),
+                bill_id         = row.get('bill_id'),
+                bill_date       = row.get('bill_date'),
+                due_date        = row.get('due_date'),
+                currency        = row.get('currency', 'INR'),
+                exchange_rate   = row.get('exchange_rate', 1.0),
+                amount          = row.get('amount', 0.0),
+                material_centre = row.get('material_centre', ''),
             ))
             inserted += 1
 

@@ -1324,14 +1324,7 @@ def parse_items(xml_content, company_name: str, material_centre: str = '') -> li
 
 def parse_outstanding_debtors(xml_content, company_name: str, material_centre: str = '') -> list:
     """
-    Parse Sundry Debtors (Receivables) outstanding vouchers.
-
-    Returns list[dict] with keys:
-        company_name, party_name,
-        voucher_number, voucher_type,
-        bill_name, bill_type, date, bill_date, due_date,
-        reference, narration,
-        currency, exchange_rate, amount
+    Parse Sundry Debtors (Receivables) mapping Closing Balance to 'amount'.
     """
     try:
         from lxml import etree as _lxml
@@ -1341,86 +1334,54 @@ def parse_outstanding_debtors(xml_content, company_name: str, material_centre: s
             return []
 
         raw = xml_content if isinstance(xml_content, bytes) else xml_content.encode('utf-8')
-
-        parser   = _lxml.XMLParser(recover=True, encoding='utf-8')
-        root     = _lxml.fromstring(raw, parser=parser)
-        vouchers = root.findall('.//VOUCHER')
-        logger.info(f"Found {len(vouchers)} debtors vouchers [{company_name}]")
-
-        if not vouchers:
-            return []
+        parser = _lxml.XMLParser(recover=True, encoding='utf-8')
+        root = _lxml.fromstring(raw, parser=parser)
+        
+        # Target <BILL> nodes
+        bills = root.findall('.//BILL')
+        logger.info(f"Found {len(bills)} bill nodes [{company_name}]")
 
         all_rows = []
 
-        for voucher in vouchers:
-            vnum    = clean_text(voucher.findtext('VOUCHERNUMBER',      ''))
-            vtype   = clean_text(voucher.findtext('VOUCHERTYPENAME',    ''))
-            party   = clean_text(voucher.findtext('PARTYLEDGERNAME',    ''))
-            ref     = clean_text(voucher.findtext('REFERENCE',          ''))
-            narr    = clean_text(voucher.findtext('NARRATION',          ''))
-            raw_dt  = clean_text(voucher.findtext('DATE',               ''))
-            due_raw = clean_text(voucher.findtext('BASICDUEDATEOFPYMT', ''))
+        for bill in bills:
+            # Identity
+            b_name = bill.get('NAME', '')
+            party  = clean_text(bill.findtext('PARENT', ''))
+            b_id   = clean_text(bill.findtext('BILLID', '0'))
+            
+            # Dates
+            raw_dt     = clean_text(bill.findtext('BILLDATE', ''))
+            raw_due_dt = clean_text(bill.findtext('BILLDUEDATE', ''))
 
-            if not vnum:
-                continue
-
-            txn_date = parse_tally_date_formatted(raw_dt)
-            due_date = (
-                parse_tally_date_formatted(due_raw)
-                if due_raw and due_raw not in ('', '000000000') else None
-            )
-
-            amount        = 0.0
-            exchange_rate = 1.0
-            currency      = 'INR'
-            bill_name     = vnum
-            bill_type     = vtype
-            bill_date     = txn_date
-
-            for le in voucher.findall('.//ALLLEDGERENTRIES.LIST'):
-                isparty = clean_text(le.findtext('ISPARTYLEDGER', 'No'))
-                le_name = clean_text(le.findtext('LEDGERNAME',    ''))
-                amt_raw = clean_text(le.findtext('AMOUNT',        '0'))
-                bn      = clean_text(le.findtext('NAME',          ''))
-                bt      = clean_text(le.findtext('BILLTYPE',      ''))
-                bd      = clean_text(le.findtext('BILLDATE',      ''))
-
-                if isparty == 'Yes' and le_name == party:
-                    # FIX: preserve sign — negative = money owed TO us (receivable),
-                    # positive = credit note / overpayment.  Do NOT use abs() here.
-                    raw_str       = str(amt_raw).strip()
-                    is_negative   = raw_str.startswith('-')
-                    parsed_amount = _parse_fcy_amount(amt_raw)   # always positive magnitude
-                    amount        = -parsed_amount if is_negative else parsed_amount
-                    exchange_rate = _parse_fcy_exchange_rate(amt_raw)
-                    currency      = _detect_currency(amt_raw)
-                    if bn:
-                        bill_name = bn
-                    if bt:
-                        bill_type = bt
-                    if bd and bd not in ('', '000000000'):
-                        bill_date = parse_tally_date_formatted(bd)
-                    break
+            # Closing Balance Parsing
+            # Example: "-$26214.00 @ ? 87/$ = -? 2280618.00"
+            closing_raw = clean_text(bill.findtext('CLOSINGBALANCE', '0'))
+            
+            # Use existing helper to get magnitude
+            magnitude = _parse_fcy_amount(closing_raw)
+            
+            # Check for negative sign in raw string to handle Dr/Cr
+            # Tally receivables are usually negative in the XML export
+            amount = -magnitude if closing_raw.strip().startswith('-') else magnitude
+            
+            # Extract Currency and Rate using existing helpers
+            currency = _detect_currency(closing_raw)
+            rate     = _parse_fcy_exchange_rate(closing_raw)
 
             all_rows.append({
                 'company_name'   : company_name,
                 'party_name'     : party,
-                'voucher_number' : vnum,
-                'voucher_type'   : vtype,
-                'bill_name'      : bill_name,
-                'bill_type'      : bill_type,
-                'date'           : txn_date,
-                'bill_date'      : bill_date,
-                'due_date'       : due_date,
-                'reference'      : ref,
+                'bill_name'      : b_name,
+                'bill_id'        : int(b_id) if b_id.isdigit() else None,
+                'bill_date'      : parse_tally_date_formatted(raw_dt),
+                'due_date'       : parse_tally_date_formatted(raw_due_dt),
                 'currency'       : currency,
-                'exchange_rate'  : exchange_rate,
+                'exchange_rate'  : rate,
                 'amount'         : amount,
-                'narration'      : narr,
                 'material_centre': material_centre,
             })
 
-        logger.info(f"Parsed {len(all_rows)} debtors rows [{company_name}]")
+        logger.info(f"Successfully parsed {len(all_rows)} rows [{company_name}]")
         return all_rows
 
     except Exception as e:
