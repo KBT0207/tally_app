@@ -791,11 +791,14 @@ def parse_inventory_voucher(
 
             # ── Total amount from party ledger (for total_amt column) ──────────
             total_amt_from_xml = 0.0
+            voucher_type_name_lower = voucher_type_name.strip().lower()
             for ledger in ledger_entries:
                 if clean_text(ledger.findtext('ISPARTYLEDGER', 'No')) == 'Yes':
                     total_amt_from_xml = _parse_fcy_amount(
                         clean_text(ledger.findtext('AMOUNT', '0'))
                     )
+                    if voucher_type_name_lower == 'debit note':
+                        total_amt_from_xml = abs(total_amt_from_xml)
                     break
 
             # ── Aggregate GST / charges from ledger entries ────────────────────

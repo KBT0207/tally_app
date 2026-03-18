@@ -41,7 +41,7 @@ for c in companies:
         xml_content=xml_data,
         company_name=name,
         material_centre='FCY KBEIPL',
-        voucher_type_name='receipt vouchers'
+        # voucher_type_name='Debit Note'
         # voucher_type_name='Debit Note'
     )
 
