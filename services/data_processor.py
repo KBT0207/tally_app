@@ -258,46 +258,97 @@ def _parse_fcy_rate(raw: str) -> float:
     return 0.0
 
 
+# def _parse_fcy_amount(raw: str) -> float:
+#     """
+#     Extract the FCY (foreign currency) amount from a Tally AMOUNT field.
+#     Always returns an absolute value — sign is handled by the caller.
+
+#     "$61600.00 @ ? 1/$ = ? 61600.00"       → 61600.0
+#     "-$61600.00 @ ? 1/$ = -? 61600.00"     → 61600.0
+#     "CAD350.00 @ ? 0.9585/CAD = ? 335.48"  → 350.0  (CAD text-prefix format)
+#     "61600.00"                              → 61600.0
+#     """
+#     if not raw:
+#         return 0.0
+#     raw = str(raw).strip()
+
+#     # Corrupted EUR -- "7429.97 ? @ ? 105.18/? = ? 112427.03"
+#     # When euro sign is lost, it becomes '?' or U+FFFD after the FCY amount then ' @'.
+#     m = re.search(r'-?\s*([\d,]+\.?\d*)[\s]*[?\ufffd]\s*@', raw)
+#     if m:
+#         return abs(convert_to_float(m.group(1)))
+
+#     # Compound dollar symbol: -?AU$<number>
+#     #   "AU$16800.00 @ ? 1/AU$ = ? 16800.00"  ->  16800.0
+#     m = re.search(r'-?\s*' + _COMPOUND_DOLLAR_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
+#     if m:
+#         return abs(convert_to_float(m.group(2)))
+
+#     # Single-char symbol-prefixed FCY: -?<symbol><number>
+#     m = re.search(r'-?\s*' + _CURRENCY_SYMBOLS + r'\s*([\d,]+\.?\d*)', raw)
+#     if m:
+#         return abs(convert_to_float(m.group(1)))
+
+#     # ISO text-prefix FCY: -?<CODE><number>  e.g. "CAD350.00" or "-CAD350.00"
+#     m = re.search(r'-?\s*' + _ISO_TEXT_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
+#     if m:
+#         return abs(convert_to_float(m.group(2)))
+
+#     # Fallback: just first number
+#     m = re.search(r'([\d,]+\.?\d*)', raw)
+#     if m:
+#         return abs(convert_to_float(m.group(1)))
+
+#     return 0.0
+
+
+
 def _parse_fcy_amount(raw: str) -> float:
     """
     Extract the FCY (foreign currency) amount from a Tally AMOUNT field.
-    Always returns an absolute value — sign is handled by the caller.
+    Returns a signed value — negative if the raw string is negative.
 
-    "$61600.00 @ ? 1/$ = ? 61600.00"       → 61600.0
-    "-$61600.00 @ ? 1/$ = -? 61600.00"     → 61600.0
-    "CAD350.00 @ ? 0.9585/CAD = ? 335.48"  → 350.0  (CAD text-prefix format)
-    "61600.00"                              → 61600.0
+    "$61600.00 @ ? 1/$ = ? 61600.00"       →  61600.0
+    "-$61600.00 @ ? 1/$ = -? 61600.00"     → -61600.0
+    "CAD350.00 @ ? 0.9585/CAD = ? 335.48"  →  350.0
+    "-CAD350.00 @ ? 0.9585/CAD = ? 335.48" → -350.0
+    "61600.00"                              →  61600.0
+    "-61600.00"                             → -61600.0
     """
     if not raw:
         return 0.0
     raw = str(raw).strip()
 
+    # Detect sign from the raw string upfront
+    is_negative = raw.startswith('-')
+
+    def signed(value: float) -> float:
+        return -abs(value) if is_negative else abs(value)
+
     # Corrupted EUR -- "7429.97 ? @ ? 105.18/? = ? 112427.03"
-    # When euro sign is lost, it becomes '?' or U+FFFD after the FCY amount then ' @'.
     m = re.search(r'-?\s*([\d,]+\.?\d*)[\s]*[?\ufffd]\s*@', raw)
     if m:
-        return abs(convert_to_float(m.group(1)))
+        return signed(convert_to_float(m.group(1)))
 
     # Compound dollar symbol: -?AU$<number>
-    #   "AU$16800.00 @ ? 1/AU$ = ? 16800.00"  ->  16800.0
     m = re.search(r'-?\s*' + _COMPOUND_DOLLAR_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
     if m:
-        return abs(convert_to_float(m.group(2)))
+        return signed(convert_to_float(m.group(2)))
 
     # Single-char symbol-prefixed FCY: -?<symbol><number>
     m = re.search(r'-?\s*' + _CURRENCY_SYMBOLS + r'\s*([\d,]+\.?\d*)', raw)
     if m:
-        return abs(convert_to_float(m.group(1)))
+        return signed(convert_to_float(m.group(1)))
 
     # ISO text-prefix FCY: -?<CODE><number>  e.g. "CAD350.00" or "-CAD350.00"
     m = re.search(r'-?\s*' + _ISO_TEXT_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
     if m:
-        return abs(convert_to_float(m.group(2)))
+        return signed(convert_to_float(m.group(2)))
 
-    # Fallback: just first number
-    m = re.search(r'([\d,]+\.?\d*)', raw)
+    # Fallback: first number (may itself carry a minus in the raw string)
+    m = re.search(r'-?([\d,]+\.?\d*)', raw)
     if m:
-        return abs(convert_to_float(m.group(1)))
+        return signed(convert_to_float(m.group(1)))
 
     return 0.0
 
@@ -486,6 +537,9 @@ def parse_ledger_voucher(
     correctly included by Tally's filter.  We store whatever VOUCHERTYPENAME
     Tally returns — no Python-side name filtering.
     """
+
+
+    print(voucher_type_name)
     try:
         if not xml_content or (isinstance(xml_content, str) and not xml_content.strip()):
             logger.warning(f"Empty or None XML content for {voucher_type_name}")
@@ -573,6 +627,37 @@ def parse_ledger_voucher(
                 is_negative = raw_sign.startswith('-')
                 amount_type = 'Debit' if is_negative else 'Credit'
 
+                # ── Sign-correction rules ──────────────────────────────────────
+                # WHY we use `voucher_type_name` (not `voucher_type`):
+                #   - `voucher_type`      comes from Tally XML <VOUCHERTYPENAME>
+                #     and can be anything the user named it: "Receipt", "Bank Receipt",
+                #     "Cash Receipt", etc. — not reliable for matching.
+                #   - `voucher_type_name` is the fixed key from sync_service.py
+                #     VOUCHER_CONFIG['parser_type_name'], always:
+                #       receipt  → 'Receipt Vouchers'
+                #       payment  → 'Payment Vouchers'
+                #     Consistent regardless of Tally's internal naming.
+                #
+                # WHAT the rules do:
+                #   Receipt + Debit  → Tally stores party leg as negative
+                #     (money IN reduces receivable). Flip ×-1 → positive.
+                #   Payment + Credit → Tally stores party leg as positive
+                #     (money OUT increases payable credit). Flip ×-1, keep abs.
+                #
+                # `amount_type` is left unchanged — it still reflects true
+                # accounting direction (Debit / Credit) for that entry.
+                # ─────────────────────────────────────────────────────────────────
+                parsed_amount           = currency_info['amount']
+                voucher_type_name_lower = voucher_type_name.strip().lower()
+
+                if voucher_type_name_lower == 'receipt vouchers' and amount_type == 'Debit':
+                    # Receipt + Debit: Tally negative → flip to positive
+                    parsed_amount = parsed_amount * -1
+
+                elif voucher_type_name_lower == 'payment vouchers' and amount_type == 'Credit':
+                    # Payment + Credit: Tally positive → flip, keep magnitude positive
+                    parsed_amount = abs(parsed_amount * -1)
+
                 all_rows.append({
                     'company_name'  : company_name,
                     'date'          : parse_tally_date_formatted(date),
@@ -580,7 +665,7 @@ def parse_ledger_voucher(
                     'voucher_number': voucher_number,
                     'reference'     : reference,
                     'ledger_name'   : ledger_name,
-                    'amount'        : currency_info['amount'],
+                    'amount'        : parsed_amount,
                     'amount_type'   : amount_type,
                     'currency'      : currency_info['currency'],
                     'exchange_rate' : currency_info['exchange_rate'],
@@ -851,7 +936,7 @@ def parse_inventory_voucher(
                         'exp_date'     : exp_date,
                         'hsn_code'     : hsn_code,
                         'rate'         : currency_data['rate'],      # ✅ FCY per-unit rate
-                        'amount'       : item_amount,                # ✅ FCY amount
+                        'amount'       : abs(item_amount),                # ✅ FCY amount
                         'discount'     : currency_data['discount'],
                         'currency'     : currency_data['currency'],
                         'exchange_rate': currency_data['exchange_rate'],
@@ -1358,11 +1443,7 @@ def parse_outstanding(xml_content, company_name: str, material_centre: str = '')
             closing_raw = clean_text(bill.findtext('CLOSINGBALANCE', '0'))
             
             # Use existing helper to get magnitude
-            magnitude = _parse_fcy_amount(closing_raw)
-            
-            # Check for negative sign in raw string to handle Dr/Cr
-            # Tally receivables are usually negative in the XML export
-            amount = -magnitude if closing_raw.strip().startswith('-') else magnitude
+            amount = _parse_fcy_amount(closing_raw)
             
             # Extract Currency and Rate using existing helpers
             currency = _detect_currency(closing_raw)
@@ -1377,7 +1458,7 @@ def parse_outstanding(xml_content, company_name: str, material_centre: str = '')
                 'due_date'       : parse_tally_date_formatted(raw_due_dt),
                 'currency'       : currency,
                 'exchange_rate'  : rate,
-                'amount'         : amount,
+                'amount'         : (amount) * (-1),
                 'material_centre': material_centre,
             })
 
