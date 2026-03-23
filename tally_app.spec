@@ -19,6 +19,12 @@
 #     policies (DLL load blocked in isolated subprocess).
 #     The local hook skips OpenSSL detection entirely; binaries are collected
 #     binaries are collected by hooks/hook-cryptography.py instead.
+#   - Removed xlwings from excludes (it is a real dependency in pyproject.toml)
+#     and added it to hiddenimports so it is bundled correctly.
+#   - Fixed python-dotenv exclude entry (module name is 'dotenv', not 'python-dotenv').
+#   - XML data files use globs (utils/*.xml, utils/cdc/*.xml, utils/guid/*.xml,
+#     utils/reports/*.xml) so added/deleted XMLs are handled automatically at
+#     build time — no spec changes needed when XMLs change.
 #
 # FOLDER LAYOUT REQUIRED:
 #   tally_app/
@@ -245,10 +251,9 @@ a = Analysis(
         'IPython',
         'pytest',
         'rq',
-        'xlwings',
         'customtkinter',
         'ttkbootstrap',
-        'python-dotenv',
+        'dotenv',
     ],
     noarchive=False,
     optimize=0,
