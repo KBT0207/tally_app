@@ -50,7 +50,7 @@ class _InventoryVoucherMixin:
 
 
 class SalesVoucher(_InventoryVoucherMixin, Base):
-    __tablename__ = 'sales_vouchers'
+    __tablename__ = 'tally_sales_vouchers'
 
     def __repr__(self):
         return (
@@ -63,7 +63,7 @@ class SalesVoucher(_InventoryVoucherMixin, Base):
 
 
 class PurchaseVoucher(_InventoryVoucherMixin, Base):
-    __tablename__ = 'purchase_vouchers'
+    __tablename__ = 'tally_purchase_vouchers'
 
     def __repr__(self):
         return (
@@ -76,7 +76,7 @@ class PurchaseVoucher(_InventoryVoucherMixin, Base):
 
 
 class CreditNote(_InventoryVoucherMixin, Base):
-    __tablename__ = 'credit_notes'
+    __tablename__ = 'tally_credit_notes'
 
     def __repr__(self):
         return (
@@ -89,7 +89,7 @@ class CreditNote(_InventoryVoucherMixin, Base):
 
 
 class DebitNote(_InventoryVoucherMixin, Base):
-    __tablename__ = 'debit_notes'
+    __tablename__ = 'tally_debit_notes'
 
     def __repr__(self):
         return (

@@ -27,7 +27,7 @@ class _LedgerVoucherMixin:
 
 
 class ReceiptVoucher(_LedgerVoucherMixin, Base):
-    __tablename__ = 'receipt_vouchers'
+    __tablename__ = 'tally_receipt_vouchers'
 
     def __repr__(self):
         return (
@@ -40,7 +40,7 @@ class ReceiptVoucher(_LedgerVoucherMixin, Base):
 
 
 class PaymentVoucher(_LedgerVoucherMixin, Base):
-    __tablename__ = 'payment_vouchers'
+    __tablename__ = 'tally_payment_vouchers'
 
     def __repr__(self):
         return (
@@ -53,7 +53,7 @@ class PaymentVoucher(_LedgerVoucherMixin, Base):
 
 
 class JournalVoucher(_LedgerVoucherMixin, Base):
-    __tablename__ = 'journal_vouchers'
+    __tablename__ = 'tally_journal_vouchers'
 
     def __repr__(self):
         return (
@@ -66,7 +66,7 @@ class JournalVoucher(_LedgerVoucherMixin, Base):
 
 
 class ContraVoucher(_LedgerVoucherMixin, Base):
-    __tablename__ = 'contra_vouchers'
+    __tablename__ = 'tally_contra_vouchers'
 
     def __repr__(self):
         return (

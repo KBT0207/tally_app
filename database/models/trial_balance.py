@@ -4,7 +4,7 @@ from .base import Base
 
 
 class TrialBalance(Base):
-    __tablename__ = 'trial_balance'
+    __tablename__ = 'tally_trial_balance'
 
     id               = Column(BigInteger,  primary_key=True, autoincrement=True)
     company_name     = Column(String(255), nullable=False, index=True)

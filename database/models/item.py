@@ -6,7 +6,7 @@ from .base import Base
 
 
 class Item(Base):
-    __tablename__ = 'items'
+    __tablename__ = 'tally_items'
 
     # ── Primary key ──────────────────────────────────────────────────────────
     id = Column(Integer, primary_key=True, autoincrement=True)
