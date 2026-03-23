@@ -112,7 +112,6 @@ class SyncController:
         with _SYNC_LOCK:
             if not self._bypass_active_check and self._state.sync_active:
                 logger.warning("[SyncController] Sync already active — skipping duplicate start")
-                # Post all_done so caller doesn't hang waiting
                 self._q.put(("all_done",))
                 return
             self._state.sync_active    = True
@@ -242,7 +241,6 @@ class SyncController:
         try:
             from services.sync_service import sync_company
 
-            # None = CDC/incremental (alter_id gated), date string = snapshot
             fd = from_date
 
             self._post("progress", company_name, 10.0, "Syncing...")
@@ -264,15 +262,10 @@ class SyncController:
             self._post("log",      company_name, f"✓ {company_name} sync complete", "SUCCESS")
             self._post("done",     company_name, True)
 
-            # Update in-memory CompanyState so the home page badge flips to
-            # "Sync Done" immediately — without needing a restart to re-read DB.
-            # is_initial_done is set True whenever a sync completes successfully,
-            # because sync_service already wrote is_initial_done=True to SyncState
-            # rows in the DB for every voucher type it processed.
             co = self._state.get_company(company_name)
             if co:
                 co.is_initial_done  = True
-                co.last_sync_time   = datetime.now()   # update in-memory immediately
+                co.last_sync_time   = datetime.now()
 
             self._state.set_company_status(
                 company_name,
@@ -319,11 +312,25 @@ class SyncController:
             self._post("log", name, message, level)
 
     def _build_company_dict(self, name: str) -> dict:
+        """
+        Build the company dict passed to sync_service.sync_company().
+
+        default_currency is read from CompanyState (loaded from DB at startup)
+        and passed through so sync_service / data_processor use the correct
+        base currency fallback for this company instead of the hardcoded 'INR'.
+        This mirrors how material_centre is already threaded through.
+        """
         co = self._state.get_company(name)
         if co:
             return {
-                "name":           co.name,
-                "starting_from":  co.starting_from or "20240401",
-                "material_centre": getattr(co, 'material_centre', '') or '',
+                "name":             co.name,
+                "starting_from":    co.starting_from or "20240401",
+                "material_centre":  getattr(co, 'material_centre',  '') or '',
+                "default_currency": getattr(co, 'default_currency', 'INR') or 'INR',
             }
-        return {"name": name, "starting_from": "20240401", "material_centre": ""}
+        return {
+            "name":             name,
+            "starting_from":    "20240401",
+            "material_centre":  "",
+            "default_currency": "INR",
+        }

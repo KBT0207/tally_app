@@ -74,30 +74,15 @@ def _get_company_lock(company_name: str) -> threading.Lock:
 
 
 # ── Voucher type routing ──────────────────────────────────────────────────────
-#
-# Your XML templates already use Tally's built-in TDL filters:
-#   $$IsSales, $$IsPurchase, $$IsReceipt, $$IsPayment,
-#   $$IsJournal, $$IsContra, $$IsCreditNote, $$IsDebitNote
-#
-# These filters work on Tally's INTERNAL voucher type classification, NOT on
-# the display name.  So a voucher named "Tax Invoice" or "Export Invoice" that
-# is classified as Sales-type WILL be returned by $$IsSales — Tally has already
-# done the routing correctly before the XML reaches Python.
-#
-# Therefore we must NOT filter by VOUCHERTYPENAME in Python — doing so would
-# drop all your custom-named vouchers.  Instead we trust what each XML fetch
-# returns and store whatever VOUCHERTYPENAME Tally gives us directly into DB.
-#
-# The 'allowed_types' key is kept as None for all types (= accept all).
 VOUCHER_TYPE_NAMES = {
-    'sales'       : None,   # Tally $$IsSales filter already correct
-    'purchase'    : None,   # Tally $$IsPurchase filter already correct
-    'credit_note' : None,   # Tally $$IsCreditNote filter already correct
-    'debit_note'  : None,   # Tally $$IsDebitNote filter already correct
-    'receipt'     : None,   # Tally $$IsReceipt filter already correct
-    'payment'     : None,   # Tally $$IsPayment filter already correct
-    'journal'     : None,   # Tally $$IsJournal filter already correct
-    'contra'      : None,   # Tally $$IsContra filter already correct
+    'sales'       : None,
+    'purchase'    : None,
+    'credit_note' : None,
+    'debit_note'  : None,
+    'receipt'     : None,
+    'payment'     : None,
+    'journal'     : None,
+    'contra'      : None,
 }
 VOUCHER_CONFIG = [
     {
@@ -284,8 +269,7 @@ def _advance_alter_id_from_xml(
 ):
     """
     Advance last_alter_id from a deleted-only CDC batch where the parser
-    returned [] but valid XML was received.  Without this the same deleted
-    records are re-fetched on every subsequent sync.
+    returned [] but valid XML was received.
     """
     try:
         xml_str = sanitize_xml_content(xml)
@@ -332,23 +316,6 @@ def _reconcile_deleted_vouchers(
     from_date:    str,
     to_date:      str,
 ):
-    """
-    Phase 3 — Catch deletes that CDC missed, scanning from_date → to_date
-    in 3-month chunks.
-
-    from_date is always company.starting_from (full_from passed by _sync_voucher).
-    to_date   is always today.
-    Every chunk from company start to today is scanned — no date cutoffs.
-
-    SAFE FAILURE CONTRACT (never deletes when uncertain):
-      xml is None/empty   → network or Tally error → skip that chunk
-      tally_guids is None → parse failure          → skip that chunk
-      Any exception       → log and continue (non-fatal)
-
-    TRUST CONTRACT:
-      tally_guids == {} → Tally confirmed 0 vouchers in this window.
-                          This is a valid answer — delete all orphaned DB rows.
-    """
     voucher_type = config['voucher_type']
     kind         = config['kind']
     guid_fetch   = config['guid_fetch']
@@ -386,7 +353,6 @@ def _reconcile_deleted_vouchers(
                 _TALLY_SEMAPHORE.release()
 
             if not xml:
-                # xml is None → network/Tally error — never delete on a failed fetch
                 logger.debug(
                     f"[{company_name}][{voucher_type}] "
                     f"Phase 3 chunk {month_str}: no response from Tally — skipping (safe)"
@@ -396,19 +362,12 @@ def _reconcile_deleted_vouchers(
             tally_guids = parse_guids(xml)
 
             if tally_guids is None:
-                # parse_guids returns None only on a genuine parse failure —
-                # never delete when we cannot read what Tally returned
                 logger.warning(
                     f"[{company_name}][{voucher_type}] "
                     f"Phase 3 chunk {month_str}: parse_guids failed — skipping chunk (safe)"
                 )
                 continue
 
-            # tally_guids == {} means Tally confirmed 0 vouchers in this window.
-            # This is a valid response — trust it fully.
-            # reconcile_deleted_by_guids will hard-delete any DB rows whose
-            # GUIDs are not present in Tally (i.e. all rows in this window
-            # when tally_guids is empty).
             if len(tally_guids) == 0:
                 logger.info(
                     f"[{company_name}][{voucher_type}] "
@@ -455,17 +414,10 @@ def _reconcile_deleted_vouchers(
 
 def _reconcile_deleted_masters(
     company_name: str,
-    master_type:  str,   # 'items' or 'ledger'
+    master_type:  str,
     tally:        TallyConnector,
     engine,
 ):
-    """
-    Fetch all master GUIDs from Tally and hard delete any DB rows whose
-    GUID is no longer present in Tally.
-
-    SAFE FAILURE CONTRACT:
-      tally_guids None or empty → skip entirely, never delete.
-    """
     fetch_fn_name = 'fetch_item_guids' if master_type == 'items' else 'fetch_ledger_guids'
     fetch_fn      = getattr(tally, fetch_fn_name)
 
@@ -500,27 +452,15 @@ def _reconcile_deleted_masters(
 
 
 def _sync_trial_balance(
-    company_name:    str,
-    tally:           TallyConnector,
+    company_name:     str,
+    tally:            TallyConnector,
     engine,
-    from_date:       str,
-    to_date:         str,
+    from_date:        str,
+    to_date:          str,
     progress_cb=None,
-    material_centre: str = '',
+    material_centre:  str = '',
+    default_currency: str = 'INR',
 ):
-    """
-    Sync trial balance for the given date window.
-
-    FIX: The old alter_id skip guard used `max_alter_id == saved_alter_id`
-    to decide "nothing changed, skip".  Trial balance nodes in Tally
-    frequently return alter_id=0 — meaning max_alter_id would always be 0
-    and saved_alter_id would also be 0 after the first sync, causing ALL
-    subsequent trial balance syncs to be skipped silently.
-
-    New strategy: always fetch and upsert (the upsert itself is idempotent
-    and only writes when values actually differ), and advance the saved
-    alter_id to whatever Tally returns so the log is correct.
-    """
     logger.info(f"[{company_name}] Syncing Trial Balance | {from_date} -> {to_date}")
     try:
         if progress_cb:
@@ -539,14 +479,15 @@ def _sync_trial_balance(
             logger.warning(f"[{company_name}] No trial balance data from Tally")
             return
 
-        rows = parse_trial_balance(xml, company_name, from_date, to_date, material_centre=material_centre)
+        rows = parse_trial_balance(
+            xml, company_name, from_date, to_date,
+            material_centre=material_centre,
+            default_currency=default_currency,
+        )
         if not rows:
             logger.warning(f"[{company_name}] Trial balance parsed 0 rows")
             return
 
-        # FIX: always upsert — do not skip based on alter_id
-        # (trial balance alter_id is often 0 from Tally; skip guard was causing
-        # trial balance to never refresh after the very first sync)
         upsert_trial_balance(rows, engine)
 
         max_alter_id = _get_max_alter_id(rows)
@@ -564,18 +505,15 @@ def _sync_trial_balance(
 
 
 def _sync_outstanding(
-    company_name:    str,
-    tally:           TallyConnector,
+    company_name:     str,
+    tally:            TallyConnector,
     engine,
-    from_date:       str,
-    to_date:         str,
+    from_date:        str,
+    to_date:          str,
     progress_cb=None,
-    material_centre: str = '',
+    material_centre:  str = '',
+    default_currency: str = 'INR',
 ):
-    """
-    Fetch and full-replace Sundry Debtors outstanding.
-    Always a fresh point-in-time snapshot — no alter_id check.
-    """
     logger.info(f"[{company_name}] Syncing Outstanding Debtors | {from_date} -> {to_date}")
     try:
         if progress_cb:
@@ -594,7 +532,11 @@ def _sync_outstanding(
             logger.warning(f"[{company_name}] No outstanding debtors data from Tally")
             return
 
-        rows = parse_outstanding(xml, company_name, material_centre=material_centre)
+        rows = parse_outstanding(
+            xml, company_name,
+            material_centre=material_centre,
+            default_currency=default_currency,
+        )
         if not rows:
             logger.warning(f"[{company_name}] Outstanding debtors parsed 0 rows")
             return
@@ -619,11 +561,14 @@ def _sync_outstanding(
         logger.exception(f"[{company_name}] Outstanding Debtors sync failed")
 
 
-def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=None, material_centre: str = ''):
-    """
-    Sync the StockItem master.
-    First run → full snapshot.  Subsequent → CDC using stored alter_id.
-    """
+def _sync_items(
+    company_name:     str,
+    tally:            TallyConnector,
+    engine,
+    progress_cb=None,
+    material_centre:  str = '',
+    default_currency: str = 'INR',
+):
     logger.info(f"[{company_name}] Syncing Items (StockItem master)")
     lock = _get_company_lock(company_name)
     try:
@@ -648,7 +593,7 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
                 _reconcile_deleted_masters(company_name, 'items', tally, engine)
                 return
 
-            rows = parse_items(xml, company_name, material_centre=material_centre)
+            rows = parse_items(xml, company_name, material_centre=material_centre, default_currency=default_currency)
             if not rows:
                 logger.info(
                     f"[{company_name}][items] CDC: 0 rows "
@@ -665,7 +610,6 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
             logger.info(
                 f"[{company_name}][items] CDC done | rows={len(rows)} | new max_alter_id={new_max}"
             )
-            # GUID reconciliation — catch deletes CDC missed
             _reconcile_deleted_masters(company_name, 'items', tally, engine)
             return
 
@@ -680,7 +624,7 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
             logger.warning(f"[{company_name}][items] No item data from Tally")
             return
 
-        rows = parse_items(xml, company_name, material_centre=material_centre)
+        rows = parse_items(xml, company_name, material_centre=material_centre, default_currency=default_currency)
         if not rows:
             logger.warning(f"[{company_name}][items] Snapshot parsed 0 rows")
             return
@@ -698,7 +642,14 @@ def _sync_items(company_name: str, tally: TallyConnector, engine, progress_cb=No
         logger.exception(f"[{company_name}] Item sync failed")
 
 
-def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=None, material_centre: str = ''):
+def _sync_ledgers(
+    company_name:     str,
+    tally:            TallyConnector,
+    engine,
+    progress_cb=None,
+    material_centre:  str = '',
+    default_currency: str = 'INR',
+):
     logger.info(f"[{company_name}] Syncing Ledgers")
     lock = _get_company_lock(company_name)
     try:
@@ -723,7 +674,7 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=
                 _reconcile_deleted_masters(company_name, 'ledger', tally, engine)
                 return
 
-            rows = parse_ledgers(xml, company_name, material_centre=material_centre)
+            rows = parse_ledgers(xml, company_name, material_centre=material_centre, default_currency=default_currency)
             if not rows:
                 logger.info(
                     f"[{company_name}][ledger] CDC: 0 rows "
@@ -740,7 +691,6 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=
             logger.info(
                 f"[{company_name}][ledger] CDC done | rows={len(rows)} | new max_alter_id={new_max}"
             )
-            # GUID reconciliation — catch deletes CDC missed
             _reconcile_deleted_masters(company_name, 'ledger', tally, engine)
             return
 
@@ -755,7 +705,7 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=
             logger.warning(f"[{company_name}][ledger] No ledger data from Tally")
             return
 
-        rows = parse_ledgers(xml, company_name, material_centre=material_centre)
+        rows = parse_ledgers(xml, company_name, material_centre=material_centre, default_currency=default_currency)
         if not rows:
             logger.warning(f"[{company_name}][ledger] Snapshot parsed 0 rows")
             return
@@ -774,15 +724,16 @@ def _sync_ledgers(company_name: str, tally: TallyConnector, engine, progress_cb=
 
 
 def _sync_voucher(
-    company_name: str,
-    config:       dict,
-    tally:        TallyConnector,
+    company_name:     str,
+    config:           dict,
+    tally:            TallyConnector,
     engine,
-    from_date:    str,   # incremental window start (used for snapshot)
-    to_date:      str,
-    full_from:    str,   # Issue 1 & 2 fix: full company history start for Phase 3
+    from_date:        str,
+    to_date:          str,
+    full_from:        str,
     progress_cb=None,
-    material_centre: str = '',
+    material_centre:  str = '',
+    default_currency: str = 'INR',
 ):
     voucher_type     = config['voucher_type']
     snapshot_fetch   = config['snapshot_fetch']
@@ -791,7 +742,7 @@ def _sync_voucher(
     upsert           = config['upsert']
     parser_type_name = config['parser_type_name']
     kind             = config['kind']
-    allowed_types    = config.get('allowed_types')   # set of allowed VOUCHERTYPENAME values or None
+    allowed_types    = config.get('allowed_types')
 
     lock = _get_company_lock(company_name)
     logger.info(f"[{company_name}][{voucher_type}] Starting")
@@ -820,11 +771,15 @@ def _sync_voucher(
                 logger.warning(
                     f"[{company_name}][{voucher_type}] CDC: no response from Tally ({fetch_ms}ms)"
                 )
-                # Issue 1 & 2 fix: reconcile full history, not just incremental window
                 _reconcile_deleted_vouchers(company_name, config, tally, engine, full_from, to_date)
                 return
 
-            rows = parser(xml, company_name, parser_type_name, allowed_types=allowed_types, material_centre=material_centre)
+            rows = parser(
+                xml, company_name, parser_type_name,
+                allowed_types=allowed_types,
+                material_centre=material_centre,
+                default_currency=default_currency,
+            )
 
             if not rows:
                 logger.info(
@@ -832,7 +787,6 @@ def _sync_voucher(
                     f"(possible delete-only batch) | advancing alter_id from XML"
                 )
                 _advance_alter_id_from_xml(xml, company_name, voucher_type, engine, lock)
-                # Issue 1 & 2 fix: reconcile full history, not just incremental window
                 _reconcile_deleted_vouchers(company_name, config, tally, engine, full_from, to_date)
                 return
 
@@ -848,8 +802,6 @@ def _sync_voucher(
                 f"fetch={fetch_ms}ms upsert={upsert_ms}ms"
             )
 
-            # Phase 3: GUID reconciliation (always after CDC)
-            # Issue 1 & 2 fix: reconcile full history, not just incremental window
             _reconcile_deleted_vouchers(company_name, config, tally, engine, full_from, to_date)
             return
 
@@ -877,12 +829,6 @@ def _sync_voucher(
 
         for chunk_from, chunk_to, month_str in _generate_chunks(from_date, to_date):
 
-            # FIX: snapshot resume — skip chunks strictly LESS THAN last_synced_month.
-            # The old code used `month_str < last_synced_month` which correctly skips
-            # already-committed chunks.  However if last_synced_month == month_str the
-            # chunk was already committed by upsert_and_advance_month in the previous
-            # run, so we should also skip it (avoid double-insert).
-            # Changed from `<` to `<=` to correctly skip the already-committed boundary chunk.
             if last_synced_month and month_str <= last_synced_month:
                 logger.debug(
                     f"[{company_name}][{voucher_type}] Skipping already-done chunk {month_str}"
@@ -913,7 +859,12 @@ def _sync_voucher(
                 chunks_done += 1
                 continue
 
-            rows = parser(xml, company_name, parser_type_name, allowed_types=allowed_types, material_centre=material_centre)
+            rows = parser(
+                xml, company_name, parser_type_name,
+                allowed_types=allowed_types,
+                material_centre=material_centre,
+                default_currency=default_currency,
+            )
 
             if not rows:
                 logger.info(
@@ -954,9 +905,6 @@ def _sync_voucher(
             f"[{company_name}][{voucher_type}] Phase 1: Snapshot complete | "
             f"chunks={chunks_done} | total_rows={total_rows} | max_alter_id={final_alter_id}"
         )
-        # Phase 3 intentionally NOT run after snapshot — we are still pulling
-        # historical data; reconciling would incorrectly delete rows for months
-        # not yet fetched.
 
     except Exception:
         logger.exception(
@@ -968,13 +916,13 @@ def _sync_voucher(
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def sync_company(
-    company:              dict,
-    tally:                TallyConnector,
+    company:               dict,
+    tally:                 TallyConnector,
     engine,
-    to_date:              str,
-    manual_from_date:     str  = None,
+    to_date:               str,
+    manual_from_date:      str  = None,
     parallel_company_mode: bool = False,
-    voucher_selection:    set  = None,   # set of voucher type strings to run; None = all
+    voucher_selection:     set  = None,
 ):
     """
     Sync a single company — all 3 phases.
@@ -983,17 +931,17 @@ def sync_company(
     Phase 2 (CDC):      runs on every subsequent sync, alter_id gated
     Phase 3 (Reconcile): runs after every CDC sync, full-history GUID diff
 
-    voucher_selection: optional set of type names to run, e.g.
-        {"sales", "purchase", "ledgers", "trial_balance"}
-        Pass None (default) to run everything — preserves existing behaviour.
-        Names match VoucherSelection attribute names used in the GUI.
+    default_currency is read from the company dict (set by sync_controller
+    from CompanyState.default_currency, which is loaded from DB).
+    It flows to every parser so plain amounts with no currency symbol are
+    attributed to the correct base currency for this company.
     """
-    comp_name     = company.get('name', '').strip()
-    mat_centre    = company.get('material_centre', '') or ''
-    from_date     = manual_from_date if manual_from_date else _resolve_from_date(company)
-    inner_workers = 1 if parallel_company_mode else VOUCHER_WORKERS
+    comp_name        = company.get('name', '').strip()
+    mat_centre       = company.get('material_centre', '') or ''
+    default_currency = company.get('default_currency', 'INR') or 'INR'
+    from_date        = manual_from_date if manual_from_date else _resolve_from_date(company)
+    inner_workers    = 1 if parallel_company_mode else VOUCHER_WORKERS
 
-    # Normalise selection to a set for O(1) lookup; None means run all
     sel = set(voucher_selection) if voucher_selection is not None else None
 
     def _selected(name: str) -> bool:
@@ -1002,6 +950,7 @@ def sync_company(
     logger.info('=' * 60)
     logger.info(f'Syncing company  : {comp_name}')
     logger.info(f'Date range       : {from_date} -> {to_date}')
+    logger.info(f'Default currency : {default_currency}')
     logger.info(f'Chunk size       : {SNAPSHOT_CHUNK_MONTHS} months per API call')
     logger.info(f'Voucher workers  : {inner_workers} (parallel_company_mode={parallel_company_mode})')
     logger.info(f'Voucher filter   : {sorted(sel) if sel is not None else "all"}')
@@ -1009,28 +958,26 @@ def sync_company(
 
     start_time = datetime.now()
 
-    # Masters & reports (only if selected)
     if _selected('ledger'):
-        _sync_ledgers(comp_name, tally, engine, material_centre=mat_centre)
+        _sync_ledgers(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency)
     else:
         logger.info(f"[{comp_name}] Skipping ledgers (not selected)")
 
     if _selected('items'):
-        _sync_items(comp_name, tally, engine, material_centre=mat_centre)
+        _sync_items(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency)
     else:
         logger.info(f"[{comp_name}] Skipping items (not selected)")
 
     if _selected('trial_balance'):
-        _sync_trial_balance(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre)
+        _sync_trial_balance(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre, default_currency=default_currency)
     else:
         logger.info(f"[{comp_name}] Skipping trial_balance (not selected)")
 
     if _selected('outstanding'):
-        _sync_outstanding(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre)
+        _sync_outstanding(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre, default_currency=default_currency)
     else:
         logger.info(f"[{comp_name}] Skipping outstanding (not selected)")
 
-    # Voucher types (filter by selection)
     active_configs = [
         config for config in VOUCHER_CONFIG
         if _selected(config['voucher_type'])
@@ -1042,23 +989,20 @@ def sync_company(
 
     if active_configs:
         logger.info(f"[{comp_name}] Launching {len(active_configs)} voucher syncs ...")
-        # full_from = earliest possible date for this company — used by Phase 3
-        # so GUID reconciliation always covers the full history, not just the
-        # incremental window.  This fixes Issues 1 & 2 (cancelled vouchers and
-        # new-fiscal-year deletes being missed).
         full_from = _resolve_from_date(company)
         with ThreadPoolExecutor(max_workers=inner_workers) as executor:
             futures = {
                 executor.submit(
                     _sync_voucher,
-                    company_name = comp_name,
-                    config       = config,
-                    tally        = tally,
-                    engine       = engine,
-                    from_date       = from_date,
-                    to_date         = to_date,
-                    full_from       = full_from,
-                    material_centre = mat_centre,
+                    company_name     = comp_name,
+                    config           = config,
+                    tally            = tally,
+                    engine           = engine,
+                    from_date        = from_date,
+                    to_date          = to_date,
+                    full_from        = full_from,
+                    material_centre  = mat_centre,
+                    default_currency = default_currency,
                 ): config['voucher_type']
                 for config in active_configs
             }
