@@ -828,7 +828,11 @@ def parse_inventory_voucher(
 
                     qty_numeric        = convert_to_float(re.search(r'[\d,]+\.?\d*', qty_txt).group() if re.search(r'[\d,]+\.?\d*', qty_txt) else '0')
                     alt_qty, alt_unit  = parse_quantity_with_unit(billed_txt)
-                    unit               = extract_unit_from_rate(rate_txt) or alt_unit
+                    # Unit priority: rate field → billedqty → actualqty
+                    # Tally sometimes sends empty RATE and BILLEDQTY (e.g. zero-qty lines),
+                    # so fall back to ACTUALQTY as a last resort.
+                    _, qty_unit        = parse_quantity_with_unit(qty_txt)
+                    unit               = extract_unit_from_rate(rate_txt) or alt_unit or qty_unit
 
                     batch_no = mfg_date = exp_date = ''
                     batch_allocations = inv.findall('.//BATCHALLOCATIONS.LIST')
