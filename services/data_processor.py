@@ -573,7 +573,7 @@ def parse_ledger_voucher(
                     break
 
             for ledger in ledger_entries:
-                ledger_name   = clean_text(ledger.findtext('LEDGERNAME', ''))
+                ledger_name   = ledger.findtext('LEDGERNAME', '') or ''
                 amount_text   = clean_text(ledger.findtext('AMOUNT', '0'))
                 currency_info = extract_currency_and_values(None, amount_text, default_currency=default_currency)
 
@@ -672,7 +672,7 @@ def parse_inventory_voucher(
             voucher_number = clean_text(voucher.findtext('VOUCHERNUMBER', ''))
             voucher_type   = clean_text(voucher.findtext('VOUCHERTYPENAME', ''))
             date           = clean_text(voucher.findtext('DATE', ''))
-            party_name     = clean_text(voucher.findtext('PARTYNAME', ''))
+            party_name     = voucher.findtext('PARTYNAME', '') or ''
             reference      = clean_text(voucher.findtext('REFERENCE', ''))
             narration      = clean_text(voucher.findtext('NARRATION', ''))
             party_gstin    = clean_text(voucher.findtext('PARTYGSTIN', ''))
@@ -748,7 +748,7 @@ def parse_inventory_voucher(
             }
 
             for ledger in ledger_entries:
-                ledger_name_raw   = clean_text(ledger.findtext('LEDGERNAME', ''))
+                ledger_name_raw   = ledger.findtext('LEDGERNAME', '') or ''
                 ledger_name_lower = ledger_name_raw.lower()
                 amt_text          = clean_text(ledger.findtext('AMOUNT', '0'))
                 amount            = abs(convert_to_float(extract_numeric_amount(amt_text)))
@@ -803,7 +803,7 @@ def parse_inventory_voucher(
 
             if has_real_inventory:
                 for inv in inventory_entries:
-                    item_name = clean_text(inv.findtext('STOCKITEMNAME', ''))
+                    item_name = inv.findtext('STOCKITEMNAME', '') or ''
                     if not item_name:
                         continue
 
@@ -834,7 +834,7 @@ def parse_inventory_voucher(
                     batch_allocations = inv.findall('.//BATCHALLOCATIONS.LIST')
                     if batch_allocations:
                         batch    = batch_allocations[0]
-                        batch_no = clean_text(batch.findtext('BATCHNAME', ''))
+                        batch_no = batch.findtext('BATCHNAME', '') or ''
                         mfg_raw  = clean_text(batch.findtext('MFDON', ''))
                         mfg_date = parse_tally_date_formatted(mfg_raw) or ''
                         exp_elem = batch.find('EXPIRYPERIOD')
@@ -1056,10 +1056,10 @@ def parse_ledgers(xml_content, company_name: str, material_centre: str = '', def
         all_rows = []
 
         for ledger in ledgers:
-            ledger_name    = ledger.get('NAME', '')
+            ledger_name    = ledger.get('NAME', '') or ledger.findtext('NAME', '') or ''
             guid           = clean_text(ledger.findtext('GUID', ''))
             alter_id       = clean_text(ledger.findtext('ALTERID', '0'))
-            parent         = clean_text(ledger.findtext('PARENT', ''))
+            parent         = ledger.findtext('PARENT', '') or ''
             created_date   = clean_text(ledger.findtext('CREATEDDATE', ''))
             altered_on     = clean_text(ledger.findtext('ALTEREDON', ''))
             email          = clean_text(ledger.findtext('EMAIL', ''))
@@ -1070,7 +1070,7 @@ def parse_ledgers(xml_content, company_name: str, material_centre: str = '', def
             contact_person = clean_text(ledger.findtext('LEDGERCONTACT', ''))
 
             aliases      = []
-            direct_alias = clean_text(ledger.findtext('ALIAS', ''))
+            direct_alias = ledger.findtext('ALIAS', '') or ''
             if direct_alias and direct_alias != ledger_name:
                 aliases.append(direct_alias)
             for lang_list in ledger.findall('.//LANGUAGENAME.LIST'):
@@ -1172,8 +1172,7 @@ def parse_trial_balance(xml_content, company_name: str, start_date: str, end_dat
         all_rows = []
 
         for ledger in ledger_nodes:
-            ledger_name = ledger.get('NAME', '') or clean_text(ledger.findtext('LEDGERNAME', ''))
-            ledger_name = clean_text(ledger_name)
+            ledger_name = ledger.get('NAME', '') or ledger.findtext('LEDGERNAME', '') or ''
             if not ledger_name:
                 continue
 
@@ -1252,7 +1251,7 @@ def parse_items(xml_content, company_name: str, material_centre: str = '', defau
         skipped  = 0
 
         for item in items:
-            item_name = clean_text(item.get('NAME', '') or item.findtext('NAME', ''))
+            item_name = item.get('NAME', '') or item.findtext('NAME', '') or ''
             guid      = clean_text(item.findtext('GUID', ''))
 
             if not item_name or not guid:
@@ -1263,10 +1262,10 @@ def parse_items(xml_content, company_name: str, material_centre: str = '', defau
             remote_alt_guid = clean_text(item.findtext('REMOTEALTGUID', ''))
             alter_id_raw    = clean_text(item.findtext('ALTERID', '0'))
 
-            parent_group = clean_text(item.findtext('PARENT',          '')).strip()
-            category     = clean_text(item.findtext('CATEGORY',        '')).strip()
-            base_units   = clean_text(item.findtext('BASEUNITS',       ''))
-            gst_type     = clean_text(item.findtext('GSTTYPEOFSUPPLY', ''))
+            parent_group = item.findtext('PARENT', '') or ''
+            category     = item.findtext('CATEGORY', '') or ''
+            base_units   = item.findtext('BASEUNITS', '') or ''
+            gst_type     = item.findtext('GSTTYPEOFSUPPLY', '') or ''
 
             opening_balance = convert_to_float(
                 extract_numeric_amount(clean_text(item.findtext('OPENINGBALANCE', '0')))
@@ -1278,7 +1277,7 @@ def parse_items(xml_content, company_name: str, material_centre: str = '', defau
                 extract_numeric_amount(clean_text(item.findtext('OPENINGVALUE',   '0')))
             )
 
-            entered_by = clean_text(item.findtext('ENTEREDBY', ''))
+            entered_by = item.findtext('ENTEREDBY', '') or ''
 
             is_deleted_raw = clean_text(item.findtext('ISDELETED', ''))
             action         = item.get('ACTION', '')
@@ -1347,7 +1346,7 @@ def parse_outstanding(xml_content, company_name: str, material_centre: str = '',
 
         for bill in bills:
             b_name = bill.get('NAME', '')
-            party  = clean_text(bill.findtext('PARENT', ''))
+            party  = bill.findtext('PARENT', '') or ''
             b_id   = clean_text(bill.findtext('BILLID', '0'))
 
             raw_dt     = clean_text(bill.findtext('BILLDATE', ''))

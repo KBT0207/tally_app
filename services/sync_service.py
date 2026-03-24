@@ -3,6 +3,9 @@ from calendar import monthrange
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import xml.etree.ElementTree as ET
+import gc
+import psutil
+import os
 
 from logging_config import logger
 from database.models.sync_state import SyncState
@@ -71,6 +74,53 @@ def _get_company_lock(company_name: str) -> threading.Lock:
         if company_name not in _SYNC_STATE_LOCKS:
             _SYNC_STATE_LOCKS[company_name] = threading.Lock()
         return _SYNC_STATE_LOCKS[company_name]
+
+
+def cleanup_sync_state(company_name: str = "") -> None:
+    """
+    Clear accumulated global lock state and force garbage collection.
+    Called in a finally block after each company sync to prevent memory growth
+    across repeated runs. Zero data impact — only clears in-memory lock dicts.
+    """
+    prefix = f"[{company_name}] " if company_name else ""
+    logger.info(f"{prefix}Cleaning up global state...")
+
+    with _SYNC_STATE_LOCKS_MUTEX:
+        sync_lock_count = len(_SYNC_STATE_LOCKS)
+        _SYNC_STATE_LOCKS.clear()
+
+    logger.info(f"Cleared {sync_lock_count} sync locks")
+
+    gc.collect()
+    logger.info(f"{prefix}Cleanup complete (zero data impact)")
+
+
+class MemoryMonitor:
+    """Tracks RSS memory and warns if growth exceeds a threshold."""
+
+    def __init__(self, company_name: str, warn_mb: float = 500.0):
+        self.company_name = company_name
+        self.warn_mb      = warn_mb
+        self._proc        = psutil.Process(os.getpid())
+        self.baseline_mb  = self._rss_mb()
+
+    def _rss_mb(self) -> float:
+        return self._proc.memory_info().rss / (1024 * 1024)
+
+    def check(self, label: str = "") -> float:
+        current_mb = self._rss_mb()
+        growth_mb  = current_mb - self.baseline_mb
+        if growth_mb > self.warn_mb:
+            logger.warning(
+                f"[{self.company_name}] MEMORY ALERT{' ' + label if label else ''}: "
+                f"RSS={current_mb:.0f}MB (+{growth_mb:.0f}MB since start)"
+            )
+        else:
+            logger.debug(
+                f"[{self.company_name}] Memory{' ' + label if label else ''}: "
+                f"RSS={current_mb:.0f}MB (+{growth_mb:.0f}MB)"
+            )
+        return current_mb
 
 
 # ── Voucher type routing ──────────────────────────────────────────────────────
@@ -875,20 +925,25 @@ def _sync_voucher(
                 continue
 
             chunk_max = max((int(r.get('alter_id', 0)) for r in rows), default=0)
-            upsert_and_advance_month(
-                rows               = rows,
-                model_class        = model_class,
-                upsert_fn          = upsert_fn,
-                company_name       = company_name,
-                voucher_type       = voucher_type,
-                month_str          = month_str,
-                engine             = engine,
-                chunk_max_alter_id = chunk_max,
-            )
+            try:
+                upsert_and_advance_month(
+                    rows               = rows,
+                    model_class        = model_class,
+                    upsert_fn          = upsert_fn,
+                    company_name       = company_name,
+                    voucher_type       = voucher_type,
+                    month_str          = month_str,
+                    engine             = engine,
+                    chunk_max_alter_id = chunk_max,
+                )
 
-            all_alter_ids.extend(int(r.get('alter_id', 0)) for r in rows)
-            total_rows  += len(rows)
-            chunks_done += 1
+                all_alter_ids.extend(int(r.get('alter_id', 0)) for r in rows)
+                total_rows  += len(rows)
+                chunks_done += 1
+            finally:
+                del xml
+                del rows
+                gc.collect()
 
         final_alter_id = max(all_alter_ids) if all_alter_ids else 0
         with lock:
@@ -958,69 +1013,73 @@ def sync_company(
 
     start_time = datetime.now()
 
-    if _selected('ledger'):
-        _sync_ledgers(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency)
-    else:
-        logger.info(f"[{comp_name}] Skipping ledgers (not selected)")
+    try:
+        if _selected('ledger'):
+            _sync_ledgers(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency)
+        else:
+            logger.info(f"[{comp_name}] Skipping ledgers (not selected)")
 
-    if _selected('items'):
-        _sync_items(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency)
-    else:
-        logger.info(f"[{comp_name}] Skipping items (not selected)")
+        if _selected('items'):
+            _sync_items(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency)
+        else:
+            logger.info(f"[{comp_name}] Skipping items (not selected)")
 
-    if _selected('trial_balance'):
-        _sync_trial_balance(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre, default_currency=default_currency)
-    else:
-        logger.info(f"[{comp_name}] Skipping trial_balance (not selected)")
+        if _selected('trial_balance'):
+            _sync_trial_balance(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre, default_currency=default_currency)
+        else:
+            logger.info(f"[{comp_name}] Skipping trial_balance (not selected)")
 
-    if _selected('outstanding'):
-        _sync_outstanding(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre, default_currency=default_currency)
-    else:
-        logger.info(f"[{comp_name}] Skipping outstanding (not selected)")
+        if _selected('outstanding'):
+            _sync_outstanding(comp_name, tally, engine, from_date, to_date, material_centre=mat_centre, default_currency=default_currency)
+        else:
+            logger.info(f"[{comp_name}] Skipping outstanding (not selected)")
 
-    active_configs = [
-        config for config in VOUCHER_CONFIG
-        if _selected(config['voucher_type'])
-    ]
+        active_configs = [
+            config for config in VOUCHER_CONFIG
+            if _selected(config['voucher_type'])
+        ]
 
-    skipped = [c['voucher_type'] for c in VOUCHER_CONFIG if c not in active_configs]
-    if skipped:
-        logger.info(f"[{comp_name}] Skipping voucher types: {skipped}")
+        skipped = [c['voucher_type'] for c in VOUCHER_CONFIG if c not in active_configs]
+        if skipped:
+            logger.info(f"[{comp_name}] Skipping voucher types: {skipped}")
 
-    if active_configs:
-        logger.info(f"[{comp_name}] Launching {len(active_configs)} voucher syncs ...")
-        full_from = _resolve_from_date(company)
-        with ThreadPoolExecutor(max_workers=inner_workers) as executor:
-            futures = {
-                executor.submit(
-                    _sync_voucher,
-                    company_name     = comp_name,
-                    config           = config,
-                    tally            = tally,
-                    engine           = engine,
-                    from_date        = from_date,
-                    to_date          = to_date,
-                    full_from        = full_from,
-                    material_centre  = mat_centre,
-                    default_currency = default_currency,
-                ): config['voucher_type']
-                for config in active_configs
-            }
+        if active_configs:
+            logger.info(f"[{comp_name}] Launching {len(active_configs)} voucher syncs ...")
+            full_from = _resolve_from_date(company)
+            with ThreadPoolExecutor(max_workers=inner_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _sync_voucher,
+                        company_name     = comp_name,
+                        config           = config,
+                        tally            = tally,
+                        engine           = engine,
+                        from_date        = from_date,
+                        to_date          = to_date,
+                        full_from        = full_from,
+                        material_centre  = mat_centre,
+                        default_currency = default_currency,
+                    ): config['voucher_type']
+                    for config in active_configs
+                }
 
-            for future in as_completed(futures):
-                vt = futures[future]
-                try:
-                    future.result()
-                    logger.info(f"[{comp_name}][{vt}] Thread finished OK")
-                except Exception:
-                    logger.error(
-                        f"[{comp_name}][{vt}] Thread raised an exception (other types continue)"
-                    )
-    else:
-        logger.info(f"[{comp_name}] No voucher types to run after filtering")
+                for future in as_completed(futures):
+                    vt = futures[future]
+                    try:
+                        future.result()
+                        logger.info(f"[{comp_name}][{vt}] Thread finished OK")
+                    except Exception:
+                        logger.error(
+                            f"[{comp_name}][{vt}] Thread raised an exception (other types continue)"
+                        )
+        else:
+            logger.info(f"[{comp_name}] No voucher types to run after filtering")
 
-    elapsed = (datetime.now() - start_time).total_seconds()
-    logger.info(f"[{comp_name}] Sync completed in {elapsed:.1f}s")
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logger.info(f"[{comp_name}] Sync completed in {elapsed:.1f}s")
+
+    finally:
+        cleanup_sync_state(comp_name)
 
 
 def sync_all_companies(
