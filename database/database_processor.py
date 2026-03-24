@@ -53,7 +53,7 @@ def _log_changes(label, existing, update_fields, new_row):
 def _t(value, max_len):
     if value is None:
         return None
-    value = str(value).strip()
+    value = str(value)
     if len(value) > max_len:
         logger.debug(f"Truncating value of length {len(value)} to {max_len}: {value[:30]}...")
         return value[:max_len]
