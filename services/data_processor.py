@@ -791,8 +791,9 @@ def parse_inventory_voucher(
                     voucher_charges['other_amt'] += amount
 
             # ── Inventory line items ───────────────────────────────────────────
-            has_real_inventory = any(
-                clean_text(inv.findtext('STOCKITEMNAME', ''))
+            real_items = [
+                inv for inv in inventory_entries
+                if clean_text(inv.findtext('STOCKITEMNAME', ''))
                 and (
                     _parse_fcy_amount(
                         clean_text((inv.find('AMOUNT').text if inv.find('AMOUNT') is not None else ''))
@@ -802,8 +803,15 @@ def parse_inventory_voucher(
                         if re.search(r'[\d,]+\.?\d*', clean_text((inv.find('ACTUALQTY').text if inv.find('ACTUALQTY') is not None else '') or '')) else '0'
                     ) > 0
                 )
-                for inv in inventory_entries
-            )
+            ]
+
+            named_items = [
+                inv for inv in inventory_entries
+                if clean_text(inv.findtext('STOCKITEMNAME', ''))
+            ]
+
+            has_real_inventory = bool(named_items)
+            inventory_entries = real_items if real_items else named_items
 
             temp_item_data    = []
             total_item_amount = 0.0

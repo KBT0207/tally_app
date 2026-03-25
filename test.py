@@ -10,8 +10,10 @@ tally = TallyConnector()
 comps = tally.fetch_all_companies()
 for comp in comps:
     name = comp.get("name")
+    if name in ['', ' ', 'N/A', 'NA']:
+        continue
     print(name)
-    data = tally.fetch_sales(name, from_date='20220201',to_date='20220801',debug=False)
+    data = tally.fetch_sales(name, from_date='20260204',to_date='20260204',debug=False)
     rec = parse_inventory_voucher(data,company_name=name, material_centre='Vashi KBEIPL')
     df = pd.DataFrame(rec)
     view(df)
