@@ -869,7 +869,10 @@ def _propagate_ledger_rename(
         count = (
             db.query(model)
             .filter(*filters)
-            .update({'party_name': new_name}, synchronize_session='fetch')
+            .update(
+                {'company_name': company_name, 'party_name': new_name},
+                synchronize_session='fetch',
+            )
         )
         if count:
             logger.info(
@@ -899,7 +902,10 @@ def _propagate_ledger_rename(
         count = (
             db.query(model)
             .filter(*filters)
-            .update({'ledger_name': new_name}, synchronize_session='fetch')
+            .update(
+                {'company_name': company_name, 'ledger_name': new_name},
+                synchronize_session='fetch',
+            )
         )
         if count:
             logger.info(
@@ -943,7 +949,10 @@ def _propagate_item_rename(
                 model.item_name    == old_name,        # exact case-sensitive match
                 model.is_deleted   == 'No',
             )
-            .update({'item_name': new_name}, synchronize_session='fetch')
+            .update(
+                {'company_name': company_name, 'item_name': new_name},
+                synchronize_session='fetch',
+            )
         )
         if count:
             logger.info(
