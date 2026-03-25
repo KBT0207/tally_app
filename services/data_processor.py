@@ -31,12 +31,19 @@ class ProcessingTimer:
 # Text / XML helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+# def clean_text(text):
+#     if not text:
+#         return ""
+#     text = str(text).replace('&#13;&#10;', ' ').replace('&#13;', ' ').replace('&#10;', ' ')
+#     text = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
+#     return re.sub(r'\s+', ' ', text).strip()
+
 def clean_text(text):
     if not text:
         return ""
     text = str(text).replace('&#13;&#10;', ' ').replace('&#13;', ' ').replace('&#10;', ' ')
     text = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
-    return re.sub(r'\s+', ' ', text).strip()
+    return text.strip()
 
 
 def sanitize_xml_content(content):
