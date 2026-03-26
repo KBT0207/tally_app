@@ -47,6 +47,9 @@ class CompanyState:
     is_initial_done:   bool                 = False
     starting_from:     Optional[str]        = None   # YYYYMMDD string
     books_from:        Optional[str]        = None
+    formal_name:       Optional[str]        = None   # BASICCOMPANYFORMALNAME from Tally
+    company_number:    Optional[str]        = None   # COMPANYNUMBER from Tally
+    audited_upto:      Optional[str]        = None   # AUDITEDUPTO from Tally (YYYYMMDD)
     tally_host:        str                  = "localhost"
     tally_port:        int                  = 9000
     tally_open:        bool                 = False  # ← FIXED: was missing, caused pill to never show

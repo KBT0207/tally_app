@@ -716,6 +716,9 @@ class TallySyncApp:
                     is_initial_done   = is_initial,
                     starting_from     = from_str,
                     books_from        = books_str,
+                    formal_name       = getattr(co, 'formal_name',    None) or None,
+                    company_number    = getattr(co, 'company_number',  None) or None,
+                    audited_upto      = str(co.audited_upto).replace("-", "")[:8] if getattr(co, 'audited_upto', None) else None,
                     tally_host        = getattr(co, 'tally_host', 'localhost') or 'localhost',
                     tally_port        = int(getattr(co, 'tally_port', 9000) or 9000),
                     tally_open        = False,
@@ -765,14 +768,24 @@ class TallySyncApp:
                 self.state.companies[name].tally_open = True
                 if not self.state.companies[name].books_from and books_str:
                     self.state.companies[name].books_from = books_str
+                # Always update these from Tally — they're read-only Tally fields
+                if tc.get('formal_name'):
+                    self.state.companies[name].formal_name    = tc['formal_name']
+                if tc.get('company_number'):
+                    self.state.companies[name].company_number = tc['company_number']
+                if tc.get('audited_upto'):
+                    self.state.companies[name].audited_upto   = tc['audited_upto']
             else:
                 cs = CompanyState(
-                    name          = name,
-                    guid          = tc.get("guid", ""),
-                    status        = CompanyStatus.NOT_CONFIGURED,
-                    starting_from = from_str,
-                    books_from    = books_str,
-                    tally_open    = True,
+                    name           = name,
+                    guid           = tc.get("guid", ""),
+                    status         = CompanyStatus.NOT_CONFIGURED,
+                    starting_from  = from_str,
+                    books_from     = books_str,
+                    formal_name    = tc.get("formal_name",    None) or None,
+                    company_number = tc.get("company_number", None) or None,
+                    audited_upto   = tc.get("audited_upto",   None) or None,
+                    tally_open     = True,
                 )
                 self.state.companies[name] = cs
 
@@ -782,7 +795,9 @@ class TallySyncApp:
                            tally_host: str = "localhost", tally_port: int = 9000,
                            company_type: str = "local", data_path: str = "",
                            tds_path: str = "", drive_letter: str = "",
-                           material_centre: str = "", default_currency: str = "INR"):
+                           material_centre: str = "", default_currency: str = "INR",
+                           formal_name: str = "", company_number: str = "",
+                           audited_upto: str = ""):
         from sqlalchemy.orm import sessionmaker
         from database.models.company import Company
 
@@ -813,6 +828,13 @@ class TallySyncApp:
                     existing.default_currency = default_currency or 'INR'
                 if books_from:
                     existing.books_from = books_from
+                if formal_name and hasattr(existing, 'formal_name'):
+                    existing.formal_name    = formal_name or None
+                if company_number and hasattr(existing, 'company_number'):
+                    existing.company_number = company_number or None
+                if audited_upto and hasattr(existing, 'audited_upto'):
+                    from database.database_processor import _parse_date_str
+                    existing.audited_upto = _parse_date_str(audited_upto)
             else:
                 co = Company(
                     name             = company_name,
@@ -826,7 +848,12 @@ class TallySyncApp:
                     drive_letter     = drive_letter     or None,
                     material_centre  = material_centre  or None,
                     default_currency = default_currency or 'INR',
+                    formal_name      = formal_name      or None,
+                    company_number   = company_number   or None,
                 )
+                if audited_upto and hasattr(Company, 'audited_upto'):
+                    from database.database_processor import _parse_date_str
+                    co.audited_upto = _parse_date_str(audited_upto)
                 if hasattr(Company, 'tally_host'):
                     co.tally_host = tally_host or "localhost"
                 if hasattr(Company, 'tally_port'):

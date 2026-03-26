@@ -466,6 +466,9 @@ class ConfigureCompanyDialog(tk.Toplevel):
             drive_letter     = drive_letter,
             material_centre  = self._material_centre_var.get().strip(),
             default_currency = self._default_currency_var.get().strip() or 'INR',
+            formal_name      = getattr(co, 'formal_name',    None) or '',
+            company_number   = getattr(co, 'company_number', None) or '',
+            audited_upto     = getattr(co, 'audited_upto',   None) or '',
         )
 
         if not ok:
@@ -488,6 +491,8 @@ class ConfigureCompanyDialog(tk.Toplevel):
         co.drive_letter       = drive_letter
         co.material_centre    = self._material_centre_var.get().strip()
         co.default_currency   = self._default_currency_var.get().strip() or 'INR'
+        # formal_name / company_number / audited_upto are read-only from Tally —
+        # already set on co when fetched; no need to re-assign here.
 
         if reset_initial:
             co.is_initial_done = False

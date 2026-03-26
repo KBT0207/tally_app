@@ -8,14 +8,16 @@ from services.tally_connector import TallyConnector
 
 tally = TallyConnector()
 comps = tally.fetch_all_companies()
-for comp in comps:
-    name = comp.get("name")
-    if name in ['', ' ', 'N/A', 'NA']:
-        continue
-    print(name)
-    data = tally.fetch_credit_note(name, from_date='20251004',to_date='20251004',debug=True)
-    rec = parse_inventory_voucher(data,company_name=name, material_centre='FCY KBEIPL', voucher_type_name='credit note')
-    df = pd.DataFrame(rec)
-    view(df)
+df = pd.DataFrame(comps)
+view(df)
+# for comp in comps:
+#     name = comp.get("name")
+#     if name in ['', ' ', 'N/A', 'NA']:
+#         continue
+#     print(name)
+#     data = tally.fetch_credit_note(name, from_date='20251004',to_date='20251004',debug=True)
+#     rec = parse_inventory_voucher(data,company_name=name, material_centre='FCY KBEIPL', voucher_type_name='credit note')
+#     df = pd.DataFrame(rec)
+#     view(df)
   
 
