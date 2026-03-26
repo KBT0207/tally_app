@@ -710,13 +710,12 @@ def parse_inventory_voucher(
                             ledger.findall('.//INVENTORYALLOCATIONS.LIST')
                         )
                         if nested_inv:
-                            inventory_entries = nested_inv
-                            logger.info(
-                                f"[{voucher_type_name}] Accounting Voucher View detected: "
-                                f"extracted {len(nested_inv)} inventory entries from ledger "
-                                f"'{ledger.findtext('LEDGERNAME', '')}'"
-                            )
-                            break
+                            inventory_entries.extend(nested_inv)   # ← extend, not assign
+                if inventory_entries:
+                    logger.info(
+                        f"[{voucher_type_name}] Accounting Voucher View: "
+                        f"collected {len(inventory_entries)} inventory entries across all ledgers"
+                    )
 
             # Deleted CDC stub — emit a single row so DB can mark it deleted
             if is_deleted_flag == 'Yes' and not ledger_entries and not inventory_entries:
