@@ -13,8 +13,8 @@ for comp in comps:
     if name in ['', ' ', 'N/A', 'NA']:
         continue
     print(name)
-    data = tally.fetch_sales(name, from_date='20260204',to_date='20260204',debug=False)
-    rec = parse_inventory_voucher(data,company_name=name, material_centre='Vashi KBEIPL')
+    data = tally.fetch_sales(name, from_date='20251003',to_date='20251003',debug=False)
+    rec = parse_inventory_voucher(data,company_name=name, material_centre='Vashi KBEIPL', voucher_type_name='credit note')
     df = pd.DataFrame(rec)
     view(df)
   

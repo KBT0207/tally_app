@@ -696,6 +696,28 @@ def parse_inventory_voucher(
             inventory_entries = (voucher.findall('.//ALLINVENTORYENTRIES.LIST') or
                                  voucher.findall('.//INVENTORYENTRIES.LIST'))
 
+            # ── Accounting Voucher View fallback (Credit Note / Debit Note) ──────
+            # Tally's Accounting Voucher View embeds inventory inside a non-party
+            # ALLLEDGERENTRIES.LIST using INVENTORYALLOCATIONS.LIST sub-nodes
+            # (not ALLINVENTORYENTRIES.LIST). Extract those so item/qty/rate/amount
+            # fields are populated instead of falling back to "No Item".
+            if not inventory_entries:
+                for ledger in ledger_entries:
+                    if clean_text(ledger.findtext('ISPARTYLEDGER', 'No')) != 'Yes':
+                        nested_inv = (
+                            ledger.findall('.//ALLINVENTORYENTRIES.LIST') or
+                            ledger.findall('.//INVENTORYENTRIES.LIST') or
+                            ledger.findall('.//INVENTORYALLOCATIONS.LIST')
+                        )
+                        if nested_inv:
+                            inventory_entries = nested_inv
+                            logger.info(
+                                f"[{voucher_type_name}] Accounting Voucher View detected: "
+                                f"extracted {len(nested_inv)} inventory entries from ledger "
+                                f"'{ledger.findtext('LEDGERNAME', '')}'"
+                            )
+                            break
+
             # Deleted CDC stub — emit a single row so DB can mark it deleted
             if is_deleted_flag == 'Yes' and not ledger_entries and not inventory_entries:
                 all_rows.append(_deleted_inventory_stub(
