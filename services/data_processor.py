@@ -7,6 +7,97 @@ from logging_config import logger
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Sign transformation rules
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Tally stores amounts with accounting sign conventions that vary by voucher
+# type.  These helpers re-sign parsed rows so all amounts are expressed from
+# a consistent reporting perspective before the rows reach the database.
+#
+# Rules:
+#   Sales       → total_amt × -1
+#   Purchase    → amount, cgst_amt, sgst_amt, igst_amt,
+#                 freight_amt, dca_amt, cf_amt, other_amt  × -1
+#   Credit Note → same 8 fields as Purchase  × -1
+#   Debit Note  → total_amt × -1
+#   Receipt / Payment / Journal / Contra
+#               → amount × -1  only when amount_type == 'Debit'
+
+_SIGN_DETAIL_FIELDS = (
+    'amount', 'cgst_amt', 'sgst_amt', 'igst_amt',
+    'freight_amt', 'dca_amt', 'cf_amt', 'other_amt',
+)
+
+# All amount fields that must be rounded to 2 decimal places.
+# Excludes: exchange_rate, gst_rate (precision rates), quantity/alt_qty (counts).
+_INVENTORY_AMOUNT_FIELDS = (
+    'rate', 'amount', 'discount',
+    'cgst_amt', 'sgst_amt', 'igst_amt',
+    'freight_amt', 'dca_amt', 'cf_amt', 'other_amt',
+    'total_amt',
+)
+_LEDGER_AMOUNT_FIELDS = (
+    'amount',
+)
+
+
+def _negate_fields(row: dict, *fields: str) -> None:
+    """Multiply each named numeric field by -1 in-place; skips missing/None/zero."""
+    for field in fields:
+        val = row.get(field)
+        if val is not None:
+            try:
+                fval = float(val)
+                if fval != 0:          # ignore zero — never negate a zero value
+                    row[field] = -fval
+            except (TypeError, ValueError):
+                pass
+
+
+def _round_fields(row: dict, *fields: str) -> None:
+    """Round each named numeric field to 2 decimal places in-place; skips missing/None."""
+    for field in fields:
+        val = row.get(field)
+        if val is not None:
+            try:
+                row[field] = round(float(val), 2)
+            except (TypeError, ValueError):
+                pass
+
+
+def _apply_inventory_signs(rows: list, voucher_type_name: str) -> list:
+    """
+    Apply sign rules + round to 2dp for inventory voucher rows
+    (Sales / Purchase / Credit Note / Debit Note).
+    Called inside parse_inventory_voucher just before returning all_rows.
+    """
+    key = voucher_type_name.strip().lower()
+    for row in rows:
+        if 'sales' in key:
+            _negate_fields(row, 'total_amt')
+        elif 'purchase' in key or 'credit' in key:
+            _negate_fields(row, *_SIGN_DETAIL_FIELDS)
+        elif 'debit' in key:
+            _negate_fields(row, 'total_amt')
+        _round_fields(row, *_INVENTORY_AMOUNT_FIELDS)
+    return rows
+
+
+def _apply_ledger_signs(rows: list) -> list:
+    """
+    Apply sign rules + round to 2dp for ledger voucher rows
+    (Receipt / Payment / Journal / Contra).
+    Called inside parse_ledger_voucher just before returning all_rows.
+    Negates amount only when amount_type == 'Debit'.
+    """
+    for row in rows:
+        if row.get('amount_type') == 'Debit':
+            _negate_fields(row, 'amount')
+        _round_fields(row, *_LEDGER_AMOUNT_FIELDS)
+    return rows
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Timer utility
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -44,6 +135,16 @@ def clean_text(text):
     text = str(text).replace('&#13;&#10;', ' ').replace('&#13;', ' ').replace('&#10;', ' ')
     text = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
     return text.strip()
+
+
+def clean_narration(text):
+    """Clean narration text: replace tabs with a single space, then collapse
+    any runs of whitespace down to one space and strip edges."""
+    if not text:
+        return ""
+    text = clean_text(text)          # handle newlines / HTML entities first
+    text = text.replace('\t', ' ')   # tabs → single space
+    return re.sub(r' {2,}', ' ', text).strip()
 
 
 def sanitize_xml_content(content):
@@ -228,42 +329,42 @@ def _parse_fcy_rate(raw: str) -> float:
     # Pattern: <digits>?<optional-space>=  ->  grab the digits before the corrupt char.
     m = re.search(r'([\d,]+\.?\d*)[?\ufffd]\s*=', raw)
     if m:
-        return abs(convert_to_float(m.group(1)))
+        return convert_to_float(m.group(1))
 
     # Step 1a: Compound dollar symbol (AU$, NZ$, HK$, SG$, CA$) — check BEFORE bare $
     #   "AU$28.00 = ? 28.00/box"  ->  28.0  (AUD)
     m = re.search(_COMPOUND_DOLLAR_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
     if m:
-        return abs(convert_to_float(m.group(2)))
+        return convert_to_float(m.group(2))
 
     # Step 1b: Single-char FCY symbol -- number immediately after symbol
     #   "$14.00 = ? 84.5/$ = ? 1183/box"  ->  14.0  (USD)
     m = re.search(_CURRENCY_SYMBOLS + r'\s*([\d,]+\.?\d*)', raw)
     if m:
-        return abs(convert_to_float(m.group(1)))
+        return convert_to_float(m.group(1))
 
     # Step 1c: Single-char FCY symbol -- number immediately BEFORE symbol
     #   "30.58 £ = ? 3216.40/Box"  ->  30.58  (GBP RATE: FCY qty precedes the symbol)
     m = re.search(r'([\d,]+\.?\d*)\s*' + _CURRENCY_SYMBOLS, raw)
     if m:
-        return abs(convert_to_float(m.group(1)))
+        return convert_to_float(m.group(1))
 
     # Step 2: FCY ISO text-prefix — number immediately after code
     #   "CAD50.00 = ? 47.93/box"  →  grabs 50.0  ✓
     m = re.search(_ISO_TEXT_PATTERN + r'\s*([\d,]+\.?\d*)', raw)
     if m:
-        return abs(convert_to_float(m.group(2)))
+        return convert_to_float(m.group(2))
 
     # Step 3: INR — number immediately before /alphabetic-unit
     #   "14.00/box"  →  14.0  ✓
     m = re.search(r'([\d,]+\.?\d*)\s*/\s*[a-zA-Z]', raw)
     if m:
-        return abs(convert_to_float(m.group(1)))
+        return convert_to_float(m.group(1))
 
     # Fallback: first number in string
     m = re.search(r'([\d,]+\.?\d*)', raw)
     if m:
-        return abs(convert_to_float(m.group(1)))
+        return convert_to_float(m.group(1))
 
     return 0.0
 
@@ -284,7 +385,7 @@ def _parse_fcy_amount(raw: str) -> float:
         return 0.0
     raw = str(raw).strip()
 
-    # Detect sign from the raw string upfront
+    # Preserve Tally's raw sign
     is_negative = raw.startswith('-')
 
     def signed(value: float) -> float:
@@ -310,7 +411,7 @@ def _parse_fcy_amount(raw: str) -> float:
     if m:
         return signed(convert_to_float(m.group(2)))
 
-    # Fallback: first number (may itself carry a minus in the raw string)
+    # Fallback: first number
     m = re.search(r'-?([\d,]+\.?\d*)', raw)
     if m:
         return signed(convert_to_float(m.group(1)))
@@ -394,20 +495,23 @@ def extract_numeric_amount(text):
         return "0"
     text = str(text)
 
+    is_negative = text.strip().startswith('-')
+    prefix = '-' if is_negative else ''
+
     # Tally FCY: prefer the FIRST numeric value (foreign amount)
     if _is_fcy_string(text):
         m = re.search(r'-?\s*' + _CURRENCY_SYMBOLS + r'?\s*([\d,]+\.?\d*)', text)
         if m:
-            return m.group(1)
+            return prefix + m.group(1)
 
     # For plain / INR: take value after '= ?' pattern (base currency)
     m = re.search(r'=\s*[?]?\s*[-]?(\d+\.?\d*)', text)
     if m:
-        return m.group(1)
+        return prefix + m.group(1)
 
     m = re.search(r'[-]?(\d+\.?\d*)', text)
     if m:
-        return m.group(1)
+        return prefix + m.group(1)
 
     return "0"
 
@@ -442,11 +546,11 @@ def extract_currency_and_values(rate_text=None, amount_text=None, discount_text=
         # Plain base-currency voucher — use legacy numeric extraction
         result['exchange_rate'] = 1.0
         if rate_text:
-            result['rate'] = abs(convert_to_float(extract_numeric_amount(rate_text)))
+            result['rate'] = convert_to_float(extract_numeric_amount(rate_text))
         if amount_text:
-            result['amount'] = abs(convert_to_float(extract_numeric_amount(amount_text)))
+            result['amount'] = convert_to_float(extract_numeric_amount(amount_text))
         if discount_text:
-            result['discount'] = abs(convert_to_float(extract_numeric_amount(discount_text)))
+            result['discount'] = convert_to_float(extract_numeric_amount(discount_text))
     else:
         # FCY voucher — use dedicated FCY parsers
         if amount_text:
@@ -534,7 +638,7 @@ def parse_ledger_voucher(
             voucher_type   = clean_text(voucher.findtext('VOUCHERTYPENAME', ''))
             date           = clean_text(voucher.findtext('DATE', ''))
             reference      = clean_text(voucher.findtext('REFERENCE', ''))
-            narration      = clean_text(voucher.findtext('NARRATION', ''))
+            narration      = clean_narration(voucher.findtext('NARRATION', ''))
 
             action          = voucher.get('ACTION', 'Unknown')
             is_deleted      = voucher.findtext('ISDELETED', 'No')
@@ -597,11 +701,6 @@ def parse_ledger_voucher(
                 parsed_amount           = currency_info['amount']
                 voucher_type_name_lower = voucher_type_name.strip().lower()
 
-                if voucher_type_name_lower == 'receipt vouchers' and amount_type == 'Debit':
-                    parsed_amount = parsed_amount * -1
-
-                elif voucher_type_name_lower == 'payment vouchers' and amount_type == 'Credit':
-                    parsed_amount = abs(parsed_amount * -1)
 
                 all_rows.append({
                     'company_name'  : company_name,
@@ -623,6 +722,7 @@ def parse_ledger_voucher(
                     'material_centre': material_centre,
                 })
 
+        _apply_ledger_signs(all_rows)
         logger.info(f"Parsed {len(all_rows)} rows for {voucher_type_name} [{company_name}]")
         return all_rows
 
@@ -681,7 +781,7 @@ def parse_inventory_voucher(
             date           = clean_text(voucher.findtext('DATE', ''))
             party_name     = voucher.findtext('PARTYNAME', '') or ''
             reference      = clean_text(voucher.findtext('REFERENCE', ''))
-            narration      = clean_text(voucher.findtext('NARRATION', ''))
+            narration      = clean_narration(voucher.findtext('NARRATION', ''))
             party_gstin    = clean_text(voucher.findtext('PARTYGSTIN', ''))
             irn_number     = clean_text(voucher.findtext('IRNACKNO', ''))
             eway_bill      = clean_text(voucher.findtext('TEMPGSTEWAYBILLNUMBER', ''))
@@ -755,15 +855,15 @@ def parse_inventory_voucher(
 
             # ── Total amount from party ledger (for total_amt column) ──────────
             total_amt_from_xml = 0.0
-            voucher_type_name_lower = voucher_type_name.strip().lower()
+            # Standardizing the name format
+            v_type = voucher_type_name.strip().lower().replace(' ', '_')
             for ledger in ledger_entries:
                 if clean_text(ledger.findtext('ISPARTYLEDGER', 'No')) == 'Yes':
                     total_amt_from_xml = _parse_fcy_amount(
                         clean_text(ledger.findtext('AMOUNT', '0'))
                     )
-                    if voucher_type_name_lower == 'debit note':
-                        total_amt_from_xml = abs(total_amt_from_xml)
-                    break
+
+
 
             # ── Aggregate GST / charges from ledger entries ────────────────────
             voucher_gst_data = {
@@ -779,7 +879,7 @@ def parse_inventory_voucher(
                 ledger_name_raw   = ledger.findtext('LEDGERNAME', '') or ''
                 ledger_name_lower = ledger_name_raw.lower()
                 amt_text          = clean_text(ledger.findtext('AMOUNT', '0'))
-                amount            = abs(convert_to_float(extract_numeric_amount(amt_text)))
+                amount            = convert_to_float(extract_numeric_amount(amt_text))
 
                 if re.search(r'cgst|c\.gst', ledger_name_lower) and re.search(r'input|output', ledger_name_lower):
                     voucher_gst_data['cgst_total'] += amount
@@ -905,7 +1005,7 @@ def parse_inventory_voucher(
                         'exp_date'     : exp_date,
                         'hsn_code'     : hsn_code,
                         'rate'         : currency_data['rate'],
-                        'amount'       : abs(item_amount),
+                        'amount'       : item_amount,
                         'discount'     : currency_data['discount'],
                         'currency'     : currency_data['currency'],
                         'exchange_rate': currency_data['exchange_rate'],
@@ -1008,6 +1108,7 @@ def parse_inventory_voucher(
                         'exchange_rate': item['exchange_rate'],
                     })
 
+        _apply_inventory_signs(all_rows, voucher_type_name)
         logger.info(f"Parsed {len(all_rows)} rows for {voucher_type_name} [{company_name}]")
         return all_rows
 
@@ -1224,8 +1325,8 @@ def parse_trial_balance(xml_content, company_name: str, start_date: str, end_dat
             opening_text     = clean_text(ledger.findtext('OPENINGBALANCE', '0'))
             closing_text     = clean_text(ledger.findtext('CLOSINGBALANCE', '0'))
             # Trial balance values are base-currency totals — use plain extraction
-            opening_val      = abs(convert_to_float(extract_numeric_amount(str(opening_text))))
-            closing_val      = abs(convert_to_float(extract_numeric_amount(str(closing_text))))
+            opening_val      = convert_to_float(extract_numeric_amount(str(opening_text)))
+            closing_val      = convert_to_float(extract_numeric_amount(str(closing_text)))
             net_transactions = closing_val - opening_val
 
             all_rows.append({
@@ -1407,7 +1508,7 @@ def parse_outstanding(xml_content, company_name: str, material_centre: str = '',
                 'due_date'       : parse_tally_date_formatted(raw_due_dt),
                 'currency'       : currency,
                 'exchange_rate'  : rate,
-                'amount'         : (amount) * (-1),
+                'amount'         : amount,
                 'material_centre': material_centre,
             })
 
