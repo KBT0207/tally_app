@@ -34,19 +34,21 @@ except ImportError:
 # ── The 5 images tally_launcher.py actually uses ──────────────────────────────
 IMAGE_DEFS = [
     # (key,           label,                   description)
-    ("gateway",      "Gateway Screen",         "Confirms company is fully open in Tally"),
-    ("search_box",   "Company Search Box",     "Yellow search box on the Select Company screen"),
+    ("gateway",        "Gateway Screen",          "Confirms company is fully open in Tally"),
+    ("select_company", "Select Company Screen",   "Title bar of the Select Company list — shown right after Tally launches"),
+    ("search_box",     "Company Search Box",      "Yellow search box on the Select Company screen"),
     ("username",     "Username Field",         "Username label on the company login dialog"),
     ("data_server",  "Data Server Button",     "Data Server button — TDS companies only"),
     ("local_path",   "Local Path Screen",      "Path selection screen after clicking Data Server — TDS only"),
 ]
 
 DEFAULT_FILENAMES = {
-    "gateway":     "tally_gateway_screen.png",
-    "search_box":  "tally_company_search_box.png",
-    "username":    "tally_username_field.png",
-    "data_server": "tally_dataserver_image.png",
-    "local_path":  "tally_local_path_image.png",
+    "gateway":        "tally_gateway_screen.png",
+    "select_company": "tally_select_company_title.png",
+    "search_box":     "tally_company_search_box.png",
+    "username":       "tally_username_field.png",
+    "data_server":    "tally_dataserver_image.png",
+    "local_path":     "tally_local_path_image.png",
 }
 
 
@@ -804,11 +806,12 @@ class SettingsPage(tk.Frame):
         if not engine:
             return
         col_map = {
-            "gateway":     "image_gateway",
-            "search_box":  "image_search_box",
-            "username":    "image_username",
-            "data_server": "image_data_server",
-            "local_path":  "image_local_path",
+            "gateway":        "image_gateway",
+            "select_company": "image_select_title",
+            "search_box":     "image_search_box",
+            "username":       "image_username",
+            "data_server":    "image_data_server",
+            "local_path":     "image_local_path",
         }
         col = col_map.get(key)
         if not col:

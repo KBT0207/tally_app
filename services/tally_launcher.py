@@ -52,6 +52,7 @@ IMAGE_FILES = {
     "username":    "tally_username_field.png",
     "data_server": "tally_dataserver_image.png",
     "local_path":  "tally_local_path_image.png",
+    'select_company':"tally_select_company_title.png",
 }
 
 
@@ -222,9 +223,14 @@ class TallyLauncher:
                 break
             time.sleep(1)
 
-        # Wait extra time for Tally to fully load
-        logger.info("[TallyLauncher] Waiting 6s for Tally to load...")
-        time.sleep(6)
+        # Wait for company list screen instead of fixed sleep
+        logger.info("[TallyLauncher] Waiting for company list screen to load...")
+        found = self.wait_for_image("select_company", seconds=self.get_timeout())
+        if found:
+            logger.info("[TallyLauncher] Tally fully loaded — company list ready ✓")
+        else:
+            logger.warning("[TallyLauncher] Company list not detected after timeout — continuing anyway")
+
         return True, "launched"
 
     # ──────────────────────────────────────────────
@@ -362,15 +368,10 @@ class TallyLauncher:
     # ──────────────────────────────────────────────
 
     def handle_company_login(self, company, company_type: str) -> Tuple[bool, str]:
-        """
-        Type username and password for the company login dialog.
-
-        LOCAL: wait for username image to appear, then type credentials.
-        TDS:   skip image detection — just wait 3 seconds then type credentials.
-               (TDS search box can cause false image matches, so we skip detection.)
-        """
         username = getattr(company, 'tally_username', '') or ''
         password = getattr(company, 'tally_password', '') or ''
+
+        logger.debug(f"[TallyLauncher] Company login creds — username='{username}' password={'***' if password else '(empty)'}")
 
         # ── TDS login ──────────────────────────────────────────────────────
         if company_type == 'tds':
@@ -399,6 +400,7 @@ class TallyLauncher:
             return True, "logged_in"
 
         # ── Local / Remote login ───────────────────────────────────────────
+        # Always wait for username image first — only type if it appears
         logger.info("[TallyLauncher] Waiting for company login dialog (10s)...")
         found = self.wait_for_image("username", seconds=10)
 
@@ -406,9 +408,22 @@ class TallyLauncher:
             logger.info("[TallyLauncher] No login dialog — company opened directly ✓")
             return True, "no_login"
 
-        logger.info(f"[TallyLauncher] Login dialog found — typing username '{username}'")
+        # Login dialog appeared
         self.bring_tally_to_front()
         time.sleep(1)
+
+        if not username:
+            # Dialog found but no credentials configured — just press Enter twice to dismiss
+            logger.info("[TallyLauncher] Login dialog found but no credentials configured — pressing Enter to skip")
+            pyautogui.press('enter')  # skip username field
+            time.sleep(0.5)
+            pyautogui.press('enter')  # skip password field
+            time.sleep(2)
+            logger.info("[TallyLauncher] Login dialog dismissed ✓")
+            return True, "no_credentials_skipped"
+
+        # Credentials exist — type username and password
+        logger.info(f"[TallyLauncher] Login dialog found — typing username '{username}'")
 
         self.type_text(username)
         time.sleep(0.3)
@@ -420,7 +435,7 @@ class TallyLauncher:
         pyautogui.press('enter')
         time.sleep(2)
 
-        # Check if dialog is gone (login success)
+        # Confirm dialog dismissed (login success)
         img_path = os.path.join(ASSETS_DIR, IMAGE_FILES["username"])
         for _ in range(8):
             if not self.find_image_on_screen(img_path):
