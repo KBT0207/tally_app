@@ -779,8 +779,7 @@ def parse_inventory_voucher(
             voucher_number = clean_text(voucher.findtext('VOUCHERNUMBER', ''))
             voucher_type   = clean_text(voucher.findtext('VOUCHERTYPENAME', ''))
             date           = clean_text(voucher.findtext('DATE', ''))
-            # party_name     = voucher.findtext('PARTYNAME', '') or ''
-            party_name     = voucher.findtext('BASICBASEPARTYNAME', '') or ''
+            party_name     = voucher.findtext('PARTYLEDGERNAME', '') or ''
             reference      = clean_text(voucher.findtext('REFERENCE', ''))
             narration      = clean_narration(voucher.findtext('NARRATION', ''))
             party_gstin    = clean_text(voucher.findtext('PARTYGSTIN', ''))
