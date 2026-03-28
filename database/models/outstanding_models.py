@@ -25,7 +25,7 @@ class _OutstandingMixin:
 
 class OutstandingData(_OutstandingMixin, Base):
     """Sundry Debtors — Bill-wise outstanding receivables."""
-    __tablename__ = 'tally_outstanding_data'
+    __tablename__ = 'tally_outstanding'
 
     def __repr__(self):
         return (

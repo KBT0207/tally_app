@@ -4,7 +4,7 @@ from .base import Base
 
 
 class Ledger(Base):
-    __tablename__ = 'tally_ledgers'
+    __tablename__ = 'tally_account_master'
 
     id                    = Column(BigInteger,  primary_key=True, autoincrement=True)
     company_name          = Column(String(255), nullable=False, index=True)
