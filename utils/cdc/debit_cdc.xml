@@ -29,7 +29,7 @@
                         <FETCH>DATE</FETCH>
                         <FETCH>REFERENCE</FETCH>
                         <FETCH>NARRATION</FETCH>
-                        <FETCH>PARTYNAME</FETCH>
+                        <FETCH>PARTYLEDGERNAME</FETCH>
                         <FETCH>PARTYGSTIN</FETCH>
                         <FETCH>IRNACKNO</FETCH>
                         <FETCH>TEMPGSTEWAYBILLNUMBER</FETCH>

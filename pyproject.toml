@@ -25,6 +25,7 @@ dependencies = [
     "requests>=2.32.5",
     "sqlalchemy>=2.0.47",
     "tkcalendar>=1.6.1",
+    "xlwings>=0.34.0",
     "xmltodict>=1.0.4",
 ]
 

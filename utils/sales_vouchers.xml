@@ -26,7 +26,7 @@
                         <FETCH>VOUCHERNUMBER</FETCH>
                         <FETCH>VOUCHERTYPENAME</FETCH>
                         <FETCH>DATE</FETCH>
-                        <FETCH>PARTYNAME</FETCH>
+                        <FETCH>PARTYLEDGERNAME</FETCH>
                         <FETCH>REFERENCE</FETCH>
                         <FETCH>NARRATION</FETCH>
                         <FETCH>PARTYGSTIN</FETCH>
