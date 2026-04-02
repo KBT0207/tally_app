@@ -610,7 +610,6 @@ def parse_ledger_voucher(
                       Used as fallback in _detect_currency / extract_currency_and_values
                       so plain amounts with no symbol are attributed to the correct currency.
     """
-    print(voucher_type_name)
     try:
         if not xml_content or (isinstance(xml_content, str) and not xml_content.strip()):
             logger.warning(f"Empty or None XML content for {voucher_type_name}")
