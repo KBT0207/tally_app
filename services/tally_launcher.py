@@ -126,7 +126,7 @@ class TallyLauncher:
             pyautogui.hotkey('alt', 'f2')
             
             # Wait for dialog
-            if not self.wait_for_image("change_period", seconds=10):
+            if not self.wait_for_image("change_period", seconds=300):
                 return False, "Change Period dialog did not appear"
 
             # Get and format starting_from date
@@ -221,7 +221,7 @@ class TallyLauncher:
         username = getattr(self.state, 'tally_username', '') or ''
         password = getattr(self.state, 'tally_password', '') or ''
         if not username: return True, "skipped"
-        if self.wait_for_image("username", seconds=8):
+        if self.wait_for_image("username", seconds=300):
             self.bring_tally_to_front()
             self.type_text(username)
             pyautogui.press('enter')
@@ -266,7 +266,7 @@ class TallyLauncher:
             self.type_text(password)
             pyautogui.press('enter')
             return True, "logged_in"
-        if not self.wait_for_image("username", seconds=10): return True, "no_dialog"
+        if not self.wait_for_image("username", seconds=60): return True, "no_dialog"
         self.bring_tally_to_front()
         if not username:
             pyautogui.press('enter', presses=2)
@@ -303,7 +303,7 @@ class TallyLauncher:
             return pyautogui.locateOnScreen(img_path, confidence=conf, grayscale=True) if HAS_OPENCV else pyautogui.locateOnScreen(img_path)
         except: return None
 
-    def wait_for_image(self, image_key: str, seconds: int = 30) -> bool:
+    def wait_for_image(self, image_key: str, seconds: int = 300) -> bool:
         images   = getattr(self.state, 'tally_images', {}) or {}
         filename = images.get(image_key) or IMAGE_FILES.get(image_key) or f"tally_{image_key}.png"
         img_path = os.path.join(ASSETS_DIR, filename)
