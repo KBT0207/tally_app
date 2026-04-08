@@ -201,6 +201,7 @@ class AppState:
             "change_path":  "tally_change_path_btn.png",
             "remote_tab":   "tally_remote_tab.png",
             "tds_field":    "tally_tds_field.png",
+            "change_period": "tally_change_period.png",
         }
 
         # ── Active sync tracking ──────────────────────────

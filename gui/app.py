@@ -640,6 +640,7 @@ class TallySyncApp:
                 "tds_field":    ts.image_tds_field    or "tally_tds_field.png",
                 "data_server":  getattr(ts, 'image_data_server', None) or "tally_dataserver_image.png",
                 "local_path":   getattr(ts, 'image_local_path',  None) or "tally_local_path_image.png",
+                "change_period": getattr(ts, 'image_change_period', None) or "tally_change_period.png",
             }
 
             # ── AutomationSettings ────────────────────────

@@ -38,6 +38,7 @@ IMAGE_DEFS = [
     ("select_company", "Select Company Screen",   "Title bar of the Select Company list — shown right after Tally launches"),
     ("search_box",     "Company Search Box",      "Yellow search box on the Select Company screen"),
     ("username",     "Username Field",         "Username label on the company login dialog"),
+    ("change_period",  "Change Period Dialog",    "The Alt+F2 Change Period window header"),
     ("data_server",  "Data Server Button",     "Data Server button — TDS companies only"),
     ("local_path",   "Local Path Screen",      "Path selection screen after clicking Data Server — TDS only"),
 ]
@@ -47,6 +48,7 @@ DEFAULT_FILENAMES = {
     "select_company": "tally_select_company_title.png",
     "search_box":     "tally_company_search_box.png",
     "username":       "tally_username_field.png",
+    "change_period":  "tally_change_period.png",
     "data_server":    "tally_dataserver_image.png",
     "local_path":     "tally_local_path_image.png",
 }
@@ -810,6 +812,7 @@ class SettingsPage(tk.Frame):
             "select_company": "image_select_title",
             "search_box":     "image_search_box",
             "username":       "image_username",
+            "change_period":  "image_change_period",
             "data_server":    "image_data_server",
             "local_path":     "image_local_path",
         }
