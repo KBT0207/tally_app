@@ -76,6 +76,41 @@ def _get_company_lock(company_name: str) -> threading.Lock:
         return _SYNC_STATE_LOCKS[company_name]
 
 
+def _should_sync_entity(
+    entity_type: str,
+    is_user_selected: bool,
+    sync_state_exists: bool,
+    is_initial_done: bool,
+) -> tuple[bool, str, str]:
+    """
+    Determine if entity should sync and what mode to use.
+
+    Args:
+        entity_type: 'items', 'ledger', 'sales', etc.
+        is_user_selected: Did user check this entity in UI?
+        sync_state_exists: Does sync_state row exist in database?
+        is_initial_done: Has initial snapshot been done?
+
+    Returns:
+        (should_sync, reason, mode)
+        mode = 'SNAPSHOT' or 'CDC' or 'SKIP'
+    """
+    # STEP 1: Check user selection FIRST
+    if not is_user_selected:
+        return False, f"User did not select {entity_type}", "SKIP"
+
+    # STEP 2: If sync_state doesn't exist, user is selecting for first time
+    if not sync_state_exists:
+        return True, f"{entity_type} selected (first time, no sync_state)", "SNAPSHOT"
+
+    # STEP 3: If sync_state exists but snapshot not done yet
+    if not is_initial_done:
+        return True, f"{entity_type} selected (snapshot not done yet)", "SNAPSHOT"
+
+    # STEP 4: All conditions met for CDC
+    return True, f"{entity_type} selected (ready for CDC)", "CDC"
+
+
 def cleanup_sync_state(company_name: str = "") -> None:
     """
     Clear accumulated global lock state and force garbage collection.
@@ -618,18 +653,35 @@ def _sync_items(
     progress_cb=None,
     material_centre:  str = '',
     default_currency: str = 'INR',
+    is_user_selected: bool = True,  # NEW: respect UI selection
 ):
-    logger.info(f"[{company_name}] Syncing Items (StockItem master)")
+    logger.info(f"[{company_name}] ═══ ITEM SYNC START ═══")
     lock = _get_company_lock(company_name)
     try:
         if progress_cb:
             progress_cb(0.0, "Fetching items from Tally...")
-        state           = get_sync_state(company_name, 'items', engine)
-        is_initial_done = state.is_initial_done if state else False
-        last_alter_id   = state.last_alter_id   if state else 0
 
-        if is_initial_done:
-            logger.info(f"[{company_name}][items] CDC | last_alter_id={last_alter_id}")
+        state             = get_sync_state(company_name, 'items', engine)
+        sync_state_exists = state is not None
+        is_initial_done   = state.is_initial_done if state else False
+        last_alter_id     = state.last_alter_id   if state else 0
+
+        # NEW: Check selection + decide mode
+        should_sync, reason, sync_mode = _should_sync_entity(
+            entity_type       = 'items',
+            is_user_selected  = is_user_selected,
+            sync_state_exists = sync_state_exists,
+            is_initial_done   = is_initial_done,
+        )
+
+        if not should_sync:
+            logger.info(f"[{company_name}][items] ✗ Skipped: {reason}")
+            return
+
+        logger.info(f"[{company_name}][items] Proceeding: {reason}")
+
+        if sync_mode == 'CDC':
+            logger.info(f"[{company_name}][items] CDC MODE | last_alter_id={last_alter_id}")
             if not _tally_semaphore_acquire():
                 raise RuntimeError("Tally semaphore timeout — Tally may be hung")
             try:
@@ -658,35 +710,36 @@ def _sync_items(
             with lock:
                 update_sync_state(company_name, 'items', new_max, engine, is_initial_done=True)
             logger.info(
-                f"[{company_name}][items] CDC done | rows={len(rows)} | new max_alter_id={new_max}"
+                f"[{company_name}][items] ✓ SYNC COMPLETE | mode=CDC | last_alter_id={new_max}"
             )
             _reconcile_deleted_masters(company_name, 'items', tally, engine)
             return
 
-        logger.info(f"[{company_name}][items] SNAPSHOT — fetching all stock items")
-        if not _tally_semaphore_acquire():
-            raise RuntimeError("Tally semaphore timeout — Tally may be hung")
-        try:
-            xml = tally.fetch_items(company_name=company_name)
-        finally:
-            _TALLY_SEMAPHORE.release()
-        if not xml:
-            logger.warning(f"[{company_name}][items] No item data from Tally")
-            return
+        elif sync_mode == 'SNAPSHOT':
+            logger.info(f"[{company_name}][items] SNAPSHOT MODE — fetching all items")
+            if not _tally_semaphore_acquire():
+                raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+            try:
+                xml = tally.fetch_items(company_name=company_name)
+            finally:
+                _TALLY_SEMAPHORE.release()
+            if not xml:
+                logger.warning(f"[{company_name}][items] No item data from Tally")
+                return
 
-        rows = parse_items(xml, company_name, material_centre=material_centre, default_currency=default_currency)
-        if not rows:
-            logger.warning(f"[{company_name}][items] Snapshot parsed 0 rows")
-            return
+            rows = parse_items(xml, company_name, material_centre=material_centre, default_currency=default_currency)
+            if not rows:
+                logger.warning(f"[{company_name}][items] Snapshot parsed 0 rows")
+                return
 
-        max_alter_id = _get_max_alter_id(rows)
-        upsert_items(rows, engine)
-        with lock:
-            update_sync_state(company_name, 'items', max_alter_id, engine, is_initial_done=True)
-        logger.info(
-            f"[{company_name}][items] Snapshot done | "
-            f"rows={len(rows)} | max_alter_id={max_alter_id} | CDC enabled from next run"
-        )
+            max_alter_id = _get_max_alter_id(rows)
+            upsert_items(rows, engine)
+            with lock:
+                update_sync_state(company_name, 'items', max_alter_id, engine, is_initial_done=True)
+            logger.info(
+                f"[{company_name}][items] ✓ SYNC COMPLETE | mode=SNAPSHOT | "
+                f"rows={len(rows)} | last_alter_id={max_alter_id}"
+            )
 
     except Exception:
         logger.exception(f"[{company_name}] Item sync failed")
@@ -699,18 +752,35 @@ def _sync_ledgers(
     progress_cb=None,
     material_centre:  str = '',
     default_currency: str = 'INR',
+    is_user_selected: bool = True,  # NEW: respect UI selection
 ):
-    logger.info(f"[{company_name}] Syncing Ledgers")
+    logger.info(f"[{company_name}] ═══ LEDGER SYNC START ═══")
     lock = _get_company_lock(company_name)
     try:
         if progress_cb:
             progress_cb(0.0, "Fetching ledgers from Tally...")
-        state           = get_sync_state(company_name, 'ledger', engine)
-        is_initial_done = state.is_initial_done if state else False
-        last_alter_id   = state.last_alter_id   if state else 0
 
-        if is_initial_done:
-            logger.info(f"[{company_name}][ledger] CDC | last_alter_id={last_alter_id}")
+        state             = get_sync_state(company_name, 'ledger', engine)
+        sync_state_exists = state is not None
+        is_initial_done   = state.is_initial_done if state else False
+        last_alter_id     = state.last_alter_id   if state else 0
+
+        # NEW: Check selection + decide mode
+        should_sync, reason, sync_mode = _should_sync_entity(
+            entity_type       = 'ledger',
+            is_user_selected  = is_user_selected,
+            sync_state_exists = sync_state_exists,
+            is_initial_done   = is_initial_done,
+        )
+
+        if not should_sync:
+            logger.info(f"[{company_name}][ledger] ✗ Skipped: {reason}")
+            return
+
+        logger.info(f"[{company_name}][ledger] Proceeding: {reason}")
+
+        if sync_mode == 'CDC':
+            logger.info(f"[{company_name}][ledger] CDC MODE | last_alter_id={last_alter_id}")
             if not _tally_semaphore_acquire():
                 raise RuntimeError("Tally semaphore timeout — Tally may be hung")
             try:
@@ -739,35 +809,36 @@ def _sync_ledgers(
             with lock:
                 update_sync_state(company_name, 'ledger', new_max, engine, is_initial_done=True)
             logger.info(
-                f"[{company_name}][ledger] CDC done | rows={len(rows)} | new max_alter_id={new_max}"
+                f"[{company_name}][ledger] ✓ SYNC COMPLETE | mode=CDC | last_alter_id={new_max}"
             )
             _reconcile_deleted_masters(company_name, 'ledger', tally, engine)
             return
 
-        logger.info(f"[{company_name}][ledger] SNAPSHOT — fetching all ledgers")
-        if not _tally_semaphore_acquire():
-            raise RuntimeError("Tally semaphore timeout — Tally may be hung")
-        try:
-            xml = tally.fetch_ledgers(company_name=company_name)
-        finally:
-            _TALLY_SEMAPHORE.release()
-        if not xml:
-            logger.warning(f"[{company_name}][ledger] No ledger data from Tally")
-            return
+        elif sync_mode == 'SNAPSHOT':
+            logger.info(f"[{company_name}][ledger] SNAPSHOT MODE — fetching all ledgers")
+            if not _tally_semaphore_acquire():
+                raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+            try:
+                xml = tally.fetch_ledgers(company_name=company_name)
+            finally:
+                _TALLY_SEMAPHORE.release()
+            if not xml:
+                logger.warning(f"[{company_name}][ledger] No ledger data from Tally")
+                return
 
-        rows = parse_ledgers(xml, company_name, material_centre=material_centre, default_currency=default_currency)
-        if not rows:
-            logger.warning(f"[{company_name}][ledger] Snapshot parsed 0 rows")
-            return
+            rows = parse_ledgers(xml, company_name, material_centre=material_centre, default_currency=default_currency)
+            if not rows:
+                logger.warning(f"[{company_name}][ledger] Snapshot parsed 0 rows")
+                return
 
-        upsert_ledgers(rows, engine)
-        max_alter_id = _get_max_alter_id(rows)
-        with lock:
-            update_sync_state(company_name, 'ledger', max_alter_id, engine, is_initial_done=True)
-        logger.info(
-            f"[{company_name}][ledger] Snapshot done | "
-            f"rows={len(rows)} | max_alter_id={max_alter_id} | CDC enabled from next run"
-        )
+            upsert_ledgers(rows, engine)
+            max_alter_id = _get_max_alter_id(rows)
+            with lock:
+                update_sync_state(company_name, 'ledger', max_alter_id, engine, is_initial_done=True)
+            logger.info(
+                f"[{company_name}][ledger] ✓ SYNC COMPLETE | mode=SNAPSHOT | "
+                f"rows={len(rows)} | last_alter_id={max_alter_id}"
+            )
 
     except Exception:
         logger.exception(f"[{company_name}] Ledger sync failed")
@@ -784,6 +855,7 @@ def _sync_voucher(
     progress_cb=None,
     material_centre:  str = '',
     default_currency: str = 'INR',
+    is_user_selected: bool = True,  # NEW: respect UI selection
 ):
     voucher_type     = config['voucher_type']
     snapshot_fetch   = config['snapshot_fetch']
@@ -799,12 +871,27 @@ def _sync_voucher(
 
     try:
         state             = get_sync_state(company_name, voucher_type, engine)
+        sync_state_exists = state is not None
         is_initial_done   = state.is_initial_done   if state else False
         last_alter_id     = state.last_alter_id     if state else 0
         last_synced_month = state.last_synced_month if state else None
 
+        # NEW: Check selection + decide mode
+        should_sync, reason, sync_mode = _should_sync_entity(
+            entity_type       = voucher_type,
+            is_user_selected  = is_user_selected,
+            sync_state_exists = sync_state_exists,
+            is_initial_done   = is_initial_done,
+        )
+
+        if not should_sync:
+            logger.info(f"[{company_name}][{voucher_type}] ✗ Skipped: {reason}")
+            return
+
+        logger.info(f"[{company_name}][{voucher_type}] Proceeding: {reason}")
+
         # ── PHASE 2: CDC mode ─────────────────────────────────────────────────
-        if is_initial_done:
+        if sync_mode == 'CDC':
             logger.info(f"[{company_name}][{voucher_type}] Phase 2: CDC | last_alter_id={last_alter_id}")
 
             t0       = datetime.now()
@@ -847,8 +934,8 @@ def _sync_voucher(
             with lock:
                 update_sync_state(company_name, voucher_type, new_max, engine, is_initial_done=True)
             logger.info(
-                f"[{company_name}][{voucher_type}] Phase 2: CDC done | "
-                f"rows={len(rows)} | new max_alter_id={new_max} | "
+                f"[{company_name}][{voucher_type}] ✓ SYNC COMPLETE | mode=CDC | "
+                f"rows={len(rows)} | last_alter_id={new_max} | "
                 f"fetch={fetch_ms}ms upsert={upsert_ms}ms"
             )
 
@@ -856,110 +943,111 @@ def _sync_voucher(
             return
 
         # ── PHASE 1: Snapshot mode ────────────────────────────────────────────
-        logger.info(
-            f"[{company_name}][{voucher_type}] Phase 1: SNAPSHOT "
-            f"({SNAPSHOT_CHUNK_MONTHS}-month chunks) | {from_date} → {to_date}"
-        )
+        elif sync_mode == 'SNAPSHOT':
+            logger.info(
+                f"[{company_name}][{voucher_type}] Phase 1: SNAPSHOT "
+                f"({SNAPSHOT_CHUNK_MONTHS}-month chunks) | {from_date} → {to_date}"
+            )
 
-        if kind == 'inventory':
-            model_class = INVENTORY_MODEL_MAP[voucher_type]
-            upsert_fn   = _upsert_inventory_voucher_in_session
-        else:
-            model_class = LEDGER_MODEL_MAP[voucher_type]
-            upsert_fn   = _upsert_ledger_voucher_in_session
+            if kind == 'inventory':
+                model_class = INVENTORY_MODEL_MAP[voucher_type]
+                upsert_fn   = _upsert_inventory_voucher_in_session
+            else:
+                model_class = LEDGER_MODEL_MAP[voucher_type]
+                upsert_fn   = _upsert_ledger_voucher_in_session
 
-        fetch_fn      = getattr(tally, snapshot_fetch)
-        total_rows    = 0
-        chunks_done   = 0
-        all_alter_ids = [last_alter_id] if last_alter_id > 0 else []
+            fetch_fn      = getattr(tally, snapshot_fetch)
+            total_rows    = 0
+            chunks_done   = 0
+            all_alter_ids = [last_alter_id] if last_alter_id > 0 else []
 
-        _all_chunks  = list(_generate_chunks(from_date, to_date))
-        total_chunks = max(len([c for c in _all_chunks
-            if not (last_synced_month and c[2] < last_synced_month)]), 1)
+            _all_chunks  = list(_generate_chunks(from_date, to_date))
+            total_chunks = max(len([c for c in _all_chunks
+                if not (last_synced_month and c[2] < last_synced_month)]), 1)
 
-        for chunk_from, chunk_to, month_str in _generate_chunks(from_date, to_date):
+            for chunk_from, chunk_to, month_str in _generate_chunks(from_date, to_date):
 
-            if last_synced_month and month_str <= last_synced_month:
-                logger.debug(
-                    f"[{company_name}][{voucher_type}] Skipping already-done chunk {month_str}"
+                if last_synced_month and month_str <= last_synced_month:
+                    logger.debug(
+                        f"[{company_name}][{voucher_type}] Skipping already-done chunk {month_str}"
+                    )
+                    continue
+
+                if progress_cb:
+                    progress_cb(
+                        (chunks_done / max(total_chunks, 1)) * 100,
+                        f"Syncing {parser_type_name} — {month_str}",
+                    )
+
+                logger.info(
+                    f"[{company_name}][{voucher_type}] Chunk {month_str} | {chunk_from} → {chunk_to}"
                 )
-                continue
 
-            if progress_cb:
-                progress_cb(
-                    (chunks_done / max(total_chunks, 1)) * 100,
-                    f"Syncing {parser_type_name} — {month_str}",
+                if not _tally_semaphore_acquire():
+                    raise RuntimeError("Tally semaphore timeout — Tally may be hung")
+                try:
+                    xml = fetch_fn(company_name=company_name, from_date=chunk_from, to_date=chunk_to)
+                finally:
+                    _TALLY_SEMAPHORE.release()
+                if not xml:
+                    logger.info(
+                        f"[{company_name}][{voucher_type}] Chunk {month_str}: empty, advancing"
+                    )
+                    _mark_chunk_done(company_name, voucher_type, month_str, engine)
+                    chunks_done += 1
+                    continue
+
+                rows = parser(
+                    xml, company_name, parser_type_name,
+                    allowed_types=allowed_types,
+                    material_centre=material_centre,
+                    default_currency=default_currency,
+                )
+
+                if not rows:
+                    logger.info(
+                        f"[{company_name}][{voucher_type}] Chunk {month_str}: 0 rows, advancing"
+                    )
+                    _mark_chunk_done(company_name, voucher_type, month_str, engine)
+                    chunks_done += 1
+                    continue
+
+                chunk_max = max((int(r.get('alter_id', 0)) for r in rows), default=0)
+                try:
+                    upsert_and_advance_month(
+                        rows               = rows,
+                        model_class        = model_class,
+                        upsert_fn          = upsert_fn,
+                        company_name       = company_name,
+                        voucher_type       = voucher_type,
+                        month_str          = month_str,
+                        engine             = engine,
+                        chunk_max_alter_id = chunk_max,
+                    )
+
+                    all_alter_ids.extend(int(r.get('alter_id', 0)) for r in rows)
+                    total_rows  += len(rows)
+                    chunks_done += 1
+                finally:
+                    del xml
+                    del rows
+                    gc.collect()
+
+            final_alter_id = max(all_alter_ids) if all_alter_ids else 0
+            with lock:
+                update_sync_state(
+                    company_name      = company_name,
+                    voucher_type      = voucher_type,
+                    last_alter_id     = final_alter_id,
+                    engine            = engine,
+                    last_synced_month = to_date[:6],
+                    is_initial_done   = True,
                 )
 
             logger.info(
-                f"[{company_name}][{voucher_type}] Chunk {month_str} | {chunk_from} → {chunk_to}"
+                f"[{company_name}][{voucher_type}] ✓ SYNC COMPLETE | mode=SNAPSHOT | "
+                f"chunks={chunks_done} | total_rows={total_rows} | last_alter_id={final_alter_id}"
             )
-
-            if not _tally_semaphore_acquire():
-                raise RuntimeError("Tally semaphore timeout — Tally may be hung")
-            try:
-                xml = fetch_fn(company_name=company_name, from_date=chunk_from, to_date=chunk_to)
-            finally:
-                _TALLY_SEMAPHORE.release()
-            if not xml:
-                logger.info(
-                    f"[{company_name}][{voucher_type}] Chunk {month_str}: empty, advancing"
-                )
-                _mark_chunk_done(company_name, voucher_type, month_str, engine)
-                chunks_done += 1
-                continue
-
-            rows = parser(
-                xml, company_name, parser_type_name,
-                allowed_types=allowed_types,
-                material_centre=material_centre,
-                default_currency=default_currency,
-            )
-
-            if not rows:
-                logger.info(
-                    f"[{company_name}][{voucher_type}] Chunk {month_str}: 0 rows, advancing"
-                )
-                _mark_chunk_done(company_name, voucher_type, month_str, engine)
-                chunks_done += 1
-                continue
-
-            chunk_max = max((int(r.get('alter_id', 0)) for r in rows), default=0)
-            try:
-                upsert_and_advance_month(
-                    rows               = rows,
-                    model_class        = model_class,
-                    upsert_fn          = upsert_fn,
-                    company_name       = company_name,
-                    voucher_type       = voucher_type,
-                    month_str          = month_str,
-                    engine             = engine,
-                    chunk_max_alter_id = chunk_max,
-                )
-
-                all_alter_ids.extend(int(r.get('alter_id', 0)) for r in rows)
-                total_rows  += len(rows)
-                chunks_done += 1
-            finally:
-                del xml
-                del rows
-                gc.collect()
-
-        final_alter_id = max(all_alter_ids) if all_alter_ids else 0
-        with lock:
-            update_sync_state(
-                company_name      = company_name,
-                voucher_type      = voucher_type,
-                last_alter_id     = final_alter_id,
-                engine            = engine,
-                last_synced_month = to_date[:6],
-                is_initial_done   = True,
-            )
-
-        logger.info(
-            f"[{company_name}][{voucher_type}] Phase 1: Snapshot complete | "
-            f"chunks={chunks_done} | total_rows={total_rows} | max_alter_id={final_alter_id}"
-        )
 
     except Exception:
         logger.exception(
@@ -1015,12 +1103,12 @@ def sync_company(
 
     try:
         if _selected('ledger'):
-            _sync_ledgers(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency)
+            _sync_ledgers(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency, is_user_selected=True)
         else:
             logger.info(f"[{comp_name}] Skipping ledgers (not selected)")
 
         if _selected('items'):
-            _sync_items(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency)
+            _sync_items(comp_name, tally, engine, material_centre=mat_centre, default_currency=default_currency, is_user_selected=True)
         else:
             logger.info(f"[{comp_name}] Skipping items (not selected)")
 
@@ -1059,6 +1147,7 @@ def sync_company(
                         full_from        = full_from,
                         material_centre  = mat_centre,
                         default_currency = default_currency,
+                        is_user_selected = _selected(config['voucher_type']),
                     ): config['voucher_type']
                     for config in active_configs
                 }
