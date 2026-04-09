@@ -1211,14 +1211,21 @@ def parse_ledgers(xml_content, company_name: str, material_centre: str = '', def
 
             aliases      = []
             direct_alias = ledger.findtext('ALIAS', '') or ''
-            if direct_alias and direct_alias != ledger_name:
-                aliases.append(direct_alias)
+            ledger_name_lower = ledger_name.lower().strip()
+            if direct_alias:
+                direct_alias_lower = direct_alias.lower().strip()
+                if direct_alias_lower != ledger_name_lower:
+                    aliases.append(direct_alias)
             for lang_list in ledger.findall('.//LANGUAGENAME.LIST'):
                 for name_list in lang_list.findall('.//NAME.LIST'):
                     for name in name_list.findall('NAME'):
                         alias_text = clean_text(name.text or '')
-                        if alias_text and alias_text != ledger_name and alias_text not in aliases:
-                            aliases.append(alias_text)
+                        if alias_text:
+                            alias_text_lower = alias_text.lower().strip()
+                            existing_aliases_lower = [a.lower().strip() for a in aliases]
+                            if (alias_text_lower != ledger_name_lower and 
+                                alias_text_lower not in existing_aliases_lower):
+                                aliases.append(alias_text)
 
             address_lines = []
             for addr_list in ledger.findall('.//ADDRESS.LIST'):

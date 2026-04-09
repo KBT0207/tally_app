@@ -1039,7 +1039,7 @@ def upsert_items(rows, engine):
                 name_changed = (
                     old_item_name
                     and new_item_name
-                    and old_item_name != new_item_name
+                    and old_item_name.lower().strip() != new_item_name.lower().strip()
                     and not incoming_deleted
                 )
                 if name_changed:
@@ -1253,7 +1253,7 @@ def upsert_ledgers(rows, engine):
                 name_changed = (
                     old_ledger_name
                     and new_ledger_name
-                    and old_ledger_name != new_ledger_name
+                    and old_ledger_name.lower().strip() != new_ledger_name.lower().strip()
                     and not incoming_deleted
                 )
                 if name_changed:
