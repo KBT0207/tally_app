@@ -31,6 +31,7 @@ class CompanyStatus:
 class SyncMode:
     INCREMENTAL = "incremental"   # CDC — use alter_id
     SNAPSHOT    = "snapshot"      # Full date range pull
+    RECONCILE   = "reconcile"     # Full re-fetch + update all changed vouchers
 
 
 # ─────────────────────────────────────────────

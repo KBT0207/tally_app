@@ -687,10 +687,19 @@ def parse_ledger_voucher(
                 amount_text   = clean_text(ledger.findtext('AMOUNT', '0'))
                 currency_info = extract_currency_and_values(None, amount_text, default_currency=default_currency)
 
-                # Propagate voucher-level FCY if this entry didn't resolve its own
+                # Propagate voucher-level FCY if this entry didn't resolve its own.
+                # CRITICAL FIX: also convert the amount from INR → FCY.
+                # When Tally sends a plain number (e.g. "84500") with no currency
+                # symbol, extract_currency_and_values treats it as INR and stores
+                # amount=84500.  We must divide by exchange_rate to get the FCY
+                # amount (e.g. 84500 / 84.5 = 1000 USD).
                 if currency_info['currency'] == default_currency and voucher_currency != default_currency:
                     currency_info['currency']      = voucher_currency
                     currency_info['exchange_rate'] = voucher_exchange_rate
+                    # Convert INR amount → FCY amount
+                    if voucher_exchange_rate and voucher_exchange_rate != 0:
+                        inr_amt = currency_info['amount']
+                        currency_info['amount'] = round(inr_amt / voucher_exchange_rate, 6)
 
                 # Determine Dr/Cr from raw amount sign
                 raw_sign    = str(amount_text).strip()
@@ -858,9 +867,14 @@ def parse_inventory_voucher(
             v_type = voucher_type_name.strip().lower().replace(' ', '_')
             for ledger in ledger_entries:
                 if clean_text(ledger.findtext('ISPARTYLEDGER', 'No')) == 'Yes':
-                    total_amt_from_xml = _parse_fcy_amount(
-                        clean_text(ledger.findtext('AMOUNT', '0'))
-                    )
+                    party_amt_raw      = clean_text(ledger.findtext('AMOUNT', '0'))
+                    total_amt_from_xml = _parse_fcy_amount(party_amt_raw)
+                    # CRITICAL FIX: if FCY symbol absent but we know the voucher
+                    # is FCY, the raw string is an INR total — convert to FCY.
+                    if (voucher_currency != default_currency
+                            and voucher_exchange_rate and voucher_exchange_rate != 0
+                            and not _is_fcy_string(party_amt_raw)):
+                        total_amt_from_xml = round(total_amt_from_xml / voucher_exchange_rate, 6)
 
 
 
@@ -956,10 +970,17 @@ def parse_inventory_voucher(
 
                     currency_data = extract_currency_and_values(rate_txt, amount_txt, discount_txt, default_currency=default_currency)
 
-                    # Propagate voucher-level FCY if item-level didn't resolve
+                    # Propagate voucher-level FCY if item-level didn't resolve.
+                    # CRITICAL FIX: also convert amount and rate from INR → FCY.
                     if currency_data['currency'] == default_currency and voucher_currency != default_currency:
                         currency_data['currency']      = voucher_currency
                         currency_data['exchange_rate'] = voucher_exchange_rate
+                        # Convert INR amount → FCY amount
+                        if voucher_exchange_rate and voucher_exchange_rate != 0:
+                            if currency_data['amount']:
+                                currency_data['amount'] = round(currency_data['amount'] / voucher_exchange_rate, 6)
+                            if currency_data['rate']:
+                                currency_data['rate'] = round(currency_data['rate'] / voucher_exchange_rate, 6)
 
                     qty_numeric        = convert_to_float(re.search(r'[\d,]+\.?\d*', qty_txt).group() if re.search(r'[\d,]+\.?\d*', qty_txt) else '0')
                     alt_qty, alt_unit  = parse_quantity_with_unit(billed_txt)

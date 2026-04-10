@@ -224,6 +224,19 @@ class SyncController:
             self._post("log", company_name,
                 f"ℹ  No from date specified — using company default: {from_date}", "INFO")
 
+        if self._sync_mode == SyncMode.RECONCILE:
+            # Full re-fetch from company start date → to_date.
+            # sync_company will re-fetch every voucher in the date range.
+            # _should_update_voucher in database_processor detects what actually
+            # changed (FCY conversions, amount changes, etc.) and only updates
+            # those rows. Unchanged rows are left as-is.
+            from_date = (co_state.starting_from if co_state else None) \
+                        or company_dict.get("starting_from", "20240401")
+            self._post("log", company_name,
+                f"🔄 RECONCILE MODE — full re-fetch {from_date} → {to_date}", "INFO")
+            self._post("log", company_name,
+                "   Any changed vouchers (incl. FCY conversions) will be updated automatically.", "INFO")
+
         if from_date:
             self._post("log", company_name, f"📅  Date range: {from_date} → {to_date}", "INFO")
         else:
@@ -237,35 +250,76 @@ class SyncController:
         selected = voucher_sel.selected_types()
         self._post("log", company_name, f"Syncing: {', '.join(selected)}", "INFO")
 
-        # ── Run sync ──────────────────────────────────────
+        # ── Run sync / reconcile ──────────────────────────
         try:
-            from services.sync_service import sync_company
+            from services.sync_service import sync_company, deep_reconcile_company
 
             fd = from_date
 
-            self._post("progress", company_name, 10.0, "Syncing...")
-            self._post("log",      company_name,
-                       f"→ Syncing: {', '.join(sorted(selected))}", "INFO")
+            if self._sync_mode == SyncMode.RECONCILE:
+                # Phase 1 — deep GUID reconcile: removes vouchers deleted in Tally
+                self._post("progress", company_name, 10.0, "Phase 1: GUID reconciliation...")
+                self._post("log",      company_name, "→ Phase 1: Removing vouchers deleted in Tally...", "INFO")
+                try:
+                    recon_results = deep_reconcile_company(
+                        company     = company_dict,
+                        tally       = tally,
+                        engine      = engine,
+                        to_date     = to_date,
+                        progress_cb = lambda p, msg: self._post(
+                            "progress", company_name,
+                            10.0 + p * 0.3,   # 10% → 40%
+                            msg,
+                        ),
+                    )
+                    total_deleted = sum(recon_results.values())
+                    self._post("log", company_name,
+                        f"   Phase 1 done — {total_deleted} stale voucher(s) removed", "INFO")
+                except Exception as e:
+                    self._post("log", company_name, f"   Phase 1 warning: {e}", "WARNING")
 
-            sync_company(
-                company           = company_dict,
-                tally             = tally,
-                engine            = engine,
-                to_date           = to_date,
-                manual_from_date  = fd,
-                voucher_selection = set(selected),
-            )
+                # Phase 2 — full snapshot re-fetch: picks up all changed vouchers
+                self._post("progress", company_name, 40.0, "Phase 2: Re-fetching all vouchers...")
+                self._post("log",      company_name,
+                    f"→ Phase 2: Full re-fetch {fd} → {to_date} (updates changed vouchers)...", "INFO")
+                sync_company(
+                    company           = company_dict,
+                    tally             = tally,
+                    engine            = engine,
+                    to_date           = to_date,
+                    manual_from_date  = fd,
+                    voucher_selection = set(selected),
+                )
+            else:
+                self._post("progress", company_name, 10.0, "Syncing...")
+                self._post("log",      company_name,
+                           f"→ Syncing: {', '.join(sorted(selected))}", "INFO")
+                sync_company(
+                    company           = company_dict,
+                    tally             = tally,
+                    engine            = engine,
+                    to_date           = to_date,
+                    manual_from_date  = fd,
+                    voucher_selection = set(selected),
+                )
 
             # ── Done ──────────────────────────────────────
-            self._post("progress", company_name, 100.0, "Complete ✓")
+            done_label = "Reconcile Complete ✓" if self._sync_mode == SyncMode.RECONCILE else "Complete ✓"
+            self._post("progress", company_name, 100.0, done_label)
             self._post("status",   company_name, CompanyStatus.SYNC_DONE)
-            self._post("log",      company_name, f"✓ {company_name} sync complete", "SUCCESS")
+            self._post("log",      company_name,
+                f"✓ {company_name} {'reconcile' if self._sync_mode == SyncMode.RECONCILE else 'sync'} complete",
+                "SUCCESS")
             self._post("done",     company_name, True)
 
             co = self._state.get_company(company_name)
             if co:
                 co.is_initial_done  = True
                 co.last_sync_time   = datetime.now()
+
+            # Reset RECONCILE mode back to INCREMENTAL so next sync is normal CDC
+            if self._sync_mode == SyncMode.RECONCILE:
+                self._state.sync_mode = SyncMode.INCREMENTAL
 
             self._state.set_company_status(
                 company_name,

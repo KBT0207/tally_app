@@ -294,13 +294,14 @@ class HomePage(tk.Frame):
                 shown_unconfigured = True
 
             card = CompanyCard(
-                parent       = self._list_frame,
-                company      = co,
-                on_select    = self._on_card_select,
-                on_sync      = self._on_single_sync,
-                on_schedule  = self._on_single_schedule,
-                on_configure = self._on_configure_company,
-                selected     = co.name in self.state.selected_companies,
+                parent        = self._list_frame,
+                company       = co,
+                on_select     = self._on_card_select,
+                on_sync       = self._on_single_sync,
+                on_schedule   = self._on_single_schedule,
+                on_configure  = self._on_configure_company,
+                on_reconcile  = self._on_single_reconcile,
+                selected      = co.name in self.state.selected_companies,
             )
             bg = Color.BG_TABLE_ODD if i % 2 == 0 else Color.BG_TABLE_EVEN
             card.configure(bg=bg)
@@ -555,6 +556,62 @@ class HomePage(tk.Frame):
             self._handle_initial_snapshot_flow(name)
         else:
             self.navigate("sync")
+
+    def _on_single_reconcile(self, name: str):
+        """
+        Reconcile button on a single company card.
+        Runs a full re-fetch for the company's entire date range and updates
+        any vouchers that changed (including FCY conversions CDC missed).
+        Does NOT touch alter_id watermark logic — safe to run any time.
+        """
+        import threading
+        from tkinter import messagebox
+
+        # Block if sync already running
+        sync_q = getattr(self.app, '_sync_queue_controller', None)
+        if sync_q and not sync_q.is_idle:
+            messagebox.showwarning(
+                "Sync in Progress",
+                "A scheduled sync is running. Please wait for it to finish."
+            )
+            return
+
+        if self.state.sync_active:
+            messagebox.showwarning("Sync Running", "A sync is already in progress.")
+            return
+
+        co = self.state.get_company(name)
+        if not co or not co.is_initial_done:
+            messagebox.showwarning(
+                "Snapshot Required",
+                name + " has not completed its initial snapshot yet.\n"
+                "Please run a full sync first before reconciling."
+            )
+            return
+
+        ans = messagebox.askyesno(
+            "Reconcile Company",
+            "Reconcile  '" + name + "'?\n\n"
+            "This will:\n"
+            "  \u2022 Re-fetch ALL vouchers from Tally for the full date range\n"
+            "  \u2022 Automatically update any vouchers that changed\n"
+            "    (including foreign currency conversions CDC may have missed)\n"
+            "  \u2022 Remove any vouchers deleted in Tally\n\n"
+            "This may take a few minutes depending on data size.\n"
+            "Continue?",
+        )
+        if not ans:
+            return
+
+        # Set state and navigate to sync page in RECONCILE mode
+        from gui.state import SyncMode
+        self.state.selected_companies = [name]
+        for n, card in self._cards.items():
+            card.set_selected(n == name)
+        self._update_action_bar()
+        self.state.sync_mode      = SyncMode.RECONCILE
+        self.state.sync_from_date = co.starting_from
+        self.navigate("sync")
 
     def _handle_initial_snapshot_flow(self, name: str):
         from gui.components.initial_snapshot_dialog import InitialSnapshotDialog

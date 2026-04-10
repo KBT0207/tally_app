@@ -34,7 +34,8 @@ class CompanyCard(tk.Frame):
         on_select:    Callable,
         on_sync:      Callable,
         on_schedule:  Callable,
-        on_configure: Callable = None,   # NEW — for NOT_CONFIGURED companies
+        on_configure:  Callable = None,   # for NOT_CONFIGURED companies
+        on_reconcile:  Callable = None,   # NEW — full reconcile for this company
         selected:     bool = False,
         **kwargs,
     ):
@@ -44,6 +45,7 @@ class CompanyCard(tk.Frame):
         self.on_sync      = on_sync
         self.on_schedule  = on_schedule
         self.on_configure = on_configure
+        self.on_reconcile = on_reconcile
         self._selected_var = tk.BooleanVar(value=selected)
         self._bg_frames    = []
         self._prog_lbl     = None
@@ -272,6 +274,17 @@ class CompanyCard(tk.Frame):
                 cursor="hand2",
                 command=self._on_configure_click,
             ).pack(side="left")
+
+            tk.Button(
+                sub_row,
+                text="🔄",
+                font=Font.BUTTON_SM,
+                bg=Color.WARNING_BG, fg=Color.WARNING_FG,
+                relief="flat", bd=0,
+                padx=Spacing.SM, pady=Spacing.XS,
+                cursor="hand2",
+                command=self._on_reconcile_click,
+            ).pack(side="left", padx=(4, 0))
         else:
             # Configure button — highlighted more when Tally is open
             cfg_bg = Color.PRIMARY      if tally_open else Color.WARNING_BG
@@ -328,6 +341,10 @@ class CompanyCard(tk.Frame):
     def _on_configure_click(self):
         if self.on_configure:
             self.on_configure(self.company.name)
+
+    def _on_reconcile_click(self):
+        if self.on_reconcile:
+            self.on_reconcile(self.company.name)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Public update API
