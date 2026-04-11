@@ -47,7 +47,7 @@ IMAGE_FILES = {
     "data_server":  "tally_dataserver_image.png",
     "local_path":   "tally_local_path_image.png",
     "select_company":"tally_select_company_title.png",
-    "change_period": "tally_change_period.png",  # Added for the new method
+    "change_period": "tally_change_period.png",
 }
 
 
@@ -96,11 +96,9 @@ class TallyLauncher:
             ok, msg = self.wait_for_gateway()
             if not ok: return False, msg
 
-            # ── ADDED: Change Period Method called after Gateway is confirmed ──
             ok, msg = self.change_period(company)
             if not ok:
                 logger.warning(f"[TallyLauncher] Change period failed: {msg}")
-                # We continue even if period fails, as company is technically open
 
             logger.info(f"[TallyLauncher] '{company_name}' is ready ✓")
             return True, "ready"
@@ -109,53 +107,41 @@ class TallyLauncher:
             logger.exception(f"[TallyLauncher] Unexpected error for '{company_name}'")
             return False, str(e)
 
-    # ──────────────────────────────────────────────
-    #  NEW METHOD: CHANGE PERIOD
-    # ──────────────────────────────────────────────
-
     def change_period(self, company) -> Tuple[bool, str]:
-        """
-        Navigates to Change Period (Alt+F2) and sets the range 
-        from 'starting_from' to 'today'.
-        """
         try:
             self.bring_tally_to_front()
             time.sleep(1)
 
-            # Press Alt+F2
             pyautogui.hotkey('alt', 'f2')
             
-            # Wait for dialog
-            if not self.wait_for_image("change_period", seconds=300):
+            if not self.wait_for_image("change_period"):
                 return False, "Change Period dialog did not appear"
 
-            # Get and format starting_from date
             raw_start = getattr(company, 'starting_from', None)
             if not raw_start:
                 return False, "starting_from date missing"
 
-            # Convert YYYYMMDD to DD-MM-YYYY
             clean = str(raw_start).replace("-", "")[:8]
             formatted_start = f"{clean[6:8]}-{clean[4:6]}-{clean[0:4]}"
             formatted_today = datetime.now().strftime("%d-%m-%Y")
 
-            # Type dates
             self.type_text(formatted_start)
             pyautogui.press('enter')
             time.sleep(0.5)
             self.type_text(formatted_today)
             pyautogui.press('enter')
 
-            # Wait for dialog to disappear
-            self._wait_for_image_to_disappear("change_period", seconds=120)
+            self._wait_for_image_to_disappear("change_period")
             logger.info(f"[TallyLauncher] Period changed to: {formatted_start} to {formatted_today}")
             return True, "period_changed"
             
         except Exception as e:
             return False, str(e)
 
-    def _wait_for_image_to_disappear(self, image_key: str, seconds: int = 30) -> bool:
-        """Helper to confirm the dialog closed."""
+    def _wait_for_image_to_disappear(self, image_key: str, seconds: int = None) -> bool:
+        if seconds is None:
+            seconds = self.get_timeout()
+
         images   = getattr(self.state, 'tally_images', {}) or {}
         filename = images.get(image_key) or IMAGE_FILES.get(image_key) or f"tally_{image_key}.png"
         img_path = os.path.join(ASSETS_DIR, filename)
@@ -166,10 +152,6 @@ class TallyLauncher:
                 return True
             time.sleep(1)
         return False
-
-    # ──────────────────────────────────────────────
-    #  REMAINDER OF ORIGINAL CODE (UNCHANGED)
-    # ──────────────────────────────────────────────
 
     def close_tally(self) -> Tuple[bool, str]:
         if not self.is_tally_running():
@@ -210,18 +192,29 @@ class TallyLauncher:
     def open_tally(self, exe_path: str) -> Tuple[bool, str]:
         if not exe_path or not os.path.exists(exe_path):
             return False, "Tally path error"
+        
         subprocess.Popen([exe_path])
+
+        found = False
         for _ in range(30):
-            if self.get_tally_window() is not None: break
+            if self.get_tally_window() is not None:
+                found = True
+                break
             time.sleep(1)
-        self.wait_for_image("select_company", seconds=self.get_timeout())
+
+        if not found:
+            return False, "tally window not found"
+
+        if not self._select_company(interval=60):
+            return False, "select_company not found"
+        
         return True, "launched"
 
     def handle_tally_login(self) -> Tuple[bool, str]:
         username = getattr(self.state, 'tally_username', '') or ''
         password = getattr(self.state, 'tally_password', '') or ''
         if not username: return True, "skipped"
-        if self.wait_for_image("username", seconds=300):
+        if self.wait_for_image("username"):
             self.bring_tally_to_front()
             self.type_text(username)
             pyautogui.press('enter')
@@ -231,7 +224,7 @@ class TallyLauncher:
         return True, "done"
 
     def wait_for_company_list(self) -> Tuple[bool, str]:
-        if self.wait_for_image("search_box", seconds=self.get_timeout()):
+        if self.wait_for_image("search_box"):
             time.sleep(1)
             return True, "ready"
         return False, "timeout"
@@ -240,8 +233,8 @@ class TallyLauncher:
         self.bring_tally_to_front()
         if not self.double_click_image("data_server"): return False, "no_btn"
         pyautogui.moveTo(5, 5)
-        if not self.wait_for_image("local_path", seconds=self.get_timeout()): return False, "no_path"
-        if not self.wait_for_image("search_box", seconds=self.get_timeout()): return False, "no_reload"
+        if not self.wait_for_image("local_path"): return False, "no_path"
+        if not self.wait_for_image("search_box"): return False, "no_reload"
         return True, "tds_ready"
 
     def select_company(self, company) -> Tuple[bool, str]:
@@ -266,7 +259,7 @@ class TallyLauncher:
             self.type_text(password)
             pyautogui.press('enter')
             return True, "logged_in"
-        if not self.wait_for_image("username", seconds=60): return True, "no_dialog"
+        if not self.wait_for_image("username"): return True, "no_dialog"
         self.bring_tally_to_front()
         if not username:
             pyautogui.press('enter', presses=2)
@@ -279,7 +272,7 @@ class TallyLauncher:
         return True, "done"
 
     def wait_for_gateway(self) -> Tuple[bool, str]:
-        if self.wait_for_image("gateway", seconds=self.get_timeout()):
+        if self.wait_for_image("gateway"):
             return True, "gateway_found"
         return False, "timeout"
 
@@ -303,15 +296,32 @@ class TallyLauncher:
             return pyautogui.locateOnScreen(img_path, confidence=conf, grayscale=True) if HAS_OPENCV else pyautogui.locateOnScreen(img_path)
         except: return None
 
-    def wait_for_image(self, image_key: str, seconds: int = 300) -> bool:
+    def wait_for_image(self, image_key: str, seconds: int = None) -> bool:
+        if seconds is None:
+            seconds = self.get_timeout()
+
         images   = getattr(self.state, 'tally_images', {}) or {}
         filename = images.get(image_key) or IMAGE_FILES.get(image_key) or f"tally_{image_key}.png"
         img_path = os.path.join(ASSETS_DIR, filename)
         if not os.path.exists(img_path): return False
+
         end = time.time() + seconds
         while time.time() < end:
             if self.find_image_on_screen(img_path): return True
             time.sleep(1)
+        return False
+
+    def _select_company(self, interval: int = 60, timeout: int = None) -> bool:
+        if timeout is None:
+            timeout = self.get_timeout()
+
+        start = time.time()
+        while (time.time() - start) < timeout:
+            if self.wait_for_image("select_company", seconds=2):
+                return True
+            self.bring_tally_to_front()
+            pyautogui.press('enter')
+            time.sleep(min(interval, 5))
         return False
 
     def click_image(self, image_key: str) -> bool:
@@ -343,4 +353,5 @@ class TallyLauncher:
 
     def get_timeout(self) -> int:
         aut = getattr(self.state, 'automation', None)
-        return int(getattr(aut, 'wait_timeout_sec', 30)) if aut else 30
+        timeout = getattr(aut, 'wait_timeout_sec', None) if aut else None
+        return int(timeout) if timeout is not None else 300
