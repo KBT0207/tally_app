@@ -234,9 +234,12 @@ class HomePage(tk.Frame):
     # ─────────────────────────────────────────────────────────────────────────
     def refresh_companies(self):
         """Called by app.py after DB + Tally load completes."""
-        # force_rebuild=True so button layout (Configure vs Sync/Edit/Schedule)
-        # is always rebuilt correctly after a DB reload
         self._render_cards(force_rebuild=True)
+        # After rebuild, show/hide resync button based on current tally_open state
+        for name, card in self._cards.items():
+            co = self.state.get_company(name)
+            if co:
+                card.update_tally_open(getattr(co, 'tally_open', False))
         self._update_summary()
 
     def _render_cards(self, filter_text: str = "", force_rebuild: bool = False):
@@ -559,20 +562,19 @@ class HomePage(tk.Frame):
 
     def _on_single_reconcile(self, name: str):
         """
-        Reconcile button on a single company card.
-        Runs a full re-fetch for the company's entire date range and updates
-        any vouchers that changed (including FCY conversions CDC missed).
-        Does NOT touch alter_id watermark logic — safe to run any time.
+        Resync: delete ALL company data from DB, reset sync watermarks,
+        then kick off a fresh full snapshot from Tally.
+        Company config (credentials, schedule, data_path) is preserved.
         """
         import threading
-        from tkinter import messagebox
 
-        # Block if sync already running
+        # ── Guard: block if a sync is already running ──────────────────────
         sync_q = getattr(self.app, '_sync_queue_controller', None)
         if sync_q and not sync_q.is_idle:
             messagebox.showwarning(
                 "Sync in Progress",
-                "A scheduled sync is running. Please wait for it to finish."
+                "A sync is currently running.\n"
+                "Please wait for it to finish before resyncing."
             )
             return
 
@@ -580,38 +582,87 @@ class HomePage(tk.Frame):
             messagebox.showwarning("Sync Running", "A sync is already in progress.")
             return
 
-        co = self.state.get_company(name)
-        if not co or not co.is_initial_done:
-            messagebox.showwarning(
-                "Snapshot Required",
-                name + " has not completed its initial snapshot yet.\n"
-                "Please run a full sync first before reconciling."
-            )
-            return
-
+        # ── Confirmation ───────────────────────────────────────────────────
         ans = messagebox.askyesno(
-            "Reconcile Company",
-            "Reconcile  '" + name + "'?\n\n"
-            "This will:\n"
-            "  \u2022 Re-fetch ALL vouchers from Tally for the full date range\n"
-            "  \u2022 Automatically update any vouchers that changed\n"
-            "    (including foreign currency conversions CDC may have missed)\n"
-            "  \u2022 Remove any vouchers deleted in Tally\n\n"
-            "This may take a few minutes depending on data size.\n"
-            "Continue?",
+            "⚠  Resync Company",
+            f"Resync  '{name}'?\n\n"
+            "This will DELETE all locally stored data for this company:\n"
+            "  • Ledgers, Items\n"
+            "  • All voucher types (Sales, Purchase, Receipt, Payment …)\n"
+            "  • Trial Balance, Outstanding entries\n"
+            "  • Sync watermarks (alter_id / snapshot state)\n\n"
+            "A full snapshot will then be pulled fresh from Tally.\n"
+            "Company config and schedule are NOT affected.\n\n"
+            "This cannot be undone. Continue?",
+            icon="warning",
         )
         if not ans:
             return
 
-        # Set state and navigate to sync page in RECONCILE mode
-        from gui.state import SyncMode
-        self.state.selected_companies = [name]
-        for n, card in self._cards.items():
-            card.set_selected(n == name)
-        self._update_action_bar()
-        self.state.sync_mode      = SyncMode.RECONCILE
-        self.state.sync_from_date = co.starting_from
-        self.navigate("sync")
+        engine = self.state.db_engine
+        if not engine:
+            messagebox.showerror("DB Error", "Database engine is not available.")
+            return
+
+        # ── Guard: check Tally is reachable BEFORE deleting anything ───────
+        co = self.state.get_company(name)
+        try:
+            from services.tally_connector import TallyConnector
+            host = co.tally_host if co else self.state.tally.host
+            port = co.tally_port if co else self.state.tally.port
+            tally_check = TallyConnector(host=host, port=port)
+            if tally_check.status != "Connected":
+                raise ConnectionError()
+        except Exception:
+            messagebox.showerror(
+                "Tally Not Reachable",
+                f"Cannot connect to Tally.\n\n"
+                "Resync ABORTED — no data was deleted.\n\n"
+                "Please make sure Tally is open and running, then try again.",
+            )
+            return
+
+        # ── Delete all data in background thread ───────────────────────────
+        def _do_resync():
+            try:
+                from database.database_processor import resync_company
+                result = resync_company(name, engine)
+
+                # Reset in-memory company state
+                co = self.state.get_company(name)
+                if co:
+                    co.is_initial_done = False
+                    co.last_sync_time  = None
+                    co.last_alter_id   = 0
+                    self.state.emit("company_updated", name=name, company=co)
+
+                total_deleted = sum(result.get("deleted", {}).values())
+                self.after(0, lambda: _launch_snapshot(total_deleted))
+
+            except Exception as exc:
+                self.after(0, lambda e=exc: messagebox.showerror(
+                    "Resync Failed",
+                    f"Failed to delete data for '{name}':\n{e}\n\n"
+                    "No data was changed — rolled back."
+                ))
+
+        def _launch_snapshot(rows_deleted: int):
+            messagebox.showinfo(
+                "Resync Ready",
+                f"All data for '{name}' cleared ({rows_deleted:,} rows).\n\n"
+                "A full snapshot sync will now start."
+            )
+            from gui.state import SyncMode
+            co = self.state.get_company(name)
+            self.state.selected_companies = [name]
+            for n, card in self._cards.items():
+                card.set_selected(n == name)
+            self._update_action_bar()
+            self.state.sync_mode      = SyncMode.SNAPSHOT
+            self.state.sync_from_date = co.starting_from if co else None
+            self.navigate("sync")
+
+        threading.Thread(target=_do_resync, name=f"resync-{name}", daemon=True).start()
 
     def _handle_initial_snapshot_flow(self, name: str):
         from gui.components.initial_snapshot_dialog import InitialSnapshotDialog
@@ -658,8 +709,10 @@ class HomePage(tk.Frame):
                 card = self._cards[name]
                 # Update status badge
                 card.update_status(company.status)
-                # Update snapshot badge — this is the one that stayed stale
+                # Update snapshot badge
                 card.update_snapshot(company.is_initial_done)
+                # Show/hide 🔄 Resync button based on Tally open state
+                card.update_tally_open(getattr(company, 'tally_open', False))
                 # Update last-sync time in the meta row
                 if company.last_sync_time:
                     card.update_sync_time(company.last_sync_time)

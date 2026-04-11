@@ -35,7 +35,7 @@ class CompanyCard(tk.Frame):
         on_sync:      Callable,
         on_schedule:  Callable,
         on_configure:  Callable = None,   # for NOT_CONFIGURED companies
-        on_reconcile:  Callable = None,   # NEW — full reconcile for this company
+        on_reconcile:  Callable = None,   # full reconcile for this company
         selected:     bool = False,
         **kwargs,
     ):
@@ -53,6 +53,7 @@ class CompanyCard(tk.Frame):
         self._prog_bar     = None
         self._meta_lbl     = None
         self._snap_badge   = None   # reference so update_snapshot() can swap it
+        self._resync_btn   = None   # reference so update_tally_open() can show/hide it
         self._build()
         self._bind_hover()
 
@@ -275,7 +276,8 @@ class CompanyCard(tk.Frame):
                 command=self._on_configure_click,
             ).pack(side="left")
 
-            tk.Button(
+            # Resync button — only shown when this company is open in Tally
+            self._resync_btn = tk.Button(
                 sub_row,
                 text="🔄",
                 font=Font.BUTTON_SM,
@@ -284,7 +286,9 @@ class CompanyCard(tk.Frame):
                 padx=Spacing.SM, pady=Spacing.XS,
                 cursor="hand2",
                 command=self._on_reconcile_click,
-            ).pack(side="left", padx=(4, 0))
+            )
+            if tally_open:
+                self._resync_btn.pack(side="left", padx=(4, 0))
         else:
             # Configure button — highlighted more when Tally is open
             cfg_bg = Color.PRIMARY      if tally_open else Color.WARNING_BG
@@ -379,6 +383,15 @@ class CompanyCard(tk.Frame):
     def update_sync_time(self, dt):
         if self._meta_lbl:
             self._meta_lbl.configure(text=f"Last sync: {self._fmt_sync_time(dt)}")
+
+    def update_tally_open(self, tally_open: bool):
+        """Show or hide the 🔄 Resync button based on whether company is open in Tally."""
+        if not self._resync_btn:
+            return
+        if tally_open:
+            self._resync_btn.pack(side="left", padx=(4, 0))
+        else:
+            self._resync_btn.pack_forget()
 
     def update_queue_state(self, current_company: str, queued: list):
         """

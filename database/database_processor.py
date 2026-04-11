@@ -1429,3 +1429,81 @@ def upsert_outstanding(rows, engine):
         raise
     finally:
         db.close()
+
+# ── Resync: delete all company data and reset sync state ─────────────────────
+
+def resync_company(company_name: str, engine) -> dict:
+    """
+    Full resync for a single company.
+
+    Steps
+    -----
+    1. Delete every data row that belongs to ``company_name`` across all
+       tables that carry a ``company_name`` column:
+           Ledger, Item,
+           SalesVoucher, PurchaseVoucher, CreditNote, DebitNote,
+           ReceiptVoucher, PaymentVoucher, JournalVoucher, ContraVoucher,
+           TrialBalance, OutstandingData
+    2. Reset (delete) all SyncState rows for this company so that the next
+       sync treats everything as a fresh initial snapshot (is_initial_done=False,
+       last_alter_id=0).
+    3. Leave the Company master row intact — the company record in ``companies``
+       table is NOT deleted because the caller still needs its config
+       (credentials, data_path, schedule, etc.).
+
+    Returns a dict with per-table deleted counts and a 'success' bool.
+    """
+    db = _get_session(engine)
+    counts: dict[str, int] = {}
+    try:
+        logger.info(f"[{company_name}] RESYNC START — deleting all company data")
+
+        # ── 1. Data tables ────────────────────────────────────────────────────
+        data_models = [
+            ("Ledger",          Ledger),
+            ("Item",            Item),
+            ("SalesVoucher",    SalesVoucher),
+            ("PurchaseVoucher", PurchaseVoucher),
+            ("CreditNote",      CreditNote),
+            ("DebitNote",       DebitNote),
+            ("ReceiptVoucher",  ReceiptVoucher),
+            ("PaymentVoucher",  PaymentVoucher),
+            ("JournalVoucher",  JournalVoucher),
+            ("ContraVoucher",   ContraVoucher),
+            ("TrialBalance",    TrialBalance),
+            ("OutstandingData", OutstandingData),
+        ]
+
+        for label, model in data_models:
+            n = (
+                db.query(model)
+                .filter(model.company_name == company_name)
+                .delete(synchronize_session="fetch")
+            )
+            counts[label] = n
+            logger.info(f"[{company_name}] Deleted {n:>6} rows from {label}")
+
+        # ── 2. Reset sync-state watermarks ────────────────────────────────────
+        n_state = (
+            db.query(SyncState)
+            .filter(SyncState.company_name == company_name)
+            .delete(synchronize_session="fetch")
+        )
+        counts["SyncState"] = n_state
+        logger.info(f"[{company_name}] Deleted {n_state} SyncState rows — next sync will be a full snapshot")
+
+        db.commit()
+
+        total = sum(counts.values())
+        logger.info(
+            f"[{company_name}] RESYNC COMPLETE — "
+            f"total rows deleted: {total} | breakdown: {counts}"
+        )
+        return {"success": True, "company_name": company_name, "deleted": counts}
+
+    except Exception:
+        db.rollback()
+        logger.exception(f"[{company_name}] RESYNC FAILED — rolled back all changes")
+        raise
+    finally:
+        db.close()
