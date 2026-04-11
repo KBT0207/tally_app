@@ -118,16 +118,16 @@ def cleanup_sync_state(company_name: str = "") -> None:
     across repeated runs. Zero data impact — only clears in-memory lock dicts.
     """
     prefix = f"[{company_name}] " if company_name else ""
-    logger.info(f"{prefix}Cleaning up global state...")
+    # cleanup
 
     with _SYNC_STATE_LOCKS_MUTEX:
         sync_lock_count = len(_SYNC_STATE_LOCKS)
         _SYNC_STATE_LOCKS.clear()
 
-    logger.info(f"Cleared {sync_lock_count} sync locks")
+    # locks cleared
 
     gc.collect()
-    logger.info(f"{prefix}Cleanup complete (zero data impact)")
+    # cleanup done
 
 
 class MemoryMonitor:

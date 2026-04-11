@@ -150,7 +150,6 @@ class CompanyController:
             )
             db.execute(stmt)
             db.commit()
-            logger.debug(f"[CompanyController] Upserted config for: {name}")
         except Exception as e:
             db.rollback()
             logger.error(f"[CompanyController] Failed to save config for {name}: {e}")

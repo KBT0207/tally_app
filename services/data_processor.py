@@ -759,6 +759,26 @@ def parse_inventory_voucher(
     Parse Sales / Purchase / Credit Note / Debit Note XML from Tally.
 
     default_currency: per-company base currency passed from sync_service.
+
+    FIX — other_amt inflated by sales-account ledger amounts:
+    ─────────────────────────────────────────────────────────
+    Tally's Accounting Voucher View stores inventory inside
+    INVENTORYALLOCATIONS.LIST nodes nested under each sales-account
+    ALLLEDGERENTRIES.LIST entry (e.g. "Export CFR - Vegetables - (HSN 08045026)").
+    The Accounting Voucher View fallback already collects those nested nodes
+    into inventory_entries correctly.
+
+    The bug: the ledger aggregation loop runs BEFORE has_real_inventory is known,
+    so those same sales-account ledgers (which have real inventory nested inside
+    them) fell into the catch-all and inflated other_amt to the full invoice total.
+
+    The fix: perform a lightweight pre-scan of ledger entries to detect whether
+    any non-party ledger contains nested inventory nodes.  When it does,
+    _ledger_has_inventory is True and the catch-all correctly sends the ledger
+    amount into other_amt only if the ledger has NO nested inventory (i.e. it is
+    genuinely a miscellaneous charge like rounding, insurance, TCS, etc.).
+    When the ledger DOES have nested inventory, it is a sales-account line — skip
+    its amount entirely (the amount will be accounted for via the inventory rows).
     """
     try:
         if not xml_content or (isinstance(xml_content, str) and not xml_content.strip()):
@@ -876,7 +896,26 @@ def parse_inventory_voucher(
                             and not _is_fcy_string(party_amt_raw)):
                         total_amt_from_xml = round(total_amt_from_xml / voucher_exchange_rate, 6)
 
-
+            # ── FIX: Pre-scan ledger entries to build a set of ledger names that
+            # contain nested inventory allocations (Accounting Voucher View pattern).
+            # These are sales-account ledgers — their monetary amount is already
+            # captured via the nested stock item rows and must NOT also go into
+            # other_amt (that was the root cause of the inflation bug).
+            # Any non-party ledger that has NO nested inventory and is not a known
+            # charge (GST / freight / DCA / CF) is a genuine miscellaneous charge
+            # and does correctly belong in other_amt.
+            _ledgers_with_inventory = set()
+            for ledger in ledger_entries:
+                if clean_text(ledger.findtext('ISPARTYLEDGER', 'No')) != 'Yes':
+                    nested_check = (
+                        ledger.findall('.//ALLINVENTORYENTRIES.LIST') or
+                        ledger.findall('.//INVENTORYENTRIES.LIST') or
+                        ledger.findall('.//INVENTORYALLOCATIONS.LIST')
+                    )
+                    if nested_check:
+                        _ledgers_with_inventory.add(
+                            ledger.findtext('LEDGERNAME', '') or ''
+                        )
 
             # ── Aggregate GST / charges from ledger entries ────────────────────
             voucher_gst_data = {
@@ -922,7 +961,19 @@ def parse_inventory_voucher(
                     voucher_charges['cf_amt'] += amount
 
                 elif clean_text(ledger.findtext('ISPARTYLEDGER', 'No')) != 'Yes':
-                    voucher_charges['other_amt'] += amount
+                    # ── FIX ──────────────────────────────────────────────────────
+                    # If this ledger contains nested inventory allocations it is a
+                    # sales-account line (Accounting Voucher View pattern).  Its
+                    # monetary value is already captured through the stock item rows
+                    # that will be built from the nested nodes, so adding it to
+                    # other_amt would double-count.  Skip it here.
+                    #
+                    # If it has NO nested inventory it is a genuine miscellaneous
+                    # charge (rounding off, insurance, TCS, packing, etc.) and does
+                    # belong in other_amt — exactly as before.
+                    # ─────────────────────────────────────────────────────────────
+                    if ledger_name_raw not in _ledgers_with_inventory:
+                        voucher_charges['other_amt'] += amount
 
             # ── Inventory line items ───────────────────────────────────────────
             real_items = [

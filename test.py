@@ -12,10 +12,9 @@ for comp in comps:
     name = comp.get("name")
     if name in ['', ' ', 'N/A', 'NA']:
         continue
-    print(name)
     # data = tally.fetch_credit_note(name, from_date='20241004',to_date='20251004',debug=True)
-    data = tally.fetch_sales(name, from_date='20260326',to_date='20260326',debug=True)
-    rec = parse_inventory_voucher(data,company_name=name, material_centre='FCY KBEIPL', voucher_type_name='purchase vouchers')
+    data = tally.fetch_sales(name, from_date='20250425',to_date='20250425',debug=True)
+    rec = parse_inventory_voucher(data,company_name=name, material_centre='FCY KBEIPL', voucher_type_name='sales vouchers')
     df = pd.DataFrame(rec)
     view(df)
   

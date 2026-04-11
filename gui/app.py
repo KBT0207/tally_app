@@ -16,12 +16,17 @@ Usage (from run_gui.py):
     app.run()
 """
 
+import logging
 import threading
 import queue
 import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
+
+logging.getLogger("PIL").setLevel(logging.WARNING)
+logging.getLogger("PIL.Image").setLevel(logging.WARNING)
+logging.getLogger("PIL.PngImagePlugin").setLevel(logging.WARNING)
 
 try:
     import ttkbootstrap as tb

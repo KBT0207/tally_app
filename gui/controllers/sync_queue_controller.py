@@ -775,27 +775,14 @@ class SyncQueueController:
         Without this, by Company 6-7 the process RAM is bloated and
         PyAutoGUI screenshot calls start slowing down or failing.
         """
-        logger.debug(f"[SyncQueue] Cleanup after '{company_name}'...")
-
-        # Step 1: Python garbage collection
         collected = gc.collect()
-        logger.debug(f"[SyncQueue] GC collected {collected} objects")
 
-        # Step 2: Windows — trim process working set
-        # Forces Windows to release cached RAM pages to the OS
         try:
             import ctypes
-            # -1 as handle = current process
             ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1)
-            logger.debug("[SyncQueue] Windows memory trim done")
         except Exception:
-            pass  # Non-Windows or permission denied — skip silently
+            pass
 
-        # Step 3: Settle time — lets Tally finish any pending UI operations
-        # before the next company's PyAutoGUI automation starts clicking
-        logger.debug(
-            f"[SyncQueue] Waiting {CLEANUP_SLEEP_SEC}s for Tally to settle..."
-        )
         time.sleep(CLEANUP_SLEEP_SEC)
 
         logger.info(f"[SyncQueue] Cleanup done after '{company_name}' ✓")
