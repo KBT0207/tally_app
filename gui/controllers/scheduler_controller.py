@@ -148,7 +148,7 @@ def _run_scheduled_sync(company_name: str):
 
 
 def _slug(name: str) -> str:
-    """Convert company name to a safe APScheduler job ID."""
+    """Convert company name to a safe APScheduler job ID base."""
     return "sync_" + re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
 
@@ -266,7 +266,13 @@ class SchedulerController:
     #  Job management
     # ─────────────────────────────────────────────────────────────────────────
     def add_or_update_job(self, company_name: str):
-        """Add or reschedule a job for a company. Safe to call if job exists."""
+        """
+        Add or reschedule job(s) for a company.
+        For daily interval: registers one APScheduler job per configured time.
+        For minutes/hourly: registers a single interval job (index _0).
+        Safe to call if jobs already exist — replace_existing=True handles it.
+        Also cleans up the old non-indexed job format for backward compat.
+        """
         if not HAS_APSCHEDULER or not self._scheduler:
             return
 
@@ -275,56 +281,106 @@ class SchedulerController:
             self.remove_job(company_name)
             return
 
-        job_id  = _slug(company_name)
-        trigger = self._build_trigger(co)
+        triggers = self._build_trigger(co)
+        slug     = _slug(company_name)
 
         with self._lock:
             try:
-                self._scheduler.add_job(
-                    func             = _run_scheduled_sync,
-                    trigger          = trigger,
-                    id               = job_id,
-                    name             = f"Sync: {company_name}",
-                    kwargs           = {
-                        "company_name": company_name,   # only picklable arg needed
-                    },
-                    replace_existing = True,
-                )
+                # ── Backward compat: remove old non-indexed job if present ──
+                try:
+                    if self._scheduler.get_job(slug):
+                        self._scheduler.remove_job(slug)
+                        logger.info(f"[Scheduler] Removed legacy job ID '{slug}'")
+                except Exception:
+                    pass
+
+                # ── Remove excess indexed jobs (e.g. user reduced times) ────
+                for i in range(len(triggers), 10):
+                    old_id = f"{slug}_{i}"
+                    try:
+                        if self._scheduler.get_job(old_id):
+                            self._scheduler.remove_job(old_id)
+                    except Exception:
+                        pass
+
+                # ── Register one job per trigger ────────────────────────────
+                for i, trigger in enumerate(triggers):
+                    job_id   = f"{slug}_{i}"
+                    job_name = (
+                        f"Sync: {company_name}"
+                        if len(triggers) == 1
+                        else f"Sync: {company_name} [{i + 1}/{len(triggers)}]"
+                    )
+                    self._scheduler.add_job(
+                        func             = _run_scheduled_sync,
+                        trigger          = trigger,
+                        id               = job_id,
+                        name             = job_name,
+                        kwargs           = {"company_name": company_name},
+                        replace_existing = True,
+                    )
+
                 logger.info(
-                    f"[Scheduler] Job added/updated: {job_id} "
+                    f"[Scheduler] {len(triggers)} job(s) registered for '{company_name}' "
                     f"({co.schedule_interval} × {co.schedule_value})"
                 )
                 self._post_schedule_update(company_name)
+
             except Exception as e:
                 logger.error(f"[Scheduler] Failed to add job for {company_name}: {e}")
 
     def remove_job(self, company_name: str):
+        """Remove all APScheduler jobs for a company (indexed + legacy format)."""
         if not HAS_APSCHEDULER or not self._scheduler:
             return
-        job_id = _slug(company_name)
+        slug    = _slug(company_name)
+        removed = False
+
+        # Remove legacy non-indexed job
         try:
-            if self._scheduler.get_job(job_id):
-                self._scheduler.remove_job(job_id)
-                logger.info(f"[Scheduler] Job removed: {job_id}")
-                self._post_schedule_update(company_name)
+            if self._scheduler.get_job(slug):
+                self._scheduler.remove_job(slug)
+                removed = True
         except Exception as e:
-            logger.error(f"[Scheduler] Failed to remove job for {company_name}: {e}")
+            logger.error(f"[Scheduler] Failed to remove legacy job for {company_name}: {e}")
+
+        # Remove indexed jobs
+        for i in range(10):
+            job_id = f"{slug}_{i}"
+            try:
+                if self._scheduler.get_job(job_id):
+                    self._scheduler.remove_job(job_id)
+                    removed = True
+            except Exception as e:
+                logger.error(f"[Scheduler] Failed to remove job {job_id}: {e}")
+
+        if removed:
+            logger.info(f"[Scheduler] Job(s) removed for '{company_name}'")
+            self._post_schedule_update(company_name)
 
     def pause_job(self, company_name: str):
+        """Pause all jobs for a company."""
         if not self._scheduler:
             return
-        try:
-            self._scheduler.pause_job(_slug(company_name))
-        except Exception:
-            pass
+        slug = _slug(company_name)
+        for job_id in [slug] + [f"{slug}_{i}" for i in range(10)]:
+            try:
+                if self._scheduler.get_job(job_id):
+                    self._scheduler.pause_job(job_id)
+            except Exception:
+                pass
 
     def resume_job(self, company_name: str):
+        """Resume all jobs for a company."""
         if not self._scheduler:
             return
-        try:
-            self._scheduler.resume_job(_slug(company_name))
-        except Exception:
-            pass
+        slug = _slug(company_name)
+        for job_id in [slug] + [f"{slug}_{i}" for i in range(10)]:
+            try:
+                if self._scheduler.get_job(job_id):
+                    self._scheduler.resume_job(job_id)
+            except Exception:
+                pass
 
     def pause_all(self):
         """
@@ -358,11 +414,28 @@ class SchedulerController:
             logger.error(f"[Scheduler] resume_all() failed: {e}")
 
     def get_next_run(self, company_name: str) -> Optional[datetime]:
+        """
+        Return the earliest next_run_time across all APScheduler jobs
+        for this company (supports multiple daily times).
+        """
         if not self._scheduler:
             return None
         try:
-            job = self._scheduler.get_job(_slug(company_name))
-            return job.next_run_time if job else None
+            slug      = _slug(company_name)
+            next_runs = []
+
+            # Check legacy non-indexed job
+            job = self._scheduler.get_job(slug)
+            if job and job.next_run_time:
+                next_runs.append(job.next_run_time)
+
+            # Check indexed jobs
+            for i in range(10):
+                job = self._scheduler.get_job(f"{slug}_{i}")
+                if job and job.next_run_time:
+                    next_runs.append(job.next_run_time)
+
+            return min(next_runs) if next_runs else None
         except Exception:
             return None
 
@@ -381,18 +454,36 @@ class SchedulerController:
     #  Trigger builder
     # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
-    def _build_trigger(co: CompanyState):
+    def _build_trigger(co: CompanyState) -> list:
+        """
+        Build and return a LIST of APScheduler triggers for a company.
+
+        - minutes / hourly  → always returns [single IntervalTrigger]
+        - daily             → returns one CronTrigger per comma-separated time
+                              e.g. schedule_time="01:00,14:00" → 2 CronTriggers
+        - fallback          → [IntervalTrigger(hours=1)]
+
+        Callers must loop over the returned list and register one job per trigger.
+        """
         if co.schedule_interval == "minutes":
-            return IntervalTrigger(minutes=max(1, co.schedule_value))
+            return [IntervalTrigger(minutes=max(1, co.schedule_value))]
+
         elif co.schedule_interval == "hourly":
-            return IntervalTrigger(hours=max(1, co.schedule_value))
+            return [IntervalTrigger(hours=max(1, co.schedule_value))]
+
         elif co.schedule_interval == "daily":
-            try:
-                h, m = map(int, co.schedule_time.split(":"))
-            except Exception:
-                h, m = 9, 0
-            return CronTrigger(hour=h, minute=m)
-        return IntervalTrigger(hours=1)  # fallback
+            triggers = []
+            raw_times = [t.strip() for t in co.schedule_time.split(",") if t.strip()]
+            for t in raw_times:
+                try:
+                    h, m = map(int, t.split(":"))
+                except Exception:
+                    h, m = 9, 0
+                triggers.append(CronTrigger(hour=h, minute=m))
+            # Fallback to 09:00 if nothing parsed
+            return triggers if triggers else [CronTrigger(hour=9, minute=0)]
+
+        return [IntervalTrigger(hours=1)]  # fallback
 
     # ─────────────────────────────────────────────────────────────────────────
     #  APScheduler event listener
@@ -474,7 +565,7 @@ class SchedulerController:
 
         for name, co in enabled_companies:
             if co.schedule_interval == "daily":
-                # Daily: no stagger needed — register immediately
+                # Daily: no stagger needed — register immediately (multiple times supported)
                 self.add_or_update_job(name)
             else:
                 key = (co.schedule_interval, co.schedule_value)
@@ -497,7 +588,7 @@ class SchedulerController:
                         f"in group {interval_key})"
                     )
 
-        # Count daily jobs too
+        # Count daily companies (each may have multiple jobs)
         daily_count = sum(
             1 for _, co in enabled_companies
             if co.schedule_interval == "daily"
@@ -505,7 +596,7 @@ class SchedulerController:
         total_registered += daily_count
 
         logger.info(
-            f"[Scheduler] Registered {total_registered} job(s) "
+            f"[Scheduler] Registered jobs for {total_registered} company/companies "
             f"({len(interval_groups)} interval group(s), "
             f"{daily_count} daily). "
             f"Stagger: {self.STAGGER_SECONDS}s between companies "
@@ -518,11 +609,14 @@ class SchedulerController:
     def _add_job_with_startup_delay(self, company_name: str, co,
                                      stagger_offset: int = 0):
         """
-        Register job so next_run_time is calculated correctly after restart.
+        Register a single interval-based job (minutes/hourly) with a smart
+        start_date so next_run_time is correct after restart.
+
+        For daily companies, add_or_update_job() is called directly from
+        _sync_all_jobs() — this method is only used for interval jobs.
 
         stagger_offset: extra seconds added on top of startup delay so
           companies sharing the same interval fire at different times.
-          E.g. position 0 → +0s, position 1 → +10s, position 2 → +20s ...
 
         Respects last_sync_time:
           1. If last_sync_time exists → compute ideal_next = last_sync + interval
@@ -534,19 +628,18 @@ class SchedulerController:
             return
 
         import datetime as _dt
-        from apscheduler.triggers.interval import IntervalTrigger as _IT
-        from apscheduler.triggers.cron     import CronTrigger     as _CT
+        from apscheduler.triggers.cron     import CronTrigger as _CT
 
-        job_id  = _slug(company_name)
+        slug    = _slug(company_name)
         now     = _dt.datetime.now()
-        trigger = self._build_trigger(co)
+        triggers = self._build_trigger(co)
 
-        # ── Daily (CronTrigger): no stagger needed ────────────────────────────
-        if isinstance(trigger, _CT):
+        # ── Daily (CronTrigger): delegate to add_or_update_job ───────────────
+        if triggers and isinstance(triggers[0], _CT):
             self.add_or_update_job(company_name)
             return
 
-        # ── Interval-based (minutes / hourly) ────────────────────────────────
+        # ── Interval-based (minutes / hourly) — always exactly one trigger ───
         if co.schedule_interval == "minutes":
             interval_seconds = max(1, co.schedule_value) * 60
         else:  # hourly
@@ -569,9 +662,6 @@ class SchedulerController:
         )
 
         if ideal_next and ideal_next > min_start:
-            # Future next run — preserve it, but still add stagger offset
-            # so companies in the same group don't all fire at the exact
-            # same wall-clock time even when their last_sync times were similar.
             start_date = ideal_next + _dt.timedelta(seconds=stagger_offset)
             logger.info(
                 f"[Scheduler] '{company_name}' — next run preserved "
@@ -579,7 +669,6 @@ class SchedulerController:
                 f"{start_date.strftime('%d %b %Y %H:%M:%S')}"
             )
         else:
-            # Missed or no last_sync — use startup delay + stagger
             start_date = min_start
             if ideal_next:
                 logger.info(
@@ -594,13 +683,24 @@ class SchedulerController:
                     f"(+{stagger_offset}s stagger)"
                 )
 
+        from apscheduler.triggers.interval import IntervalTrigger as _IT
         delayed_trigger = _IT(
             seconds    = interval_seconds,
             start_date = start_date,
         )
 
+        # Interval jobs always have exactly one trigger → use index 0
+        job_id = f"{slug}_0"
+
         with self._lock:
             try:
+                # Remove legacy non-indexed job if present
+                try:
+                    if self._scheduler.get_job(slug):
+                        self._scheduler.remove_job(slug)
+                except Exception:
+                    pass
+
                 self._scheduler.add_job(
                     func             = _run_scheduled_sync,
                     trigger          = delayed_trigger,

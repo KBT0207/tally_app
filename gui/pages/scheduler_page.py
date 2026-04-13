@@ -12,11 +12,12 @@ Layout:
 │  Vouchers: All                    [Edit]  [Run Now]  [Disable]  │
 ├─────────────────────────────────────────────────────────────────┤
 │  XYZ Enterprises                            [○ Disabled]        │
-│  Every: [1] [Day ▾]  At: [09:00]  Next run: —                  │
+│  Every: [1] [Day ▾]  At: [09:00] [+ Add Time]  Next run: —    │
 │  Vouchers: Sales, Purchase           [Edit]  [Run Now]  [Enable]│
 └─────────────────────────────────────────────────────────────────┘
 
 Edit opens an inline form that expands below the row.
+For daily interval, multiple times can be added (e.g. 01:00 and 14:00).
 """
 
 import tkinter as tk
@@ -67,6 +68,11 @@ class ScheduleRow(tk.Frame):
         self._on_run_now = on_run_now
         self._page_app   = app            # used by _meta_text for round-aware label
         self._editing    = False
+
+        # Multiple-time UI state
+        self._time_entry_vars:  list  = []   # list of tk.StringVar (one per time row)
+        self._time_entry_rows:  list  = []   # list of tk.Frame    (one per time row)
+
         self._build()
 
     # ── Live company accessor — always returns the current object ─────────────
@@ -197,31 +203,50 @@ class ScheduleRow(tk.Frame):
         )
         interval_menu.grid(row=1, column=2, sticky="w", padx=(0, Spacing.LG))
 
-        # Daily time picker (shown only for daily)
-        self._time_lbl = tk.Label(f, text="At (HH:MM):", font=Font.BODY,
-                                  bg=Color.PRIMARY_LIGHT, fg=Color.TEXT_SECONDARY)
-        self._time_var = tk.StringVar(value=co.schedule_time)
-        self._time_entry = tk.Entry(
-            f, textvariable=self._time_var,
-            font=Font.BODY, width=8,
-            bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
-            relief="solid", bd=1,
-        )
+        # ── Daily times section ───────────────────────────────────────────────
+        # Replaces the old single time entry.
+        # Shows one row per configured time with a Remove button,
+        # plus an "+ Add Time" button to add more.
+        self._times_outer = tk.Frame(f, bg=Color.PRIMARY_LIGHT)
+        self._times_outer.grid(row=1, column=3, columnspan=3, sticky="w")
 
-        self._time_lbl.grid(row=1, column=3, sticky="w", padx=(0, Spacing.XS))
-        self._time_entry.grid(row=1, column=4, sticky="w")
+        tk.Label(
+            self._times_outer, text="At (HH:MM):",
+            font=Font.BODY, bg=Color.PRIMARY_LIGHT, fg=Color.TEXT_SECONDARY,
+        ).grid(row=0, column=0, sticky="w", padx=(0, Spacing.XS), pady=(0, 2))
+
+        # Container for the individual time rows
+        self._times_list_frame = tk.Frame(self._times_outer, bg=Color.PRIMARY_LIGHT)
+        self._times_list_frame.grid(row=1, column=0, sticky="w")
+
+        # "+ Add Time" button
+        self._add_time_btn = tk.Button(
+            self._times_outer, text="+ Add Time",
+            font=Font.BUTTON_SM, bg=Color.BG_ROOT, fg=Color.PRIMARY,
+            relief="solid", bd=1, padx=6, pady=2,
+            cursor="hand2", command=lambda: self._add_time_row(),
+        )
+        self._add_time_btn.grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+        # Populate from existing schedule_time (comma-separated)
+        self._time_entry_vars  = []
+        self._time_entry_rows  = []
+        existing_times = [t.strip() for t in co.schedule_time.split(",") if t.strip()]
+        if not existing_times:
+            existing_times = ["09:00"]
+        for t in existing_times:
+            self._add_time_row(t)
 
         # Preview label
         self._preview_lbl = tk.Label(
             f, text=self._schedule_preview(),
             font=Font.BODY_SM, bg=Color.PRIMARY_LIGHT, fg=Color.TEXT_SECONDARY,
         )
-        self._preview_lbl.grid(row=2, column=0, columnspan=5, sticky="w", pady=(Spacing.SM, 0))
+        self._preview_lbl.grid(row=2, column=0, columnspan=6, sticky="w", pady=(Spacing.SM, 0))
 
-        # Trace vars to update preview live
-        self._value_var.trace_add("write",    self._update_preview)
+        # Trace interval var for preview
         self._interval_var.trace_add("write", self._update_preview)
-        self._time_var.trace_add("write",     self._update_preview)
+        self._value_var.trace_add("write",    self._update_preview)
 
         # Save / Cancel
         btn_row = tk.Frame(f, bg=Color.PRIMARY_LIGHT)
@@ -241,8 +266,63 @@ class ScheduleRow(tk.Frame):
             cursor="hand2", command=self._toggle_edit,
         ).pack(side="left")
 
-        # Set initial visibility of daily time fields
+        # Set initial visibility of daily time section
         self._on_interval_change(self.company.schedule_interval)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Multiple-time helpers
+    # ─────────────────────────────────────────────────────────────────────────
+    def _add_time_row(self, time_str: str = "09:00"):
+        """
+        Add one time entry row (Entry + Remove button) to the daily times list.
+        Appends a StringVar to self._time_entry_vars.
+        """
+        idx = len(self._time_entry_vars)
+
+        row_frame = tk.Frame(self._times_list_frame, bg=Color.PRIMARY_LIGHT)
+        row_frame.grid(row=idx, column=0, sticky="w", pady=(0, 3))
+
+        var = tk.StringVar(value=time_str)
+        var.trace_add("write", self._update_preview)
+        self._time_entry_vars.append(var)
+        self._time_entry_rows.append(row_frame)
+
+        entry = tk.Entry(
+            row_frame, textvariable=var,
+            font=Font.BODY, width=8,
+            bg=Color.BG_INPUT, fg=Color.TEXT_PRIMARY,
+            relief="solid", bd=1,
+        )
+        entry.pack(side="left", padx=(0, Spacing.XS))
+
+        # Remove button — only show if there will be at least one row left
+        remove_btn = tk.Button(
+            row_frame, text="✕",
+            font=Font.BUTTON_SM, bg=Color.DANGER_BG, fg=Color.DANGER_FG,
+            relief="flat", bd=0, padx=5, pady=2,
+            cursor="hand2",
+            command=lambda f=row_frame, v=var: self._remove_time_row(f, v),
+        )
+        remove_btn.pack(side="left")
+
+    def _remove_time_row(self, row_frame: tk.Frame, var: tk.StringVar):
+        """Remove a time entry row — keeps at least one row always."""
+        if len(self._time_entry_vars) <= 1:
+            messagebox.showinfo("At least one time required",
+                                "You must have at least one daily sync time.")
+            return
+        idx = self._time_entry_rows.index(row_frame)
+        self._time_entry_vars.pop(idx)
+        self._time_entry_rows.pop(idx)
+        row_frame.destroy()
+        # Re-grid remaining rows with correct indices
+        for i, r in enumerate(self._time_entry_rows):
+            r.grid(row=i, column=0, sticky="w", pady=(0, 3))
+        self._update_preview()
+
+    def _get_all_times(self) -> list:
+        """Return list of time strings from all time entry vars."""
+        return [v.get().strip() for v in self._time_entry_vars]
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Edit form logic
@@ -259,12 +339,10 @@ class ScheduleRow(tk.Frame):
     def _on_interval_change(self, val=None):
         v = self._interval_var.get()
         if v == "daily":
-            self._time_lbl.grid()
-            self._time_entry.grid()
+            self._times_outer.grid()
             self._value_entry.configure(state="disabled")
         else:
-            self._time_lbl.grid_remove()
-            self._time_entry.grid_remove()
+            self._times_outer.grid_remove()
             self._value_entry.configure(state="normal")
         self._update_preview()
 
@@ -274,15 +352,16 @@ class ScheduleRow(tk.Frame):
                        else self.company.schedule_interval
             value    = self._value_var.get()    if hasattr(self, "_value_var")    \
                        else self.company.schedule_value
-            time_s   = self._time_var.get()     if hasattr(self, "_time_var")     \
-                       else self.company.schedule_time
 
             if interval == "minutes":
                 return f"Will sync every {value} minute(s)"
             elif interval == "hourly":
                 return f"Will sync every {value} hour(s)"
             elif interval == "daily":
-                return f"Will sync every day at {time_s}"
+                times = self._get_all_times() if self._time_entry_vars \
+                        else [self.company.schedule_time]
+                times_str = ", ".join(t for t in times if t)
+                return f"Will sync every day at: {times_str}"
         except Exception:
             pass
         return ""
@@ -302,44 +381,50 @@ class ScheduleRow(tk.Frame):
             return
 
         interval = self._interval_var.get()
-        time_s   = self._time_var.get().strip()
 
+        # ── Validate and collect times for daily ─────────────────────────────
         if interval == "daily":
             import re
-            if not re.match(r"^\d{1,2}:\d{2}$", time_s):
-                messagebox.showerror("Invalid Time", "Enter time as HH:MM, e.g. 09:00")
+            raw_times = self._get_all_times()
+            valid_times = []
+            for t in raw_times:
+                if not re.match(r"^\d{1,2}:\d{2}$", t):
+                    messagebox.showerror(
+                        "Invalid Time",
+                        f"'{t}' is not a valid time.\nEnter each time as HH:MM, e.g. 09:00 or 01:00",
+                    )
+                    return
+                valid_times.append(t)
+            if not valid_times:
+                messagebox.showerror("No Times", "Please add at least one daily sync time.")
                 return
+            time_s = ",".join(valid_times)   # e.g. "01:00,14:00"
+        else:
+            time_s = self.company.schedule_time  # unchanged for non-daily
 
         # ── FIX 5: Warn if interval is too short for number of scheduled companies ──
-        # Calculate how many companies are currently scheduled (enabled).
-        # Use a conservative estimate of AVG_SYNC_MIN per company.
-        # If total estimated round time > chosen interval → warn user.
         if interval in ("minutes", "hourly"):
-            AVG_SYNC_MIN = 10   # conservative estimate per company in minutes
+            AVG_SYNC_MIN = 10
 
-            # Count ALL enabled companies including this one after save
             scheduled_count = sum(
                 1 for c in (
                     self._state.companies.values()
                     if self._state else []
                 )
                 if getattr(c, 'schedule_enabled', False)
-                   or c.name == co.name   # this company is being enabled now
+                   or c.name == co.name
             )
-            # Remove duplicates if this company was already counted
             scheduled_count = max(1, scheduled_count)
 
-            # Convert chosen interval to minutes
             if interval == "minutes":
                 chosen_interval_min = max(1, val)
-            else:  # hourly
+            else:
                 chosen_interval_min = max(1, val) * 60
 
             estimated_round_min = scheduled_count * AVG_SYNC_MIN
 
             if estimated_round_min > chosen_interval_min:
-                suggested_min = int(estimated_round_min * 1.2)  # 20% buffer
-                # Convert suggestion back to hours if >= 60 min
+                suggested_min = int(estimated_round_min * 1.2)
                 if suggested_min >= 60:
                     suggested_str = f"{suggested_min // 60}h {suggested_min % 60}m" \
                                     if suggested_min % 60 else f"{suggested_min // 60} hour(s)"
@@ -415,9 +500,7 @@ class ScheduleRow(tk.Frame):
         always gets the current object even after a state.companies rebuild.
         """
         co = self.company
-        # Update meta text (schedule + next run)
         self._update_meta()
-        # Update status badge and enable/disable button to match live state
         self._toggle_enable_ui(co.schedule_enabled)
 
     # Alias for clarity when called from SchedulerPage.refresh_companies()
@@ -472,15 +555,16 @@ class ScheduleRow(tk.Frame):
             elif co.schedule_interval == "hourly":
                 parts.append(f"Every {co.schedule_value} hour(s)")
             elif co.schedule_interval == "daily":
-                parts.append(f"Daily at {co.schedule_time}")
+                # Show all configured times (comma-separated in DB)
+                times = [t.strip() for t in co.schedule_time.split(",") if t.strip()]
+                times_str = ", ".join(times) if times else co.schedule_time
+                parts.append(f"Daily at {times_str}")
 
             # Get sync_queue_controller for round-aware status display
             sync_q = getattr(self._page_app, '_sync_queue_controller', None) \
                      if hasattr(self, '_page_app') else None
 
             # ── Round-aware next run label ────────────────────────────────
-            # If a round is active, show live queue status instead of
-            # APScheduler next_run_time (which would be stale/misleading).
             from gui.controllers.company_controller import CompanyController
             round_label = CompanyController.next_run_label(
                 co,
@@ -488,8 +572,6 @@ class ScheduleRow(tk.Frame):
                 sync_queue_controller = sync_q,
             )
 
-            # If round_label is a live status (Syncing/Queued/Done this round)
-            # show it directly. Otherwise show with APScheduler countdown.
             live_statuses = ("⟳ Syncing now...", "⏳ Queued", "✓ Synced this round")
             if any(round_label.startswith(s) for s in live_statuses):
                 parts.append(round_label)
@@ -508,7 +590,6 @@ class ScheduleRow(tk.Frame):
                 else:
                     parts.append(f"Next run: {round_label}")
             else:
-                # Scheduler not wired yet — show estimated time
                 est = CompanyController._estimate_next_run(co)
                 if est != "—":
                     parts.append(f"Next run: ~{est} (est.)")
@@ -530,10 +611,7 @@ class ScheduleRow(tk.Frame):
             except Exception:
                 pass
 
-        # ── FIX: Tally offline indicator per company row ──────────────────────
-        # If Tally is offline, show a clear warning so user knows why
-        # the schedule is active but Tally hasn't been touched.
-        # The scheduler will still open Tally automatically when the job fires.
+        # ── Tally offline indicator per company row ───────────────────────────
         if not getattr(co, 'tally_open', False):
             parts.append("⚠ Tally offline — will open automatically on next sync")
 
@@ -600,15 +678,10 @@ class SchedulerPage(tk.Frame):
         ).pack(side="left")
 
         # ── Phase 2: Queue Status Strip ───────────────────
-        # Shows live sync state: what is running, what is waiting, what is done.
-        # Sits between toolbar and the company list. Hidden when queue is idle.
-        # Example:
-        #   ● Syncing: CompanyC  |  ⏳ Waiting: D, E, F  |  ✓ Done: A, B
         self._queue_strip = tk.Frame(
             self, bg=Color.PRIMARY_LIGHT,
             highlightthickness=1, highlightbackground=Color.BORDER,
         )
-        # Not gridded initially — shown only when queue is active
         self._queue_strip_lbl = tk.Label(
             self._queue_strip,
             text="",
@@ -702,14 +775,6 @@ class SchedulerPage(tk.Frame):
             self._no_sched_lbl.pack(fill="both", expand=True)
             return
 
-        # ── FIX 3: Show ALL companies that are configured in the DB ──────────
-        # Previously filtered by status which excluded companies when Tally
-        # was offline (status = NOT_CONFIGURED even though they ARE configured).
-        # Now we show every company that has been saved to DB (has a guid or
-        # has schedule config), sorted: scheduled-enabled first, then alpha.
-        #
-        # Tally offline = company is still configured, schedule still works.
-        # We show a "Tally Offline" indicator per row instead of hiding them.
         companies = sorted(
             [
                 co for co in self.state.companies.values()
@@ -765,12 +830,9 @@ class SchedulerPage(tk.Frame):
         Also re-syncs APScheduler jobs for any enabled schedules.
         Must be called on the main (GUI) thread.
         """
-        # Rebuild all rows — each ScheduleRow now holds a live state reference
         self._render_rows()
         self._update_scheduler_status()
 
-        # Re-register APScheduler jobs for companies that have scheduling enabled
-        # (needed if scheduler was already running before refresh)
         if self._sched_ctrl and self._sched_ctrl.is_running():
             for name, co in self.state.companies.items():
                 if co.schedule_enabled and co.status != CompanyStatus.NOT_CONFIGURED:
@@ -811,11 +873,9 @@ class SchedulerPage(tk.Frame):
         sync_q = getattr(self.app, '_sync_queue_controller', None)
         if sync_q is not None:
 
-            # ── FIX 9: Show position and wait time before confirming ──────
             current = sync_q.current_company
             waiting = list(sync_q.queued_companies)
 
-            # Already running?
             if company_name == current:
                 messagebox.showinfo(
                     "Already Syncing",
@@ -824,16 +884,14 @@ class SchedulerPage(tk.Frame):
                 )
                 return
 
-            # Already in queue?
             if company_name in waiting:
                 pos       = waiting.index(company_name) + 1
                 total     = len(waiting)
                 ahead     = pos - 1
-                # Estimate: each company ahead takes AVG_SYNC_MIN minutes
                 AVG_SYNC_MIN = 10
                 wait_min  = ahead * AVG_SYNC_MIN
                 if current:
-                    wait_min += AVG_SYNC_MIN   # add current in-progress
+                    wait_min += AVG_SYNC_MIN
                 messagebox.showinfo(
                     "Already Queued",
                     f"'{company_name}' is already in the sync queue.\n\n"
@@ -843,9 +901,6 @@ class SchedulerPage(tk.Frame):
                 )
                 return
 
-            # ── Check if already ran this round (Round Gate) ──────────────
-            # If round is active and this company already ran, enqueue()
-            # would silently skip it — show a clear message instead.
             if sync_q.round_active and company_name in sync_q.round_companies:
                 messagebox.showinfo(
                     "Already Synced This Round",
@@ -856,22 +911,17 @@ class SchedulerPage(tk.Frame):
                 )
                 return
 
-            # Not in queue — enqueue and show position
             sync_q.enqueue(company_name)
 
-            # Calculate new position after enqueue
             new_waiting  = list(sync_q.queued_companies)
-            new_pos      = len(new_waiting)   # just enqueued = last position
+            new_pos      = len(new_waiting)
             total_ahead  = new_pos - 1
             AVG_SYNC_MIN = 10
             wait_min     = total_ahead * AVG_SYNC_MIN
             if current:
                 wait_min += AVG_SYNC_MIN
 
-            if wait_min == 0:
-                wait_str = "starting shortly"
-            else:
-                wait_str = f"~{wait_min} min wait"
+            wait_str = "starting shortly" if wait_min == 0 else f"~{wait_min} min wait"
 
             messagebox.showinfo(
                 "Added to Queue",
@@ -890,7 +940,6 @@ class SchedulerPage(tk.Frame):
         self.state.selected_companies = [company_name]
         self.navigate("sync")
 
-
     # ─────────────────────────────────────────────────────────────────────────
     #  Init controllers (lazy — wait for app to create scheduler)
     # ─────────────────────────────────────────────────────────────────────────
@@ -906,31 +955,21 @@ class SchedulerPage(tk.Frame):
 
         self._co_ctrl = CompanyController(self.state)
 
-        # ── Reuse the already-running scheduler from app.py ───────────────
         existing = getattr(self.app, '_scheduler_controller', None)
         if existing is not None:
             self._sched_ctrl = existing
             return
 
-        # ── Fallback: app hasn't started its scheduler yet (first visit) ──
-        # This path runs only on very first on_show() before startup completes.
-        # We set sched_ctrl to None and retry next time on_show() is called.
         self._sched_ctrl = None
-
 
     def _update_scheduler_status(self):
         """
         FIX 2: Always re-wire _sched_ctrl before checking status.
-        Previously _sched_ctrl stayed None if on_show() ran before scheduler
-        started, causing permanent "Not running" display even after startup.
         """
-        # Always try to grab the scheduler from app — it may have started
-        # after the page was first shown
         if self._sched_ctrl is None:
             existing = getattr(self.app, '_scheduler_controller', None)
             if existing is not None:
                 self._sched_ctrl = existing
-                # Also re-wire all existing rows with the controller
                 for row in self._rows.values():
                     row._sched_ctrl = self._sched_ctrl
 
@@ -960,35 +999,21 @@ class SchedulerPage(tk.Frame):
         """
         Called by app.py via 'scheduler_ready' queue event.
         Fires after BOTH SchedulerController and SyncQueueController are started.
-        This is the correct time to wire up _sched_ctrl and refresh the page.
-
-        FIX 1: Previously the page was only refreshed on 'companies_loaded'
-        which fires BEFORE the scheduler starts → always showed "Not running".
-        Now we get a second refresh exactly when the scheduler is ready.
         """
-        # Wire up controller
         self._sched_ctrl = getattr(self.app, '_scheduler_controller', None)
         if self._co_ctrl is None:
             from gui.controllers.company_controller import CompanyController
             self._co_ctrl = CompanyController(self.state)
 
-        # Refresh everything now that scheduler is live
         self._update_scheduler_status()
         self._render_rows()
-
-        # Start periodic status refresh (every 10s) so status bar
-        # updates when Tally comes online/offline while page is open
         self._start_status_ticker()
 
         from logging_config import logger
         logger.info("[SchedulerPage] Scheduler ready — page refreshed ✓")
 
     def _start_status_ticker(self):
-        """
-        FIX 4: Periodic status bar refresh every 10 seconds.
-        Keeps 'Tally: Online/Offline' and scheduler status current
-        without user having to click Refresh.
-        """
+        """Periodic status bar refresh every 10 seconds."""
         if getattr(self, "_status_ticker_active", False):
             return
         self._status_ticker_active = True
@@ -1003,8 +1028,6 @@ class SchedulerPage(tk.Frame):
             pass
         self.after(10_000, self._tick_status)
 
-
-
     # ─────────────────────────────────────────────────────────────────────────
     #  State event callbacks
     # ─────────────────────────────────────────────────────────────────────────
@@ -1018,52 +1041,37 @@ class SchedulerPage(tk.Frame):
         """
         Called by app.py on every 'queue_updated' event.
         Updates the live queue strip at top of page.
-        Must be called on main thread (via root.after if from background).
         """
         self.after(0, self._update_queue_strip)
 
     def _update_queue_strip(self):
-        """
-        Rebuild the queue status strip text and show/hide it.
-
-        Layout:
-          ● Syncing: CompanyC  |  ⏳ Waiting: D, E, F  |  ✓ Done: A, B
-          (hidden entirely when queue is idle)
-        """
+        """Rebuild the queue status strip text and show/hide it."""
         sync_q = getattr(self.app, '_sync_queue_controller', None)
         if sync_q is None:
             self._hide_queue_strip()
             return
 
         current  = sync_q.current_company
-        waiting  = list(sync_q.queued_companies)   # snapshot
+        waiting  = list(sync_q.queued_companies)
 
-        # If nothing running and nothing waiting — hide strip
         if not current and not waiting:
-            # Show "All done" briefly then hide
             if self._queue_strip_visible:
                 done_companies = getattr(self, '_last_done_companies', [])
                 if done_companies:
-                    done_str = ", ".join(done_companies[-6:])  # max 6
+                    done_str = ", ".join(done_companies[-6:])
                     self._queue_strip_lbl.configure(
                         text=f"✓  All syncs complete  ·  Done: {done_str}",
                         fg=Color.SUCCESS,
                     )
-                    # Hide after 5 seconds
                     self.after(5_000, self._hide_queue_strip)
             return
 
-        # Build strip text
         parts = []
 
         if current:
             parts.append(f"● Syncing: {current}")
 
-            # ── Fixed: use round_companies to determine truly Done ────────
-            # Old logic used (all_enabled - current - waiting) which wrongly
-            # showed companies that hadn't synced yet as "Done".
-            # New logic: Done = ran in this round AND not running AND not waiting.
-            round_cos = sync_q.round_companies   # set of companies in current round
+            round_cos = sync_q.round_companies
             done = [
                 n for n in round_cos
                 if n != current and n not in waiting
@@ -1073,12 +1081,11 @@ class SchedulerPage(tk.Frame):
             done = []
 
         if waiting:
-            # Show position numbers: "⏳ Waiting (3): D, E, F"
             waiting_str = ", ".join(waiting)
             parts.append(f"⏳ Waiting ({len(waiting)}): {waiting_str}")
 
         if done:
-            done_str = ", ".join(done[-4:])  # show last 4 max
+            done_str = ", ".join(done[-4:])
             if len(done) > 4:
                 done_str = f"...{done_str}"
             parts.append(f"✓ Done ({len(done)}): {done_str}")
@@ -1104,13 +1111,10 @@ class SchedulerPage(tk.Frame):
             self._queue_strip_visible = False
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Live next-run ticker — refreshes all rows every 30 s automatically
+    #  Live next-run ticker
     # ─────────────────────────────────────────────────────────────────────────
     def _start_next_run_ticker(self):
-        """
-        Ticks every 1 second to keep the countdown ("in 3m 24s") live.
-        Previously ticked every 30s — not granular enough for a countdown.
-        """
+        """Ticks every 1 second to keep the countdown live."""
         if getattr(self, "_ticker_active", False):
             return
         self._ticker_active = True
@@ -1125,24 +1129,15 @@ class SchedulerPage(tk.Frame):
                 row.refresh_next_run()
             except Exception:
                 pass
-        # 1 second tick — keeps "in Xm Ys" accurate
         self.after(1_000, self._tick_next_runs)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Lifecycle
     # ─────────────────────────────────────────────────────────────────────────
     def on_show(self):
-        """
-        Called every time user navigates to the Scheduler page.
-
-        FIX: Always try to wire _sched_ctrl in case it wasn't ready on first visit.
-        Do NOT re-render rows every time — just refresh status + next-run labels.
-        Re-render only if rows are empty (first visit or after companies reload).
-        """
-        # Always try to wire controllers — safe if already wired
+        """Called every time user navigates to the Scheduler page."""
         self._init_controllers()
 
-        # Re-try wiring scheduler if it wasn't available before
         if self._sched_ctrl is None:
             existing = getattr(self.app, '_scheduler_controller', None)
             if existing is not None:
@@ -1152,17 +1147,14 @@ class SchedulerPage(tk.Frame):
 
         self._update_scheduler_status()
 
-        # Re-render only if no rows yet (first visit / empty state)
         if not self._rows:
             self._render_rows()
         else:
-            # Just refresh each row's display data
             for row in self._rows.values():
                 try:
                     row.refresh_next_run()
                 except Exception:
                     pass
 
-        # Start tickers (idempotent)
         self._start_next_run_ticker()
         self._start_status_ticker()

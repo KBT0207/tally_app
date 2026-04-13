@@ -10,7 +10,7 @@ class CompanySchedulerConfig(Base):
     enabled        = Column(Boolean,  default=False,   nullable=False)
     interval       = Column(String(20), default="hourly", nullable=False)
     value          = Column(Integer,  default=1,        nullable=False)
-    time           = Column(String(10), default="09:00", nullable=False)
+    time           = Column(String(200), default="09:00")
     last_sync_time = Column(DateTime, nullable=True,    default=None)
     updated_at     = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
