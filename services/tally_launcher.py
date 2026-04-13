@@ -205,8 +205,10 @@ class TallyLauncher:
         if not found:
             return False, "tally window not found"
 
-        if not self._select_company(interval=60):
-            return False, "select_company not found"
+        # if not self._select_company(interval=60):
+        #     return False, "select_company not found"
+
+        self.wait_for_image("select_company", seconds=self.get_timeout())
         
         return True, "launched"
 

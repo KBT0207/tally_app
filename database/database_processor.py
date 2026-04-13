@@ -1356,7 +1356,6 @@ def reconcile_deleted_masters_in_db(
     finally:
         db.close()
 
-
 def upsert_outstanding(rows, engine):
     """
     Full-replace for outstanding — point-in-time snapshot.
@@ -1364,9 +1363,13 @@ def upsert_outstanding(rows, engine):
     Both in one transaction — if insert fails, delete rolls back too.
 
     parent_group is enriched from the Ledger table at upsert time:
-      Ledger(company_name, ledger_name) → parent_group
-    A single pre-fetch builds a lookup dict so there is only ONE extra
-    query per upsert call regardless of how many rows are inserted.
+      (company_name, ledger_name) → parent_group
+
+    Compound key (company_name + ledger_name) ensures that the same ledger
+    name across different companies never collides in the lookup map.
+    Matching is case-insensitive and whitespace-tolerant on both sides.
+    Safe for 40+ companies running sequentially — single worker thread,
+    one engine shared, each call fully isolated by company_name filter.
     """
     if not rows:
         logger.warning("No rows to upsert for outstanding")
@@ -1376,25 +1379,51 @@ def upsert_outstanding(rows, engine):
     db = _get_session(engine)
     inserted = 0
     try:
-        # ── Pre-fetch parent_group from Ledger for all unique party names ──
+        # ── Pre-fetch ALL ledgers for this company ─────────────────────────
+        # Fetch by exact company_name first; if zero rows returned (can happen
+        # if company_name casing differs between ledger sync and outstanding sync),
+        # fall back to a case-insensitive LIKE so no company silently gets
+        # an empty parent_group_map across 40+ companies.
         party_names = {r['party_name'] for r in rows if r.get('party_name')}
+
         ledger_rows = (
-            db.query(Ledger.ledger_name, Ledger.parent_group)
-            .filter(
-                Ledger.company_name == company_name,
-                Ledger.ledger_name.in_(party_names),
-            )
+            db.query(Ledger.company_name, Ledger.ledger_name, Ledger.parent_group)
+            .filter(Ledger.company_name == company_name)
             .all()
         )
-        # ledger_name → parent_group lookup (empty string if not found)
-        parent_group_map: dict[str, str] = {
-            row.ledger_name: (row.parent_group or '') for row in ledger_rows
+
+        # Fallback: case-insensitive match if exact company_name returned nothing
+        if not ledger_rows:
+            logger.warning(
+                f"[{company_name}] No ledger rows found with exact company_name match — "
+                f"falling back to case-insensitive search"
+            )
+            ledger_rows = (
+                db.query(Ledger.company_name, Ledger.ledger_name, Ledger.parent_group)
+                .filter(Ledger.company_name.ilike(company_name.strip()))
+                .all()
+            )
+
+        # Compound key: (company_name_norm, ledger_name_norm) → parent_group
+        # Prevents same ledger name across different companies from colliding
+        parent_group_map: dict[tuple, str] = {
+            (row.company_name.strip().lower(), row.ledger_name.strip().lower()): (row.parent_group or '')
+            for row in ledger_rows
         }
+
+        company_key = company_name.strip().lower()
+        matched   = sum(1 for p in party_names if (company_key, p.strip().lower()) in parent_group_map)
+        unmatched = [p for p in party_names if (company_key, p.strip().lower()) not in parent_group_map]
+
         logger.info(
             f"Outstanding upsert | company={company_name} | "
             f"ledger parent_group lookup: {len(party_names)} parties → "
-            f"{len(parent_group_map)} matched"
+            f"matched={matched} unmatched={len(unmatched)}"
         )
+        if unmatched:
+            logger.warning(
+                f"Unmatched parties (no ledger master) [{company_name}]: {unmatched}"
+            )
 
         # ── Full-replace: delete then insert ──────────────────────────────
         db.query(OutstandingData).filter_by(
@@ -1408,7 +1437,7 @@ def upsert_outstanding(rows, engine):
             db.add(OutstandingData(
                 company_name    = row.get('company_name'),
                 party_name      = party,
-                parent_group    = parent_group_map.get(party, ''),
+                parent_group    = parent_group_map.get((company_key, party.strip().lower()), ''),
                 bill_name       = row.get('bill_name'),
                 bill_id         = row.get('bill_id'),
                 bill_date       = row.get('bill_date'),
