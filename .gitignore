@@ -91,3 +91,4 @@ htmlcov/
 *.key
 *.crt
 
+dist/TallySyncManager/.env

@@ -20,9 +20,12 @@ import logging
 import threading
 import queue
 import ctypes
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
+
+import requests
 
 logging.getLogger("PIL").setLevel(logging.WARNING)
 logging.getLogger("PIL.Image").setLevel(logging.WARNING)
@@ -39,7 +42,7 @@ from gui.state          import AppState, CompanyState, CompanyStatus
 from gui.config_manager import ConfigManager
 from gui.styles import (
     Color, Font, Spacing, Layout,
-    NAV_ITEMS, APP_TITLE, APP_VERSION,
+    NAV_ITEMS, APP_TITLE, APP_VERSION, GIST_VERSION_URL,
     BOOTSTRAP_THEME, STATUS_STYLE,
 )
 from gui.tray_manager import TrayManager
@@ -267,10 +270,12 @@ class TallySyncApp:
             btn = self._make_nav_button(nav_container, item)
             self._nav_buttons[item["page"]] = btn
 
+        # ── bottom section (packs upward via side="bottom") ──────────────────
+        # Pack order determines visual order: first packed = lowest, last = highest
+
+        # 1. Tally status + version — sits at the very bottom
         bottom = tk.Frame(f, bg=Color.BG_SIDEBAR)
         bottom.pack(side="bottom", fill="x", padx=Spacing.MD, pady=Spacing.LG)
-
-        tk.Frame(f, bg=Color.SIDEBAR_HOVER_BG, height=1).pack(side="bottom", fill="x")
 
         self._tally_status_lbl = tk.Label(
             bottom,
@@ -290,6 +295,26 @@ class TallySyncApp:
             fg=Color.SIDEBAR_TEXT_MUTED,
             anchor="w",
         ).pack(fill="x")
+
+        # 2. Separator line — above the bottom section
+        tk.Frame(f, bg=Color.SIDEBAR_HOVER_BG, height=1).pack(side="bottom", fill="x")
+
+        # 3. Check for Updates button — above the separator
+        self._update_btn = tk.Label(
+            f,
+            text="↑ Check for Updates",
+            font=Font.BODY_SM,
+            bg=Color.BG_SIDEBAR,
+            fg=Color.SIDEBAR_TEXT_MUTED,
+            anchor="w",
+            cursor="hand2",
+            padx=Spacing.MD,
+            pady=Spacing.SM,
+        )
+        self._update_btn.pack(side="bottom", fill="x")
+        self._update_btn.bind("<Button-1>", lambda e: self._check_for_updates())
+        self._update_btn.bind("<Enter>", lambda e: self._update_btn.configure(fg=Color.SIDEBAR_TEXT))
+        self._update_btn.bind("<Leave>", lambda e: self._update_btn.configure(fg=Color.SIDEBAR_TEXT_MUTED))
 
     def _make_nav_button(self, parent, item: dict) -> tk.Frame:
         container = tk.Frame(parent, bg=Color.BG_SIDEBAR, cursor="hand2")
@@ -1334,6 +1359,152 @@ class TallySyncApp:
     # ─────────────────────────────────────────────────────────────────────────
     #  Shutdown — ✖ button now hides to tray instead of closing
     # ─────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    #  Update checker
+    # ─────────────────────────────────────────────────────────────────────
+    def _check_for_updates(self):
+        """Check public gist for a newer version and notify the user."""
+        if not GIST_VERSION_URL:
+            messagebox.showinfo(
+                "Not Configured",
+                "Update check is not configured yet.\n(GIST_VERSION_URL is empty in styles.py)",
+                parent=self.root,
+            )
+            return
+
+        self._update_btn.configure(text="Checking...", fg=Color.SIDEBAR_TEXT_MUTED)
+        self._update_btn.unbind("<Button-1>")
+
+        def _fetch():
+            try:
+                resp = requests.get(GIST_VERSION_URL, timeout=8)
+                resp.raise_for_status()
+                data        = resp.json()
+                latest      = data.get("version", "").strip()
+                download_url = data.get("download_url", "")
+                if not latest:
+                    self.root.after(0, lambda: _show_result(None, None, "bad_gist"))
+                    return
+                self.root.after(0, lambda: _show_result(latest, download_url, None))
+            except Exception as exc:
+                err = str(exc)
+                self.root.after(0, lambda: _show_result(None, None, err))
+
+        def _show_result(latest, download_url, error):
+            self._update_btn.configure(text="↑ Check for Updates")
+            self._update_btn.bind("<Button-1>", lambda e: self._check_for_updates())
+
+            if error == "bad_gist":
+                messagebox.showerror(
+                    "Update Check Failed",
+                    "version.json in the gist is missing the 'version' field.",
+                    parent=self.root,
+                )
+                return
+
+            if error:
+                messagebox.showerror(
+                    "Update Check Failed",
+                    f"Could not fetch version info:\n{error}",
+                    parent=self.root,
+                )
+                return
+
+            def _normalize(v):
+                return v.lstrip("v").strip()
+
+            if _normalize(latest) == _normalize(APP_VERSION):
+                messagebox.showinfo(
+                    "Up to Date",
+                    f"You are running the latest version ({APP_VERSION}).",
+                    parent=self.root,
+                )
+            else:
+                answer = messagebox.askyesno(
+                    "Update Available",
+                    f"A new version is available!\n\n"
+                    f"  Current : {APP_VERSION}\n"
+                    f"  Latest  : {latest}\n\n"
+                    f"Open the download page?",
+                    parent=self.root,
+                )
+                if answer:
+                    self._prompt_update_password(download_url)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _prompt_update_password(self, release_url: str):
+        """
+        Show a password dialog before allowing the update download.
+        Password is read from .env (update_pass key) — never stored locally.
+        """
+        if not self._config.get_update_password():
+            messagebox.showwarning(
+                "Not Configured",
+                "Update password is not set.\nAdd 'update_pass' to your .env file.",
+                parent=self.root,
+            )
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Admin Password Required")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.configure(bg=Color.BG_CARD)
+
+        # Center over main window
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width()  // 2) - 175
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 90
+        dialog.geometry(f"350x180+{x}+{y}")
+
+        tk.Label(
+            dialog, text="Enter admin password to proceed:",
+            font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_PRIMARY,
+        ).pack(padx=Spacing.LG, pady=(Spacing.LG, Spacing.SM), anchor="w")
+
+        pwd_var = tk.StringVar()
+        entry = tk.Entry(
+            dialog, textvariable=pwd_var, show="●",
+            font=Font.BODY, bg=Color.BG_INPUT,
+            fg=Color.TEXT_PRIMARY, relief="solid", bd=1,
+        )
+        entry.pack(fill="x", padx=Spacing.LG)
+        entry.focus_set()
+
+        error_lbl = tk.Label(
+            dialog, text="", font=Font.BODY_SM,
+            bg=Color.BG_CARD, fg=Color.DANGER,
+        )
+        error_lbl.pack(padx=Spacing.LG, pady=(Spacing.XS, 0), anchor="w")
+
+        def _attempt():
+            if self._config.verify_update_password(pwd_var.get()):
+                dialog.destroy()
+                webbrowser.open(release_url)
+            else:
+                error_lbl.configure(text="Incorrect password. Try again.")
+                entry.delete(0, "end")
+                entry.focus_set()
+
+        btn_frame = tk.Frame(dialog, bg=Color.BG_CARD)
+        btn_frame.pack(fill="x", padx=Spacing.LG, pady=Spacing.MD)
+
+        tk.Button(
+            btn_frame, text="Confirm", command=_attempt,
+            bg=Color.PRIMARY, fg=Color.TEXT_WHITE,
+            font=Font.BODY, relief="flat", padx=Spacing.MD, cursor="hand2",
+        ).pack(side="right")
+
+        tk.Button(
+            btn_frame, text="Cancel", command=dialog.destroy,
+            bg=Color.BG_ROOT, fg=Color.TEXT_SECONDARY,
+            font=Font.BODY, relief="flat", padx=Spacing.MD, cursor="hand2",
+        ).pack(side="right", padx=(0, Spacing.SM))
+
+        entry.bind("<Return>", lambda e: _attempt())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
     def _on_close(self):
         """
         Called when user clicks ✖ on the main window.

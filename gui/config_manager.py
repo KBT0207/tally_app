@@ -38,6 +38,7 @@ import copy
 import shutil
 import logging
 import base64
+
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -308,6 +309,49 @@ class ConfigManager:
         self._data["app"]["setup_complete"] = False
         self._save()
         logger.info("[ConfigManager] Setup marked as incomplete — wizard will show on next launch")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Update password  (read from .env — never stored in config.json)
+    # ─────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _read_env_file() -> dict:
+        """
+        Manually parse .env without the dotenv library (excluded from PyInstaller).
+        Looks for .env next to the EXE (frozen) or at the project root (dev).
+        """
+        import sys
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+        else:
+            # config_manager.py lives in gui/ — project root is one level up
+            base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        env_path = os.path.join(base, '.env')
+        result = {}
+        if not os.path.exists(env_path):
+            logger.warning(f"[ConfigManager] .env not found at {env_path}")
+            return result
+
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, _, value = line.partition('=')
+                    result[key.strip()] = value.strip().strip("'\"")
+        return result
+
+    def get_update_password(self) -> str:
+        """Returns the update password from .env (key: update_pass), or '' if not set."""
+        return self._read_env_file().get('update_pass', '')
+
+    def verify_update_password(self, password: str) -> bool:
+        """Returns True if the given password matches the update_pass in .env."""
+        stored = self.get_update_password()
+        if not stored:
+            return False
+        return password == stored
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Convenience: reload from disk

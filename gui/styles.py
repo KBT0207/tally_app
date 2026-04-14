@@ -194,4 +194,8 @@ NAV_ITEMS = [
 # ─────────────────────────────────────────────────────────────────────────────
 APP_TITLE   = "Tally Sync Manager"
 APP_VERSION = "v1.0.0"
+# Public gist URL — create a gist at gist.github.com with a file named version.json
+# Format: {"version": "v1.0.1", "download_url": "https://...your-download-link..."}
+# Raw URL pattern: https://gist.githubusercontent.com/KBT0207/<GIST_ID>/raw/version.json
+GIST_VERSION_URL = "https://gist.githubusercontent.com/kbjovo/8104b531192e535de997eaf8c42afa2f/raw/version.json"
 ICON_PATH   = None   # Set to path of .ico file if available

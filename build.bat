@@ -117,6 +117,17 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+REM Step 5: Copy .env to dist folder (needed for update password at runtime)
+echo.
+echo [5/5] Copying .env to dist\TallySyncManager\...
+if exist .env (
+    copy /y .env dist\TallySyncManager\.env > nul
+    echo    .env copied OK
+) else (
+    echo    WARNING: .env not found in project root - update password will not work.
+    echo    Create a .env file with: update_pass=yourpassword
+)
+
 echo.
 echo ============================================
 echo   BUILD SUCCESSFUL!

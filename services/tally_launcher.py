@@ -205,10 +205,10 @@ class TallyLauncher:
         if not found:
             return False, "tally window not found"
 
-        # if not self._select_company(interval=60):
-        #     return False, "select_company not found"
+        if not self._select_company(interval=60):
+            return False, "select_company not found"
 
-        self.wait_for_image("select_company", seconds=self.get_timeout())
+        # self.wait_for_image("select_company", seconds=self.get_timeout())
         
         return True, "launched"
 
@@ -319,7 +319,7 @@ class TallyLauncher:
 
         start = time.time()
         while (time.time() - start) < timeout:
-            if self.wait_for_image("select_company", seconds=2):
+            if self.wait_for_image("select_company", seconds=30):
                 return True
             self.bring_tally_to_front()
             pyautogui.press('enter')
