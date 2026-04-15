@@ -7,6 +7,173 @@ from logging_config import logger
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# GUID & VOUCHER STATUS FILTERING
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Tally returns multiple types of records that should be filtered:
+# 1. Optional Vouchers (ISOPTIONAL=Yes)      → Hidden from reports
+# 2. Deleted Vouchers (ISDELETED=Yes)        → Removed from ledger
+# 3. Cancelled Vouchers (Has 0 amounts)      → Shown in history but not active
+#
+# These filters ensure only ACTIVE, REGULAR vouchers are synced to your database.
+#
+# CRITICAL: Always apply these filters BEFORE inserting/updating:
+#   - Skip if ISOPTIONAL == "Yes"
+#   - Skip if ISDELETED == "Yes" (including empty ISDELETED tags)
+#   - Use GUID for deduplication (GUID never changes, VoucherNumber can)
+#   - Use AlterID for incremental sync (what changed?)
+
+def _is_optional_voucher(voucher_elem) -> bool:
+    """
+    Check if voucher is marked as Optional.
+    Optional vouchers are invisible to normal reports and should be skipped.
+
+    Returns:
+        True  → Skip this voucher (it's hidden)
+        False → Process this voucher (it's regular/visible)
+    """
+    is_optional = voucher_elem.findtext('ISOPTIONAL', 'No').strip()
+    return is_optional.lower() in ('yes', 'true', '1')
+
+
+def _is_deleted_voucher(voucher_elem) -> bool:
+    """
+    Check if voucher is marked as Deleted.
+    Even with filters, Tally sometimes includes deleted records.
+
+    Also checks the ACTION attribute for Delete actions.
+
+    Returns:
+        True  → Skip this voucher (it's deleted)
+        False → Process this voucher (it's active)
+    """
+    is_deleted = voucher_elem.findtext('ISDELETED', 'No').strip()
+    action = voucher_elem.get('ACTION', 'Create').strip()
+
+    return (
+        is_deleted.lower() in ('yes', 'true', '1')
+        or action in ('Delete', 'Deleted', 'Remove')
+    )
+
+
+def _should_skip_voucher(voucher_elem) -> bool:
+    """
+    Master filter: Return True if voucher should be SKIPPED.
+
+    A voucher is skipped if:
+      1. It's marked as Optional (ISOPTIONAL=Yes)
+      2. It's marked as Deleted (ISDELETED=Yes)
+      3. It's a Delete action
+
+    This prevents duplicate/ghost records in your database.
+    """
+    if _is_optional_voucher(voucher_elem):
+        return True
+    if _is_deleted_voucher(voucher_elem):
+        return True
+    return False
+
+
+def get_voucher_guid(voucher_elem) -> str:
+    """
+    Extract GUID from voucher element.
+    GUID is the permanent identifier (never changes, unlike VoucherNumber).
+
+    Returns:
+        str → The GUID if found
+        ''  → Empty string if GUID is missing
+    """
+    guid_elem = voucher_elem.find('GUID')
+    if guid_elem is not None and guid_elem.text:
+        return guid_elem.text.strip()
+    return ''
+
+
+def get_voucher_number(voucher_elem) -> str:
+    """
+    Extract voucher number from voucher element.
+    VoucherNumber can change, but GUID stays the same.
+
+    Returns:
+        str → The voucher number
+        ''  → Empty string if not found
+    """
+    vnum_elem = voucher_elem.find('VOUCHERNUMBER')
+    if vnum_elem is not None and vnum_elem.text:
+        return vnum_elem.text.strip()
+    return ''
+
+
+def get_voucher_alter_id(voucher_elem) -> int:
+    """
+    Extract AlterID from voucher element.
+    AlterID increments on every save → use for change detection.
+
+    Returns:
+        int → The AlterID (0 if missing/invalid)
+    """
+    alter_id_elem = voucher_elem.find('ALTERID')
+    if alter_id_elem is not None and alter_id_elem.text:
+        try:
+            return int(alter_id_elem.text.strip())
+        except ValueError:
+            pass
+    return 0
+
+
+def get_voucher_status_info(voucher_elem) -> dict:
+    """
+    Extract all status fields from a voucher in one call.
+    Useful for logging/debugging what's happening.
+
+    Returns:
+        dict with keys:
+          - guid: str
+          - voucher_number: str
+          - alter_id: int
+          - is_optional: bool
+          - is_deleted: bool
+          - action: str
+          - should_skip: bool
+    """
+    return {
+        'guid':           get_voucher_guid(voucher_elem),
+        'voucher_number': get_voucher_number(voucher_elem),
+        'alter_id':       get_voucher_alter_id(voucher_elem),
+        'is_optional':    _is_optional_voucher(voucher_elem),
+        'is_deleted':     _is_deleted_voucher(voucher_elem),
+        'action':         voucher_elem.get('ACTION', 'Create').strip(),
+        'should_skip':    _should_skip_voucher(voucher_elem),
+    }
+
+
+def detect_deleted_guids(local_guids: set, tally_guids: set) -> set:
+    """
+    Compare local database GUIDs against Tally's current GUIDs.
+    Any GUID in local_guids but NOT in tally_guids has been deleted.
+
+    Args:
+        local_guids: set of GUIDs currently in your database
+        tally_guids: set of GUIDs returned from Tally (active only)
+
+    Returns:
+        set of deleted GUIDs to be removed from database
+
+    Example:
+        local_guids = {'guid-1', 'guid-2', 'guid-3'}
+        tally_guids = {'guid-1', 'guid-2'}
+        deleted = detect_deleted_guids(local_guids, tally_guids)
+        # deleted = {'guid-3'}
+    """
+    deleted = local_guids - tally_guids
+    if deleted:
+        logger.info(f"Deletion detection: {len(deleted)} GUIDs not found in Tally")
+        for guid in deleted:
+            logger.debug(f"  Deleted GUID: {guid}")
+    return deleted
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Sign transformation rules
 # ──────────────────────────────────────────────────────────────────────────────
 #
@@ -628,8 +795,21 @@ def parse_ledger_voucher(
             return []
 
         all_rows = []
+        skipped_optional = 0
 
         for voucher in vouchers:
+            # Skip Optional vouchers (ISOPTIONAL=Yes) — hidden duplicates.
+            # CDC-deleted vouchers (ISDELETED=Yes) are NOT skipped here;
+            # the stub logic below propagates the delete to the DB.
+            if _is_optional_voucher(voucher):
+                skipped_optional += 1
+                logger.debug(
+                    f"[{voucher_type_name}] Skipping OPTIONAL voucher: "
+                    f"{voucher.findtext('VOUCHERNUMBER', '')} "
+                    f"(GUID: {voucher.findtext('GUID', '')})"
+                )
+                continue
+
             guid           = voucher.findtext('GUID', '')
             alter_id       = voucher.findtext('ALTERID', '0')
             master_id      = voucher.findtext('MASTERID', '')
@@ -798,8 +978,21 @@ def parse_inventory_voucher(
             return []
 
         all_rows = []
+        skipped_optional = 0
 
         for voucher in vouchers:
+            # Skip Optional vouchers (ISOPTIONAL=Yes) — hidden duplicates.
+            # CDC-deleted vouchers (ISDELETED=Yes) are NOT skipped here;
+            # the stub logic below propagates the delete to the DB.
+            if _is_optional_voucher(voucher):
+                skipped_optional += 1
+                logger.debug(
+                    f"[{voucher_type_name}] Skipping OPTIONAL voucher: "
+                    f"{voucher.findtext('VOUCHERNUMBER', '')} "
+                    f"(GUID: {voucher.findtext('GUID', '')})"
+                )
+                continue
+
             guid           = voucher.findtext('GUID', '')
             alter_id       = voucher.findtext('ALTERID', '0')
             master_id      = voucher.findtext('MASTERID', '')
@@ -1603,12 +1796,97 @@ def parse_outstanding(xml_content, company_name: str, material_centre: str = '',
 # GUID reconciliation parser  (Phase 3)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def parse_guids_with_status(xml_content) -> "dict | None":
+    """
+    Parse GUID XML response from Tally with full status information.
+
+    Filters out OPTIONAL and DELETED vouchers automatically.
+
+    Returns:
+        dict[str, dict] on success:
+            {
+                guid: {
+                    'voucher_number': str,
+                    'alter_id': int,
+                    'is_optional': bool,
+                    'is_deleted': bool,
+                    'should_skip': bool,
+                }
+            }
+
+        None on ANY parse failure
+
+    CRITICAL CONTRACT for callers:
+        None       → Tally fetch or parse FAILED → DO NOT delete/update anything
+        {}  (empty)→ Tally confirmed 0 active vouchers → safe to delete DB rows
+    """
+    try:
+        if not xml_content:
+            logger.warning("parse_guids_with_status: received empty/None xml_content")
+            return None
+
+        xml_str = sanitize_xml_content(xml_content)
+        if not xml_str or not xml_str.strip():
+            logger.warning("parse_guids_with_status: empty XML after sanitization")
+            return None
+
+        root = ET.fromstring(xml_str.encode('utf-8'))
+        result = {}
+        skipped_optional = 0
+        skipped_deleted  = 0
+
+        for voucher in root.iter('VOUCHER'):
+            guid = get_voucher_guid(voucher)
+            if not guid:
+                continue
+
+            status = get_voucher_status_info(voucher)
+
+            if status['should_skip']:
+                if status['is_optional']:
+                    skipped_optional += 1
+                    logger.debug(
+                        f"Skipping optional voucher: {status['voucher_number']} "
+                        f"(GUID: {guid})"
+                    )
+                elif status['is_deleted']:
+                    skipped_deleted += 1
+                    logger.debug(
+                        f"Skipping deleted voucher: {status['voucher_number']} "
+                        f"(GUID: {guid})"
+                    )
+                continue
+
+            result[guid] = {
+                'voucher_number': status['voucher_number'],
+                'alter_id':       status['alter_id'],
+                'is_optional':    status['is_optional'],
+                'is_deleted':     status['is_deleted'],
+            }
+
+        logger.info(
+            f"parse_guids_with_status: parsed {len(result)} active GUIDs "
+            f"(skipped {skipped_optional} optional, {skipped_deleted} deleted)"
+        )
+        return result
+
+    except ET.ParseError as e:
+        logger.error(f"parse_guids_with_status: XML parse error — {e}")
+        return None
+    except Exception as e:
+        logger.error(f"parse_guids_with_status: unexpected error — {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
 def parse_guids(xml_content) -> "dict | None":
     """
     Parse a GUID XML response from Tally (utils/guid/*.xml templates).
 
+    Filters out OPTIONAL and DELETED vouchers before returning.
+
     Returns:
-        dict[str, str]  — {guid: voucher_number} on success.
+        dict[str, str]  — {guid: voucher_number} on success (active vouchers only).
                           voucher_number is '' if the template doesn't fetch it
                           (inventory GUID templates don't include VOUCHERNUMBER).
         None            — on ANY parse failure (network error, bad XML, empty content)
@@ -1618,44 +1896,17 @@ def parse_guids(xml_content) -> "dict | None":
         {}  (empty)→ Tally confirmed 0 vouchers in window → safe to delete DB rows
 
     WHY dict instead of set:
-        Ledger voucher GUID templates (receipt/payment/journal/contra) now also
+        Ledger voucher GUID templates (receipt/payment/journal/contra) also
         fetch VOUCHERNUMBER.  This lets Phase 3 detect not only deleted vouchers
         but also vouchers whose number changed (renumber) that CDC missed — e.g.
         because the app was offline when the deletion/renumber happened.
     """
-    try:
-        if not xml_content:
-            logger.warning("parse_guids: received empty/None xml_content")
-            return None
-
-        xml_str = sanitize_xml_content(xml_content)
-        if not xml_str or not xml_str.strip():
-            logger.warning("parse_guids: empty XML after sanitization")
-            return None
-
-        root = ET.fromstring(xml_str.encode('utf-8'))
-
-        result = {}
-        for voucher in root.iter('VOUCHER'):
-            guid_el  = voucher.find('GUID')
-            vnum_el  = voucher.find('VOUCHERNUMBER')
-            if guid_el is not None and guid_el.text and guid_el.text.strip():
-                guid = guid_el.text.strip()
-                vnum = (vnum_el.text or '').strip() if vnum_el is not None else ''
-                result[guid] = vnum
-
-        if not result:
-            for e in root.iter('GUID'):
-                if e.text and e.text.strip():
-                    result[e.text.strip()] = ''
-
-        logger.info(f"parse_guids: parsed {len(result)} GUIDs from Tally response")
-        return result
-
-    except ET.ParseError as e:
-        logger.error(f"parse_guids: XML parse error — {e}")
+    result_with_status = parse_guids_with_status(xml_content)
+    if result_with_status is None:
         return None
-    except Exception as e:
-        logger.error(f"parse_guids: unexpected error — {e}")
-        logger.error(traceback.format_exc())
-        return None
+
+    # Convert to simple dict[guid] = voucher_number (legacy compatibility)
+    return {
+        guid: info['voucher_number']
+        for guid, info in result_with_status.items()
+    }

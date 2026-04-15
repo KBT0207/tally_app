@@ -7,22 +7,15 @@
     </HEADER>
     <BODY>
         <DESC>
-            <STATICVARIABLES>
-                <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-                <SVCURRENTCOMPANY></SVCURRENTCOMPANY>
-                <SVFROMDATE TYPE="Date"></SVFROMDATE>
-                <SVTODATE TYPE="Date"></SVTODATE>
-            </STATICVARIABLES>
             <TDL>
                 <TDLMESSAGE>
                     <COLLECTION NAME="PurchaseVoucherGUIDs">
                         <TYPE>Voucher</TYPE>
-                        <CHILDOF>$$VchTypePurchase</CHILDOF>
-                        <FETCH>GUID</FETCH>
-                        <FETCH>VOUCHERKEY</FETCH>
-                        <FETCH>DATE</FETCH>
-                        <FETCH>VOUCHERNUMBER</FETCH>
+                        <FILTER>IsPurchaseCategory, IsNotOptional</FILTER>
+                        <FETCH>GUID, VOUCHERKEY, DATE, VOUCHERNUMBER, VOUCHERTYPENAME</FETCH>
                     </COLLECTION>
+                    <SYSTEM TYPE="Formulae" NAME="IsPurchaseCategory">$$IsPurchase:$VoucherTypeName</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="IsNotOptional">NOT $IsOptional</SYSTEM>
                 </TDLMESSAGE>
             </TDL>
         </DESC>

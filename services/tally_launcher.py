@@ -114,7 +114,7 @@ class TallyLauncher:
 
             pyautogui.hotkey('alt', 'f2')
             
-            if not self.wait_for_image("change_period"):
+            if not self.wait_for_image("change_period",seconds=self.get_timeout()):
                 return False, "Change Period dialog did not appear"
 
             raw_start = getattr(company, 'starting_from', None)
@@ -205,10 +205,10 @@ class TallyLauncher:
         if not found:
             return False, "tally window not found"
 
-        if not self._select_company(interval=60):
-            return False, "select_company not found"
+        # if not self._select_company(interval=60):
+        #     return False, "select_company not found"
 
-        # self.wait_for_image("select_company", seconds=self.get_timeout())
+        self.wait_for_image("select_company", seconds=self.get_timeout())
         
         return True, "launched"
 

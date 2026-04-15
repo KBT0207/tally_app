@@ -27,7 +27,7 @@ class AutomationSettings(Base):
     click_delay_ms    = Column(Integer, default=500)
 
     # Seconds to wait for an image to appear before giving up
-    wait_timeout_sec  = Column(Integer, default=30)
+    wait_timeout_sec  = Column(Integer, default=180)
 
     # ── Retry controls ────────────────────────────────────────────────────────
     # How many times to retry a failed image search before marking error

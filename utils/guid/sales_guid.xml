@@ -10,19 +10,23 @@
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
                 <SVCURRENTCOMPANY></SVCURRENTCOMPANY>
-                <SVFROMDATE TYPE="Date"></SVFROMDATE>
-                <SVTODATE TYPE="Date"></SVTODATE>
             </STATICVARIABLES>
             <TDL>
                 <TDLMESSAGE>
                     <COLLECTION NAME="SalesVoucherGUIDs">
                         <TYPE>Voucher</TYPE>
-                        <CHILDOF>$$VchTypeSales</CHILDOF>
+                        <FILTER>IsSalesCategory</FILTER>
+                        <FILTER>IsNotOptional</FILTER>
+                        
                         <FETCH>GUID</FETCH>
                         <FETCH>VOUCHERKEY</FETCH>
                         <FETCH>DATE</FETCH>
                         <FETCH>VOUCHERNUMBER</FETCH>
+                        <FETCH>VOUCHERTYPENAME</FETCH>
                     </COLLECTION>
+
+                    <SYSTEM TYPE="Formulae" NAME="IsSalesCategory">$$IsSales:$VoucherTypeName</SYSTEM>
+                    <SYSTEM TYPE="Formulae" NAME="IsNotOptional">NOT $IsOptional</SYSTEM>
                 </TDLMESSAGE>
             </TDL>
         </DESC>
