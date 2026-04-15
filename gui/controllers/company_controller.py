@@ -95,66 +95,82 @@ class CompanyController:
     #  Save all companies  state → DB
     # ─────────────────────────────────────────────────────────────────────────
     def save_scheduler_config(self):
-        """Upsert scheduler config for every company in state."""
+        """Upsert scheduler config for every company in state (single session)."""
         engine = self._state.db_engine
         if not engine:
             logger.warning("[CompanyController] No DB engine — cannot save scheduler config")
             return
 
-        for name, co in self._state.companies.items():
-            self._upsert(engine, name, co)
-
-        logger.info(f"[CompanyController] Saved scheduler config for "
-                    f"{len(self._state.companies)} companies")
+        Model   = _get_model()
+        Session = sessionmaker(bind=engine)
+        db      = Session()
+        try:
+            for name, co in self._state.companies.items():
+                self._upsert_in_session(db, Model, name, co)
+            db.commit()
+            logger.info(f"[CompanyController] Saved scheduler config for "
+                        f"{len(self._state.companies)} companies")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"[CompanyController] Failed to save scheduler config: {e}")
+        finally:
+            db.close()
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Internal upsert helper
     # ─────────────────────────────────────────────────────────────────────────
     def _upsert(self, engine, name: str, co: CompanyState):
         """
-        Upsert company scheduler config into DB.
-        Saves last_sync_time so it persists across app restarts and
-        is visible on the scheduler page even when Tally is closed.
+        Upsert company scheduler config into DB (single-row, own session).
+        Used by save_one(). For bulk saves use save_scheduler_config() instead.
         """
         Model   = _get_model()
         Session = sessionmaker(bind=engine)
         db      = Session()
         try:
-            # Build values dict — only include last_sync_time if it exists
-            values = dict(
-                company_name = name,
-                enabled      = co.schedule_enabled,
-                interval     = co.schedule_interval,
-                value        = co.schedule_value,
-                time         = co.schedule_time,
-                updated_at   = datetime.utcnow(),
-            )
-            update_vals = dict(
-                enabled    = co.schedule_enabled,
-                interval   = co.schedule_interval,
-                value      = co.schedule_value,
-                time       = co.schedule_time,
-                updated_at = datetime.utcnow(),
-            )
-
-            # Include last_sync_time if available on this CompanyState
-            last_sync = getattr(co, 'last_sync_time', None)
-            if last_sync:
-                values['last_sync_time']     = last_sync
-                update_vals['last_sync_time'] = last_sync
-
-            stmt = (
-                mysql_insert(Model)
-                .values(**values)
-                .on_duplicate_key_update(**update_vals)
-            )
-            db.execute(stmt)
+            self._upsert_in_session(db, Model, name, co)
             db.commit()
         except Exception as e:
             db.rollback()
             logger.error(f"[CompanyController] Failed to save config for {name}: {e}")
         finally:
             db.close()
+
+    @staticmethod
+    def _upsert_in_session(db, Model, name: str, co: CompanyState):
+        """
+        Execute a single upsert inside an already-open session (no commit/close).
+        Caller is responsible for commit and session lifecycle.
+        """
+        now = datetime.utcnow()
+        values = dict(
+            company_name = name,
+            enabled      = co.schedule_enabled,
+            interval     = co.schedule_interval,
+            value        = co.schedule_value,
+            time         = co.schedule_time,
+            updated_at   = now,
+        )
+        update_vals = dict(
+            enabled    = co.schedule_enabled,
+            interval   = co.schedule_interval,
+            value      = co.schedule_value,
+            time       = co.schedule_time,
+            updated_at = now,
+        )
+
+        # Include last_sync_time if available on this CompanyState
+        last_sync = getattr(co, 'last_sync_time', None)
+        if last_sync:
+            values['last_sync_time']      = last_sync
+            update_vals['last_sync_time'] = last_sync
+
+        stmt = (
+            mysql_insert(Model)
+            .values(**values)
+            .on_duplicate_key_update(**update_vals)
+        )
+        db.execute(stmt)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Phase 2 fix: next run time — reads from live APScheduler job

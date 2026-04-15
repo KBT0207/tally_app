@@ -680,8 +680,9 @@ class SyncPage(tk.Frame):
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>",
             lambda e: canvas.itemconfig(cw, width=e.width))
-        canvas.bind_all("<MouseWheel>",
-            lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
+        self._opt_canvas = canvas
+        canvas.bind("<Enter>", self._on_opt_canvas_enter)
+        canvas.bind("<Leave>", self._on_opt_canvas_leave)
 
         self._build_page_header(self._inner)
         self._build_step1(self._inner)
@@ -1008,6 +1009,9 @@ class SyncPage(tk.Frame):
 
         selected = self.state.selected_companies
         is_snap  = (self._mode_var.get() == SyncMode.SNAPSHOT)
+
+        # Keep on_show() guard in sync — record what we built for
+        self._last_built_selection = list(selected)
 
         if not selected:
             ef = tk.Frame(self._tbl, bg=Color.BG_CARD, pady=Spacing.XL)
@@ -1434,12 +1438,40 @@ class SyncPage(tk.Frame):
                             padx=Spacing.XL, pady=Spacing.LG, sticky="e")
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
+    def _on_opt_canvas_enter(self, e):
+        self._opt_canvas.bind_all("<MouseWheel>",
+            lambda ev: self._opt_canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"))
+        self._opt_canvas.bind_all("<Button-4>",
+            lambda ev: self._opt_canvas.yview_scroll(-1, "units"))
+        self._opt_canvas.bind_all("<Button-5>",
+            lambda ev: self._opt_canvas.yview_scroll(1, "units"))
+
+    def _on_opt_canvas_leave(self, e):
+        self._opt_canvas.unbind_all("<MouseWheel>")
+        self._opt_canvas.unbind_all("<Button-4>")
+        self._opt_canvas.unbind_all("<Button-5>")
+
+    def on_hide(self):
+        """Unbind mousewheel so scroll events don't leak to other pages."""
+        try:
+            self._opt_canvas.unbind_all("<MouseWheel>")
+            self._opt_canvas.unbind_all("<Button-4>")
+            self._opt_canvas.unbind_all("<Button-5>")
+        except Exception:
+            pass
+
     def on_show(self):
         if self.state.sync_active:
             self._show_progress()
             return
         if hasattr(self.state, "sync_mode") and self.state.sync_mode:
             self._mode_var.set(self.state.sync_mode)
-        self._rebuild_table()
+
+        # Only rebuild the company table when the selection has actually changed.
+        # Previously this rebuilt hundreds of widgets on every page visit, freezing
+        # the GUI for 1–3 seconds with large company lists.
+        if getattr(self, '_last_built_selection', None) != list(self.state.selected_companies):
+            self._rebuild_table()   # _rebuild_table() updates _last_built_selection itself
+
         self._set_mode(self._mode_var.get(), init=True)
         self._show_options()

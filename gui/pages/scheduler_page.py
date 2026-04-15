@@ -27,6 +27,7 @@ from typing import Optional
 
 from gui.state  import AppState, CompanyState, CompanyStatus
 from gui.styles import Color, Font, Spacing
+from gui.controllers.company_controller import CompanyController
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +69,11 @@ class ScheduleRow(tk.Frame):
         self._on_run_now = on_run_now
         self._page_app   = app            # used by _meta_text for round-aware label
         self._editing    = False
+
+        # Cached APScheduler next_run_time — refreshed every 30s by the slow
+        # schedule-data ticker, not on every 1-second countdown tick.
+        # This prevents 11× get_job() MySQL calls per company per second.
+        self._cached_next_run: Optional[datetime] = None
 
         # Multiple-time UI state
         self._time_entry_vars:  list  = []   # list of tk.StringVar (one per time row)
@@ -156,13 +162,14 @@ class ScheduleRow(tk.Frame):
         )
         self._meta_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
-        # ── Edit form (hidden initially) ──────────────────
+        # ── Edit form (built lazily on first click to avoid creating ~15
+        # hidden widgets per row at render time for 23 companies) ─────────
         self._edit_frame = tk.Frame(
             self, bg=Color.PRIMARY_LIGHT,
             padx=Spacing.LG, pady=Spacing.MD,
             highlightthickness=1, highlightbackground=Color.BORDER,
         )
-        self._build_edit_form()
+        self._edit_form_built = False
 
     # ─────────────────────────────────────────────────────────────────────────
     def _build_edit_form(self):
@@ -330,6 +337,9 @@ class ScheduleRow(tk.Frame):
     def _toggle_edit(self):
         self._editing = not self._editing
         if self._editing:
+            if not self._edit_form_built:
+                self._build_edit_form()
+                self._edit_form_built = True
             self._edit_frame.grid(row=1, column=0, sticky="ew")
             self._edit_btn.configure(text="▲ Close")
         else:
@@ -495,13 +505,25 @@ class ScheduleRow(tk.Frame):
     # ─────────────────────────────────────────────────────────────────────────
     def refresh_next_run(self):
         """
-        Full UI refresh from the live CompanyState object.
-        Safe to call any time — reads through the `company` property so it
-        always gets the current object even after a state.companies rebuild.
+        Cheap UI refresh — redraws label from _cached_next_run (no DB calls).
+        Safe to call every second from the countdown ticker.
         """
         co = self.company
         self._update_meta()
         self._toggle_enable_ui(co.schedule_enabled)
+
+    def refresh_schedule_data(self):
+        """
+        Expensive refresh — calls APScheduler get_next_run() (may hit MySQL).
+        Called by the slow 30-second data ticker, NOT by the 1-second countdown.
+        Updates _cached_next_run so refresh_next_run() has fresh data to display.
+        """
+        if self._sched_ctrl:
+            self._cached_next_run = self._sched_ctrl.get_next_run(self._name)
+        else:
+            self._cached_next_run = None
+        self._update_meta()
+        self._toggle_enable_ui(self.company.schedule_enabled)
 
     # Alias for clarity when called from SchedulerPage.refresh_companies()
     refresh_from_state = refresh_next_run
@@ -560,24 +582,30 @@ class ScheduleRow(tk.Frame):
                 times_str = ", ".join(times) if times else co.schedule_time
                 parts.append(f"Daily at {times_str}")
 
-            # Get sync_queue_controller for round-aware status display
+            # ── Round-aware status (in-memory only, no DB) ───────────────────
             sync_q = getattr(self._page_app, '_sync_queue_controller', None) \
                      if hasattr(self, '_page_app') else None
 
-            # ── Round-aware next run label ────────────────────────────────
-            from gui.controllers.company_controller import CompanyController
-            round_label = CompanyController.next_run_label(
-                co,
-                scheduler_controller  = self._sched_ctrl,
-                sync_queue_controller = sync_q,
-            )
+            appended_status = False
+            if sync_q is not None:
+                try:
+                    if co.name == sync_q.current_company:
+                        parts.append("⟳ Syncing now...")
+                        appended_status = True
+                    elif co.name in sync_q.queued_companies:
+                        pos = list(sync_q.queued_companies).index(co.name) + 1
+                        parts.append(f"⏳ Queued — position {pos}")
+                        appended_status = True
+                    elif sync_q.round_active and co.name in sync_q.round_companies:
+                        parts.append("✓ Synced this round")
+                        appended_status = True
+                except Exception:
+                    pass
 
-            live_statuses = ("⟳ Syncing now...", "⏳ Queued", "✓ Synced this round")
-            if any(round_label.startswith(s) for s in live_statuses):
-                parts.append(round_label)
-            elif self._sched_ctrl:
-                nrt = self._sched_ctrl.get_next_run(co.name)
-                if nrt:
+            # ── Next run from cache (refreshed every 30s, no DB per tick) ────
+            if not appended_status:
+                nrt = self._cached_next_run
+                if nrt is not None:
                     try:
                         nrt_local = nrt.astimezone().replace(tzinfo=None)
                     except Exception:
@@ -588,11 +616,9 @@ class ScheduleRow(tk.Frame):
                         f"  ({countdown})"
                     )
                 else:
-                    parts.append(f"Next run: {round_label}")
-            else:
-                est = CompanyController._estimate_next_run(co)
-                if est != "—":
-                    parts.append(f"Next run: ~{est} (est.)")
+                    est = CompanyController._estimate_next_run(co)
+                    if est != "—":
+                        parts.append(f"Next run: ~{est} (est.)")
         else:
             parts.append("No schedule configured")
 
@@ -724,24 +750,22 @@ class SchedulerPage(tk.Frame):
             row=0, column=0, columnspan=2, sticky="sew",
         )
 
-        canvas = tk.Canvas(container, bg=Color.BG_CARD, highlightthickness=0, bd=0)
-        canvas.grid(row=1, column=0, sticky="nsew")
-        vsb = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        self._canvas = tk.Canvas(container, bg=Color.BG_CARD, highlightthickness=0, bd=0)
+        self._canvas.grid(row=1, column=0, sticky="nsew")
+        vsb = tk.Scrollbar(container, orient="vertical", command=self._canvas.yview)
         vsb.grid(row=1, column=1, sticky="ns")
-        canvas.configure(yscrollcommand=vsb.set)
+        self._canvas.configure(yscrollcommand=vsb.set)
 
-        self._list_frame = tk.Frame(canvas, bg=Color.BG_CARD)
+        self._list_frame = tk.Frame(self._canvas, bg=Color.BG_CARD)
         self._list_frame.columnconfigure(0, weight=1)
-        cw = canvas.create_window((0, 0), window=self._list_frame, anchor="nw")
+        cw = self._canvas.create_window((0, 0), window=self._list_frame, anchor="nw")
         self._list_frame.bind(
             "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all"))
         )
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(cw, width=e.width))
-        canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        )
+        self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfig(cw, width=e.width))
+        self._canvas.bind("<Enter>", self._on_canvas_enter)
+        self._canvas.bind("<Leave>", self._on_canvas_leave)
 
         # ── No scheduler warning ──────────────────────────
         self._no_sched_lbl = tk.Label(
@@ -827,19 +851,16 @@ class SchedulerPage(tk.Frame):
         """
         Called by app.py whenever companies are reloaded (startup or Refresh).
         Rebuilds the row list so new CompanyState objects are picked up.
-        Also re-syncs APScheduler jobs for any enabled schedules.
         Must be called on the main (GUI) thread.
+
+        Note: job registration is intentionally NOT done here. On startup
+        _sync_all_jobs() handles it; on manual save/enable, add_or_update_job()
+        is called directly from ScheduleRow. Doing it here too caused every
+        company's job to be registered twice (concurrent with _sync_all_jobs),
+        adding ~7 seconds of MySQL writes to startup.
         """
         self._render_rows()
         self._update_scheduler_status()
-
-        if self._sched_ctrl and self._sched_ctrl.is_running():
-            for name, co in self.state.companies.items():
-                if co.schedule_enabled and co.status != CompanyStatus.NOT_CONFIGURED:
-                    try:
-                        self._sched_ctrl.add_or_update_job(name)
-                    except Exception:
-                        pass
 
     def _disable_all(self):
         if not messagebox.askyesno(
@@ -1114,22 +1135,80 @@ class SchedulerPage(tk.Frame):
     #  Live next-run ticker
     # ─────────────────────────────────────────────────────────────────────────
     def _start_next_run_ticker(self):
-        """Ticks every 1 second to keep the countdown live."""
-        if getattr(self, "_ticker_active", False):
-            return
-        self._ticker_active = True
-        self._tick_next_runs()
+        """
+        Two-tier ticker to keep countdown live without hammering the DB.
+
+        Fast ticker (5s)  — calls row.refresh_next_run()    → pure string
+                            formatting from _cached_next_run, zero DB calls.
+        Slow ticker (30s) — calls row.refresh_schedule_data() → one
+                            get_next_run() per row (up to 11 get_job() calls
+                            per company, may hit MySQL). Refreshes the cache
+                            so the fast ticker always has a fresh value.
+
+        Both tickers are stopped by on_hide() when the user leaves this page
+        so they produce zero load while other pages are visible.
+        """
+        if not getattr(self, "_ticker_active", False):
+            self._ticker_active = True
+            # Prime the cache immediately on first show so rows have data
+            self._tick_schedule_data(prime=True)
+            self._tick_next_runs()
+
+        if not getattr(self, "_data_ticker_active", False):
+            self._data_ticker_active = True
+            # First slow tick is handled by prime=True above; schedule next one
+            self.after(30_000, self._tick_schedule_data)
 
     def _tick_next_runs(self):
-        """Refresh all row meta labels every second for live countdown."""
-        if not self._ticker_active:
+        """Fast tick — redraws countdown text from cache. No DB calls."""
+        if not getattr(self, "_ticker_active", False):
             return
         for row in self._rows.values():
             try:
                 row.refresh_next_run()
             except Exception:
                 pass
-        self.after(1_000, self._tick_next_runs)
+        self.after(5_000, self._tick_next_runs)
+
+    def _tick_schedule_data(self, prime: bool = False):
+        """
+        Slow tick — fetches next_run from APScheduler for every row and
+        updates the cache. Runs the DB fetch in a background thread so the
+        GUI never blocks.
+
+        Uses get_all_next_runs() (one get_jobs() call) instead of the old
+        per-row get_next_run() which made 11 MySQL queries per company —
+        253 blocking queries on the GUI thread for 23 companies.
+        """
+        if not prime and not getattr(self, "_data_ticker_active", False):
+            return
+
+        sched_ctrl = self._sched_ctrl
+        rows_snapshot = dict(self._rows)   # snapshot so the thread doesn't race
+
+        def _fetch():
+            if sched_ctrl is None:
+                return
+            try:
+                all_next_runs = sched_ctrl.get_all_next_runs()
+            except Exception:
+                all_next_runs = {}
+
+            def _apply():
+                for name, row in rows_snapshot.items():
+                    try:
+                        row._cached_next_run = all_next_runs.get(name)
+                        row.refresh_next_run()
+                    except Exception:
+                        pass
+
+            self.after(0, _apply)
+
+        import threading as _t
+        _t.Thread(target=_fetch, daemon=True).start()
+
+        if not prime:
+            self.after(30_000, self._tick_schedule_data)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Lifecycle
@@ -1158,3 +1237,33 @@ class SchedulerPage(tk.Frame):
 
         self._start_next_run_ticker()
         self._start_status_ticker()
+
+    def _on_canvas_enter(self, e):
+        self._canvas.bind_all("<MouseWheel>",
+            lambda ev: self._canvas.yview_scroll(int(-1 * (ev.delta / 120)), "units"))
+        self._canvas.bind_all("<Button-4>",
+            lambda ev: self._canvas.yview_scroll(-1, "units"))
+        self._canvas.bind_all("<Button-5>",
+            lambda ev: self._canvas.yview_scroll(1, "units"))
+
+    def _on_canvas_leave(self, e):
+        self._canvas.unbind_all("<MouseWheel>")
+        self._canvas.unbind_all("<Button-4>")
+        self._canvas.unbind_all("<Button-5>")
+
+    def on_hide(self):
+        """
+        Called by app.py when the user navigates away from this page.
+        Stops both tickers so they produce zero load while the page is hidden.
+        They restart automatically on the next on_show() call.
+        """
+        self._ticker_active        = False
+        self._data_ticker_active   = False
+        self._status_ticker_active = False
+        # Unbind mousewheel so it doesn't leak to other pages
+        try:
+            self._canvas.unbind_all("<MouseWheel>")
+            self._canvas.unbind_all("<Button-4>")
+            self._canvas.unbind_all("<Button-5>")
+        except Exception:
+            pass

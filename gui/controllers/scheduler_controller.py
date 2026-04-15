@@ -250,7 +250,20 @@ class SchedulerController:
             self._scheduler.start()
             logger.info("[Scheduler] APScheduler started")
 
-            self._sync_all_jobs()
+            # Clear any jobs persisted from the previous session so _sync_all_jobs()
+            # registers each job exactly once with the correct startup-delay logic.
+            # (SQLAlchemyJobStore auto-loads persisted jobs on start() — without this
+            # every job would be added twice: once by the store, once by _sync_all_jobs.)
+            try:
+                self._scheduler.remove_all_jobs()
+                logger.debug("[Scheduler] Cleared persisted jobs from store ✓")
+            except Exception as _e:
+                logger.warning(f"[Scheduler] Could not clear persisted jobs: {_e}")
+
+            # Register jobs in a background thread so start() returns immediately.
+            # This prevents the ~150ms-per-company MySQL writes from blocking the
+            # GUI's "scheduler_ready" event and making the scheduler page load slowly.
+            threading.Thread(target=self._sync_all_jobs, daemon=True).start()
 
         except Exception as e:
             logger.error(f"[Scheduler] Failed to start: {e}")
@@ -439,6 +452,32 @@ class SchedulerController:
         except Exception:
             return None
 
+    def get_all_next_runs(self) -> dict:
+        """
+        Return {company_name: next_run_time} for every registered job in ONE
+        get_jobs() call instead of 11 get_job() calls per company.
+
+        Replaces the old pattern of calling get_next_run() per-company from the
+        GUI thread which did 23 × 11 = 253 individual MySQL round-trips each
+        time the scheduler page opened, freezing the app for 30s+.
+        """
+        if not self._scheduler:
+            return {}
+        try:
+            result: dict = {}
+            for job in self._scheduler.get_jobs():
+                if not job.id.startswith("sync_"):
+                    continue
+                company_name = (job.kwargs or {}).get("company_name")
+                if not company_name or not job.next_run_time:
+                    continue
+                existing = result.get(company_name)
+                if existing is None or job.next_run_time < existing:
+                    result[company_name] = job.next_run_time
+            return result
+        except Exception:
+            return {}
+
     def get_all_jobs(self) -> list:
         if not self._scheduler:
             return []
@@ -551,6 +590,14 @@ class SchedulerController:
         except Exception as e:
             logger.error(f"[Scheduler] Failed to load scheduler config from DB: {e}")
 
+        # Pause APScheduler during bulk registration so it doesn't wake up and
+        # log "Looking for jobs to run" / "Next wakeup is due at..." after each
+        # add_job() call. Resume once all jobs are registered.
+        try:
+            self._scheduler.pause()
+        except Exception:
+            pass
+
         # ── Group enabled companies by their interval key ─────────────────────
         # interval key = (interval_type, value)  e.g. ("hourly", 1) or ("minutes", 5)
         # Daily jobs are excluded from stagger — handled by CronTrigger directly.
@@ -602,6 +649,12 @@ class SchedulerController:
             f"Stagger: {self.STAGGER_SECONDS}s between companies "
             f"sharing the same interval."
         )
+
+        # Resume APScheduler now that all jobs are registered.
+        try:
+            self._scheduler.resume()
+        except Exception:
+            pass
 
     # Delay before first job fires after app opens — gives app time to fully load
     STARTUP_DELAY_SECONDS = 30

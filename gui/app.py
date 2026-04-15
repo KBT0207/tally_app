@@ -703,14 +703,21 @@ class TallySyncApp:
         from sqlalchemy.orm import sessionmaker
         from database.models.company    import Company
         from database.models.sync_state import SyncState
+        from collections import defaultdict
 
         Session = sessionmaker(bind=engine)
         db      = Session()
         try:
             db_companies = {co.name: co for co in db.query(Company).all()}
 
+            # Load ALL SyncState rows in one query instead of one query per company (N+1 fix)
+            all_states = db.query(SyncState).all()
+            states_by_company = defaultdict(list)
+            for s in all_states:
+                states_by_company[s.company_name].append(s)
+
             for name, co in db_companies.items():
-                states = db.query(SyncState).filter_by(company_name=name).all()
+                states = states_by_company.get(name, [])
 
                 last_sync  = None
                 last_alter = 0
