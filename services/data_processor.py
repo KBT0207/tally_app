@@ -1639,8 +1639,10 @@ def parse_items(xml_content, company_name: str, material_centre: str = '', defau
       1. Identity / CDC keys   — company_name, guid, remote_alt_guid, alter_id
       2. Master descriptors    — item_name, parent_group, category
       3. UoM / supply type     — base_units, gst_type_of_supply
-      4. Opening-stock values  — opening_balance, opening_rate, opening_value
-      5. Audit metadata        — entered_by, is_deleted
+      4. GST details           — hsn_code, gst_applicable_from, taxability,
+                                  cgst_rate, sgst_rate, igst_rate, cess_rate
+      5. Opening-stock values  — opening_balance, opening_rate, opening_value
+      6. Audit metadata        — entered_by, is_deleted
     """
     try:
         if not xml_content or (isinstance(xml_content, str) and not xml_content.strip()):
@@ -1671,6 +1673,7 @@ def parse_items(xml_content, company_name: str, material_centre: str = '', defau
                 logger.debug(f"Skipping item with no name/guid (name={item_name!r})")
                 continue
 
+            # ---------------- BASIC ----------------
             remote_alt_guid = clean_text(item.findtext('REMOTEALTGUID', ''))
             alter_id_raw    = clean_text(item.findtext('ALTERID', '0'))
 
@@ -1678,7 +1681,9 @@ def parse_items(xml_content, company_name: str, material_centre: str = '', defau
             category     = item.findtext('CATEGORY', '') or ''
             base_units   = item.findtext('BASEUNITS', '') or ''
             gst_type     = item.findtext('GSTTYPEOFSUPPLY', '') or ''
+            entered_by   = item.findtext('ENTEREDBY', '') or ''
 
+            # ---------------- OPENING ----------------
             opening_balance = convert_to_float(
                 extract_numeric_amount(clean_text(item.findtext('OPENINGBALANCE', '0')))
             )
@@ -1689,8 +1694,7 @@ def parse_items(xml_content, company_name: str, material_centre: str = '', defau
                 extract_numeric_amount(clean_text(item.findtext('OPENINGVALUE',   '0')))
             )
 
-            entered_by = item.findtext('ENTEREDBY', '') or ''
-
+            # ---------------- DELETE FLAG ----------------
             is_deleted_raw = clean_text(item.findtext('ISDELETED', ''))
             action         = item.get('ACTION', '')
             is_deleted     = (
@@ -1700,22 +1704,74 @@ def parse_items(xml_content, company_name: str, material_centre: str = '', defau
                 ) else 'No'
             )
 
+            # ---------------- GST EXTRACTION ----------------
+            hsn_code            = ''
+            gst_applicable_from = ''
+            taxability          = ''
+            cgst_rate           = 0.0
+            sgst_rate           = 0.0
+            igst_rate           = 0.0
+            cess_rate           = 0.0
+
+            # Sort GST detail entries by date descending — pick the latest
+            gst_details_list = sorted(
+                item.findall('.//GSTDETAILS.LIST'),
+                key=lambda x: x.findtext('APPLICABLEFROM', '0'),
+                reverse=True,
+            )
+
+            for gst in gst_details_list:
+                hsn = clean_text(gst.findtext('HSNCODE', ''))
+                if hsn:
+                    hsn_code            = hsn
+                    gst_applicable_from = gst.findtext('APPLICABLEFROM', '') or ''
+                    taxability          = gst.findtext('TAXABILITY', '') or ''
+
+                    for rate_detail in gst.findall('.//RATEDETAILS.LIST'):
+                        duty_head = (rate_detail.findtext('GSTRATEDUTYHEAD', '') or '').strip()
+                        rate      = convert_to_float(
+                            clean_text(rate_detail.findtext('GSTRATE', '0'))
+                        )
+                        if duty_head == 'Central Tax':
+                            cgst_rate = rate
+                        elif duty_head == 'State Tax':
+                            sgst_rate = rate
+                        elif duty_head == 'Integrated Tax':
+                            igst_rate = rate
+                        elif 'Cess' in duty_head:
+                            cess_rate = rate
+
+                    break  # only latest GST entry needed
+
             all_rows.append({
-                'company_name'      : company_name,
-                'item_name'         : item_name,
-                'parent_group'      : parent_group,
-                'category'          : category,
-                'base_units'        : base_units,
-                'gst_type_of_supply': gst_type,
-                'opening_balance'   : opening_balance,
-                'opening_rate'      : opening_rate,
-                'opening_value'     : opening_value,
-                'entered_by'        : entered_by,
-                'is_deleted'        : is_deleted,
-                'guid'              : guid,
-                'remote_alt_guid'   : remote_alt_guid,
-                'alter_id'          : int(alter_id_raw) if alter_id_raw else 0,
-                'material_centre'   : material_centre,
+                'company_name'       : company_name,
+                'item_name'          : item_name,
+                'parent_group'       : parent_group,
+                'category'           : category,
+                'base_units'         : base_units,
+                'gst_type_of_supply' : gst_type,
+
+                # GST
+                'hsn_code'           : hsn_code,
+                'gst_applicable_from': gst_applicable_from,
+                'taxability'         : taxability,
+                'cgst_rate'          : cgst_rate,
+                'sgst_rate'          : sgst_rate,
+                'igst_rate'          : igst_rate,
+                'cess_rate'          : cess_rate,
+
+                # Opening stock
+                'opening_balance'    : opening_balance,
+                'opening_rate'       : opening_rate,
+                'opening_value'      : opening_value,
+
+                # Meta
+                'entered_by'         : entered_by,
+                'is_deleted'         : is_deleted,
+                'guid'               : guid,
+                'remote_alt_guid'    : remote_alt_guid,
+                'alter_id'           : int(alter_id_raw) if alter_id_raw else 0,
+                'material_centre'    : material_centre,
             })
 
         logger.info(f"Parsed {len(all_rows)} stock items (skipped {skipped} empty nodes) [{company_name}]")

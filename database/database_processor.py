@@ -986,6 +986,10 @@ def upsert_items(rows, engine):
     update_fields = [
         'item_name', 'parent_group', 'category',
         'base_units', 'gst_type_of_supply',
+        # GST fields
+        'hsn_code', 'gst_applicable_from', 'taxability',
+        'cgst_rate', 'sgst_rate', 'igst_rate', 'cess_rate',
+        # Opening stock
         'opening_balance', 'opening_rate', 'opening_value',
         'entered_by', 'is_deleted',
         'guid', 'remote_alt_guid', 'alter_id',
@@ -993,21 +997,30 @@ def upsert_items(rows, engine):
 
     def _safe(row):
         return {
-            'company_name'       : _t(row.get('company_name'),        255),
-            'item_name'          : _t(row.get('item_name'),           500),
-            'parent_group'       : _t(row.get('parent_group'),        255),
-            'category'           : _t(row.get('category'),            255),
-            'base_units'         : _t(row.get('base_units'),          100),
-            'gst_type_of_supply' : _t(row.get('gst_type_of_supply'),  100),
-            'opening_balance'    : row.get('opening_balance',  0.0),
-            'opening_rate'       : row.get('opening_rate',     0.0),
-            'opening_value'      : row.get('opening_value',    0.0),
-            'entered_by'         : _t(row.get('entered_by'),          255),
-            'is_deleted'         : _t(row.get('is_deleted'),           10),
-            'guid'               : _t(row.get('guid'),                100),
-            'remote_alt_guid'    : _t(row.get('remote_alt_guid'),     100),
-            'alter_id'           : row.get('alter_id', 0),
-            'material_centre'    : _t(row.get('material_centre'), 255),
+            'company_name'        : _t(row.get('company_name'),        255),
+            'item_name'           : _t(row.get('item_name'),           500),
+            'parent_group'        : _t(row.get('parent_group'),        255),
+            'category'            : _t(row.get('category'),            255),
+            'base_units'          : _t(row.get('base_units'),          100),
+            'gst_type_of_supply'  : _t(row.get('gst_type_of_supply'),  100),
+            # GST details
+            'hsn_code'            : _t(row.get('hsn_code', ''),         20),
+            'gst_applicable_from' : _t(row.get('gst_applicable_from', ''), 20),
+            'taxability'          : _t(row.get('taxability', ''),       50),
+            'cgst_rate'           : row.get('cgst_rate',  0.0),
+            'sgst_rate'           : row.get('sgst_rate',  0.0),
+            'igst_rate'           : row.get('igst_rate',  0.0),
+            'cess_rate'           : row.get('cess_rate',  0.0),
+            # Opening stock
+            'opening_balance'     : row.get('opening_balance',  0.0),
+            'opening_rate'        : row.get('opening_rate',     0.0),
+            'opening_value'       : row.get('opening_value',    0.0),
+            'entered_by'          : _t(row.get('entered_by'),          255),
+            'is_deleted'          : _t(row.get('is_deleted'),           10),
+            'guid'                : _t(row.get('guid'),                100),
+            'remote_alt_guid'     : _t(row.get('remote_alt_guid'),     100),
+            'alter_id'            : row.get('alter_id', 0),
+            'material_centre'     : _t(row.get('material_centre'),     255),
         }
 
     try:

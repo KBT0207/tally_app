@@ -5,18 +5,23 @@
         <TYPE>Collection</TYPE>
         <ID>IncrementalStockItems</ID>
     </HEADER>
+
     <BODY>
         <DESC>
             <STATICVARIABLES>
                 <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
                 <SVCURRENTCOMPANY></SVCURRENTCOMPANY>
             </STATICVARIABLES>
+
             <TDL>
                 <TDLMESSAGE>
+
+                    <!-- ================= COLLECTION ================= -->
                     <COLLECTION NAME="IncrementalStockItems" ISMODIFY="No">
                         <TYPE>StockItem</TYPE>
                         <FILTER>AlterIdFilter</FILTER>
 
+                        <!-- ===== Core Fields ===== -->
                         <FETCH>GUID</FETCH>
                         <FETCH>ALTERID</FETCH>
                         <FETCH>REMOTEALTGUID</FETCH>
@@ -24,16 +29,40 @@
                         <FETCH>PARENT</FETCH>
                         <FETCH>CATEGORY</FETCH>
                         <FETCH>BASEUNITS</FETCH>
+                        <FETCH>ADDITIONALUNITS</FETCH>
+                        <FETCH>CONVERSION</FETCH>
                         <FETCH>GSTTYPEOFSUPPLY</FETCH>
+                        <FETCH>ENTEREDBY</FETCH>
+                        <FETCH>ISDELETED</FETCH>
+
+                        <!-- ===== Opening Values ===== -->
                         <FETCH>OPENINGBALANCE</FETCH>
                         <FETCH>OPENINGRATE</FETCH>
                         <FETCH>OPENINGVALUE</FETCH>
-                        <FETCH>ENTEREDBY</FETCH>
-                        <FETCH>ISDELETED</FETCH>
+
+                        <!-- ===== Stock / Valuation ===== -->
+                        <FETCH>VALUATIONMETHOD</FETCH>
+                        <FETCH>STANDARDPRICE</FETCH>
+                        <FETCH>STANDARDPURCHASECOST</FETCH>
+
+                        <!-- ===== GST Details ===== -->
+                        <FETCH>GSTDETAILS.LIST</FETCH>
+                        <FETCH>HSNCODE</FETCH>
+                        <FETCH>TAXABILITY</FETCH>
+                        <FETCH>ISREVERSECHARGEAPPLICABLE</FETCH>
+
+                        <!-- ===== GST Rate Details ===== -->
+                        <FETCH>RATEDETAILS.LIST</FETCH>
+                        <FETCH>GSTRATEDUTYHEAD</FETCH>
+                        <FETCH>GSTRATE</FETCH>
+
                     </COLLECTION>
+
+                    <!-- ================= FILTER ================= -->
                     <SYSTEM TYPE="Formulae" NAME="AlterIdFilter">
                         $ALTERID > PLACEHOLDER_ALTER_ID
                     </SYSTEM>
+
                 </TDLMESSAGE>
             </TDL>
         </DESC>
