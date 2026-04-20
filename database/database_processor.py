@@ -146,6 +146,9 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
     company_name_0  = next(iter(groups.values()))[0].get('company_name', '') if groups else ''
 
     # Build lookup: key → list[existing db rows]
+    # FIX: key includes company_name to prevent cross-company voucherkey collisions.
+    # Without this, two companies sharing the same voucherkey string would corrupt
+    # each other's rows during the PHASE 2 update check.
     existing_map: dict[str, list] = defaultdict(list)
     if all_keys:
         has_voucherkey = hasattr(model_class, 'voucherkey')
@@ -157,8 +160,9 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
                 model_class.is_deleted == 'No',
             ).all()
             for rec in db_rows:
-                k = getattr(rec, 'voucherkey', None) or getattr(rec, 'guid', '')
-                existing_map[k].append(rec)
+                _rec_vkey = getattr(rec, 'voucherkey', None) or getattr(rec, 'guid', '')
+                _rec_co   = getattr(rec, 'company_name', '')
+                existing_map[f"{_rec_co}|{_rec_vkey}"].append(rec)
         else:
             db_rows = db.query(model_class).filter(
                 model_class.company_name.in_(
@@ -167,20 +171,65 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
                 model_class.is_deleted == 'No',
             ).all()
             for rec in db_rows:
-                existing_map[getattr(rec, 'guid', '')].append(rec)
+                _rec_co = getattr(rec, 'company_name', '')
+                existing_map[f"{_rec_co}|{getattr(rec, 'guid', '')}"].append(rec)
+
+    def _map_key(row: dict) -> str:
+        """Return the same compound key used to build existing_map."""
+        co  = row.get('company_name', '')
+        key = row.get('voucherkey') or row.get('guid', '')
+        return f"{co}|{key}"
+
+    # ── GUID secondary index ─────────────────────────────────────────────────
+    # Tally can re-save a voucher and assign a NEW voucherkey while keeping
+    # the same GUID. In that case existing_map (keyed by voucherkey) misses
+    # the record and PHASE 3 inserts a duplicate instead of updating.
+    # guid_map lets us detect this: if a new row's GUID already exists in DB
+    # under a different voucherkey, we treat it as an update (PHASE 2), not
+    # a new insert (PHASE 3).
+    guid_map: dict[str, list] = defaultdict(list)
+    if all_keys:
+        for rec in db_rows:
+            _rec_co   = getattr(rec, 'company_name', '')
+            _rec_guid = getattr(rec, 'guid', '')
+            if _rec_guid:
+                guid_map[f"{_rec_co}|{_rec_guid}"].append(rec)
+
+    def _guid_key(row: dict) -> str:
+        """Compound key for guid_map lookup."""
+        return f"{row.get('company_name', '')}|{row.get('guid', '')}"
+
+    def _resolve_existing(row: dict) -> list:
+        """
+        Return existing DB rows for this incoming row.
+        Primary:   match by voucherkey  (normal case)
+        Fallback:  match by GUID        (Tally re-saved → new voucherkey, same GUID)
+        """
+        rows_by_vkey = existing_map.get(_map_key(row), [])
+        if rows_by_vkey:
+            return rows_by_vkey
+        rows_by_guid = guid_map.get(_guid_key(row), [])
+        if rows_by_guid:
+            logger.debug(
+                f"[{row.get('company_name','')}] voucherkey changed for guid={row.get('guid','')} "
+                f"— resolved via GUID fallback (old voucherkey={getattr(rows_by_guid[0],'voucherkey','')} "
+                f"new voucherkey={row.get('voucherkey','')})"
+            )
+        return rows_by_guid
 
     # ── PHASE 1: Process all DELETEs first ───────────────────────────────────
     delete_keys = set()
     for key, group_rows in groups.items():
         if group_rows[0].get('is_deleted', 'No') == 'Yes':
             delete_keys.add(key)
-            for rec in existing_map.get(key, []):
+            existing_rows = _resolve_existing(group_rows[0])
+            for rec in existing_rows:
                 db.delete(rec)
                 deleted += 1
             company_name = group_rows[0].get('company_name', '')
             logger.debug(
                 f"[{company_name}] PHASE1 hard deleted "
-                f"{len(existing_map.get(key, []))} rows for key={key}"
+                f"{len(existing_rows)} rows for key={key}"
             )
     if delete_keys:
         db.flush()   # ← commit deletes to DB before any inserts
@@ -190,7 +239,7 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
     for key, group_rows in groups.items():
         if key in delete_keys:
             continue
-        existing_rows = existing_map.get(key, [])
+        existing_rows = _resolve_existing(group_rows[0])
         if not existing_rows:
             continue
         company_name = group_rows[0].get('company_name', '')
@@ -219,8 +268,11 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
     for key, group_rows in groups.items():
         if key in delete_keys or key in update_keys:
             continue
-        if existing_map.get(key):
-            continue   # already handled as unchanged
+        if _resolve_existing(group_rows[0]):
+            # Exists in DB (same voucherkey OR same GUID) but alter_id didn't
+            # increase — treat as unchanged, do not insert a duplicate.
+            unchanged += len(group_rows)
+            continue
         _insert_voucher_rows(group_rows, model_class, db)
         inserted += len(group_rows)
 
@@ -370,35 +422,168 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  GUID + VoucherKey Duplicate Auto-Cleaner  (Tally is source of truth)
+# ─────────────────────────────────────────────────────────────────────────────
+def _auto_dedup_by_guid_voucherkey(
+    company_name:        str,
+    model_class,
+    db,
+    tally_guid_vkey_map: dict,   # {guid: voucherkey} — live from Tally XML
+    from_date=None,
+    to_date=None,
+) -> int:
+    """
+    PASS 0 — Precise GUID + VoucherKey dedup using Tally as source of truth.
+
+    WHY THIS IS BETTER THAN BLIND alter_id COMPARISON
+    ──────────────────────────────────────────────────
+    When Tally re-saves a voucher it keeps the same GUID but issues a brand-new
+    VOUCHERKEY.  The sync inserts a second DB row (new voucherkey) without
+    removing the first (old voucherkey) — creating a silent duplicate.
+
+    The correct fix is NOT to blindly keep the highest alter_id row, because:
+      • alter_id is a Tally internal counter and can be unreliable.
+      • The row that *should* survive is the one whose VOUCHERKEY matches
+        what Tally currently reports for that GUID — that is the live record.
+
+    ALGORITHM
+    ─────────
+    For every DB row whose (GUID, voucherkey) pair is NOT in Tally's current
+    guid→voucherkey map, delete it.  This catches:
+      1. Old voucherkey rows left behind after a Tally re-save.
+      2. Any other stale duplicates sharing the same GUID.
+
+    The row that carries the GUID's current voucherkey is untouched.
+
+    tally_guid_vkey_map must be {guid: voucherkey} built from the GUID-list
+    XML response (the same XML already fetched for reconcile_deleted_by_guids).
+
+    Returns: count of rows deleted.
+    """
+    from collections import defaultdict
+
+    if not tally_guid_vkey_map:
+        # No Tally data available — skip safely, do not delete anything
+        logger.debug(
+            f"[{company_name}][{model_class.__tablename__}] "
+            f"PASS 0 GUID+VKey dedup skipped — tally_guid_vkey_map empty"
+        )
+        return 0
+
+    query = db.query(model_class).filter(
+        model_class.company_name == company_name,
+        model_class.is_deleted   == 'No',
+    )
+    if from_date:
+        query = query.filter(model_class.date >= from_date)
+    if to_date:
+        query = query.filter(model_class.date <= to_date)
+
+    all_rows = query.all()
+
+    # Only consider GUIDs that actually have duplicates in DB
+    guid_groups: dict[str, list] = defaultdict(list)
+    for rec in all_rows:
+        guid = getattr(rec, 'guid', None)
+        if guid:
+            guid_groups[guid].append(rec)
+
+    dedup_deleted = 0
+    for guid, records in guid_groups.items():
+
+        # GUID not in Tally at all → PASS 1 will handle deletion, skip here
+        if guid not in tally_guid_vkey_map:
+            continue
+
+        tally_vkey = str(tally_guid_vkey_map[guid])
+
+        # Find stale rows: same GUID but voucherkey doesn't match Tally's current one
+        stale = [
+            r for r in records
+            if str(getattr(r, 'voucherkey', '')) != tally_vkey
+        ]
+
+        if not stale:
+            continue  # all rows for this GUID are already correct
+
+        live = [r for r in records if str(getattr(r, 'voucherkey', '')) == tally_vkey]
+
+        logger.warning(
+            f"[{company_name}][{model_class.__tablename__}] "
+            f"PASS 0 GUID+VKey DEDUP | guid={guid} | "
+            f"Tally voucherkey={tally_vkey} | "
+            f"live rows in DB={len(live)} | "
+            f"stale rows to delete={len(stale)} "
+            f"stale_voucherkeys={[getattr(r,'voucherkey','?') for r in stale]} "
+            f"— Tally re-saved this voucher with a new voucherkey"
+        )
+
+        for rec in stale:
+            db.delete(rec)
+            dedup_deleted += 1
+
+    if dedup_deleted:
+        db.flush()
+        logger.info(
+            f"[{company_name}][{model_class.__tablename__}] "
+            f"PASS 0 GUID+VKey dedup complete: {dedup_deleted} stale row(s) removed ✓"
+        )
+
+    return dedup_deleted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  GUID Reconciliation (Phase 3 — catch deletes CDC missed)
 # ─────────────────────────────────────────────────────────────────────────────
 def reconcile_deleted_by_guids(
     company_name: str,
     model_class,
-    tally_guids: dict,
+    tally_guids: dict,           # {guid: voucher_number} — for PASS 1 + PASS 2
     from_date:   str,
     to_date:     str,
     engine,
+    tally_guid_vkey_map: dict = None,  # {guid: voucherkey} — for PASS 0 dedup (optional, from parse_guids_vkey)
 ) -> int:
     """
-    Phase 3 reconciliation — two passes for the given date window.
+    Phase 3 reconciliation — three passes for the given date window.
+
+    PASS 0 — GUID + VOUCHERKEY DEDUP (precise, Tally-authoritative):
+      Requires tally_guid_vkey_map = {guid: voucherkey} from parse_guids_vkey().
+      Any DB row whose voucherkey doesn't match Tally's current voucherkey for
+      that GUID is a stale duplicate and is hard-deleted automatically.
+      This is the precise fix for Tally re-saving a voucher with a new
+      voucherkey — no blind alter_id guessing, Tally is the source of truth.
+      Skipped silently if tally_guid_vkey_map is not provided.
 
     PASS 1 — DELETE:
       Hard delete DB rows whose GUID is absent from Tally entirely.
+      Uses tally_guids = {guid: voucher_number}.
 
     PASS 2 — RENUMBER FIX:
       For vouchers whose GUID still exists but voucher_number in DB
       doesn't match Tally, update all DB rows for that GUID.
+      Uses tally_guids = {guid: voucher_number}.
 
-    Returns: count of rows deleted (Pass 1 only).
+    Returns: count of rows deleted (Pass 0 + Pass 1 combined).
     tally_guids must be a non-empty dict — caller enforces this.
     """
     from datetime import datetime
+    from collections import defaultdict
     db = _get_session(engine)
     try:
         fd = datetime.strptime(from_date, '%Y%m%d').date()
         td = datetime.strptime(to_date,   '%Y%m%d').date()
 
+        # ── PASS 0: Precise GUID + VoucherKey dedup ─────────────────────────
+        # Uses tally_guid_vkey_map={guid: voucherkey} from parse_guids_vkey().
+        # Skipped gracefully if caller didn't provide the map.
+        dedup_deleted = _auto_dedup_by_guid_voucherkey(
+            company_name, model_class, db,
+            tally_guid_vkey_map=tally_guid_vkey_map or {},
+            from_date=fd, to_date=td,
+        )
+
+        # Re-fetch after dedup so PASS 1 & 2 see a clean state
         db_rows = db.query(model_class).filter(
             model_class.company_name == company_name,
             model_class.date         >= fd,
@@ -407,15 +592,16 @@ def reconcile_deleted_by_guids(
         ).all()
 
         if not db_rows:
+            db.commit()
             logger.debug(
                 f"[{company_name}][{model_class.__tablename__}] "
                 f"GUID reconciliation: no DB rows in window {from_date}→{to_date}"
             )
-            return 0
+            return dedup_deleted
 
         tally_guid_set = set(tally_guids.keys())
 
-        # PASS 1: hard delete rows whose GUID is gone from Tally
+        # ── PASS 1: Hard delete rows whose GUID is gone from Tally ──────────
         to_delete = [r for r in db_rows if r.guid not in tally_guid_set]
         for rec in to_delete:
             db.delete(rec)
@@ -428,11 +614,10 @@ def reconcile_deleted_by_guids(
                 f"not found in Tally | window {from_date}→{to_date}"
             )
 
-        # PASS 2: fix stale voucher_numbers for renumbered vouchers
+        # ── PASS 2: Fix stale voucher_numbers for renumbered vouchers ────────
         surviving_guids = {r.guid for r in db_rows if r.guid in tally_guid_set}
 
         renumber_count = 0
-        from collections import defaultdict
         rows_by_guid: dict = defaultdict(list)
         for r in db_rows:
             if r.guid in surviving_guids:
@@ -458,7 +643,8 @@ def reconcile_deleted_by_guids(
 
         db.commit()
 
-        if deleted_count == 0 and renumber_count == 0:
+        total_deleted = dedup_deleted + deleted_count
+        if total_deleted == 0 and renumber_count == 0:
             logger.debug(
                 f"[{company_name}][{model_class.__tablename__}] "
                 f"GUID reconciliation: all {len(db_rows)} DB rows confirmed correct in Tally ✓"
@@ -469,7 +655,7 @@ def reconcile_deleted_by_guids(
                 f"GUID reconciliation Pass 2: fixed {renumber_count} stale voucher_number rows ✓"
             )
 
-        return deleted_count
+        return total_deleted
 
     except Exception:
         db.rollback()
@@ -1473,6 +1659,100 @@ def upsert_outstanding(rows, engine):
         db.close()
 
 # ── Resync: delete all company data and reset sync state ─────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Lock cleanup  (call after each company sync to prevent memory growth)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cleanup_db_locks(company_name: str = '') -> None:
+    """
+    FIX (Gap 4): _DB_COMPANY_LOCKS was never cleared, growing unbounded over
+    long-running processes with many companies.  Call this after each company
+    sync (alongside cleanup_sync_state in sync_service) — it is safe to clear
+    because locks are only needed during an active sync; no lock is held across
+    sync boundaries.  Zero data impact.
+    """
+    with _DB_COMPANY_LOCKS_MUTEX:
+        count = len(_DB_COMPANY_LOCKS)
+        _DB_COMPANY_LOCKS.clear()
+    if count:
+        prefix = f"[{company_name}] " if company_name else ""
+        logger.debug(f"{prefix}cleanup_db_locks: cleared {count} DB company lock(s)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Post-sync validation  (na zyada, na kam verification)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_sync_count(
+    company_name:   str,
+    voucher_type:   str,
+    expected_count: int,
+    engine,
+    from_date:      str = None,
+    to_date:        str = None,
+) -> dict:
+    """
+    Compare active DB row count against an expected count from Tally.
+
+    Call this after each upsert to verify 'na zyada, na kam'.
+    Returns dict: {db_count, expected_count, match, delta}.
+
+    Note: expected_count should be UNIQUE voucher count (GUID level),
+    not total rows — one Sales voucher can have N item rows in DB.
+    """
+    model_class = {**INVENTORY_MODEL_MAP, **LEDGER_MODEL_MAP}.get(voucher_type)
+    if model_class is None:
+        return {'error': f'Unknown voucher_type: {voucher_type}'}
+
+    db = _get_session(engine)
+    try:
+        query = db.query(model_class).filter(
+            model_class.company_name == company_name,
+            model_class.is_deleted   == 'No',
+        )
+        if from_date:
+            from datetime import datetime as _dt2
+            fd = _dt2.strptime(from_date, '%Y%m%d').date()
+            query = query.filter(model_class.date >= fd)
+        if to_date:
+            from datetime import datetime as _dt2
+            td = _dt2.strptime(to_date, '%Y%m%d').date()
+            query = query.filter(model_class.date <= td)
+
+        db_count = query.count()
+        match    = (db_count == expected_count)
+        delta    = db_count - expected_count
+
+        if not match:
+            logger.warning(
+                f"[{company_name}][{voucher_type}] COUNT MISMATCH | "
+                f"db={db_count} expected={expected_count} delta={delta:+d} | "
+                f"range={from_date}→{to_date}"
+            )
+        else:
+            logger.debug(
+                f"[{company_name}][{voucher_type}] count OK | "
+                f"db={db_count} | range={from_date}→{to_date}"
+            )
+
+        return {
+            'company_name'  : company_name,
+            'voucher_type'  : voucher_type,
+            'db_count'      : db_count,
+            'expected_count': expected_count,
+            'match'         : match,
+            'delta'         : delta,
+            'from_date'     : from_date,
+            'to_date'       : to_date,
+        }
+
+    except Exception:
+        logger.exception(f"[{company_name}][{voucher_type}] validate_sync_count error")
+        return {'error': 'validation failed'}
+    finally:
+        db.close()
+
 
 def resync_company(company_name: str, engine) -> dict:
     """

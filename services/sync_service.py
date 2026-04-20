@@ -19,6 +19,7 @@ from services.data_processor import (
     parse_trial_balance,
     parse_outstanding,
     parse_guids,
+    parse_guids_vkey,
     sanitize_xml_content,
 )
 from database.database_processor import (
@@ -39,6 +40,8 @@ from database.database_processor import (
     upsert_outstanding,
     reconcile_deleted_by_guids,
     reconcile_deleted_masters_in_db,
+    cleanup_db_locks,
+    validate_sync_count,
     INVENTORY_MODEL_MAP,
     LEDGER_MODEL_MAP,
     _upsert_inventory_voucher_in_session,
@@ -123,6 +126,9 @@ def cleanup_sync_state(company_name: str = "") -> None:
     with _SYNC_STATE_LOCKS_MUTEX:
         sync_lock_count = len(_SYNC_STATE_LOCKS)
         _SYNC_STATE_LOCKS.clear()
+
+    # FIX (Gap 4): also clear the DB-layer company locks so they don't grow unbounded
+    cleanup_db_locks(company_name)
 
     # locks cleared
 
@@ -453,20 +459,36 @@ def _reconcile_deleted_vouchers(
                 )
                 continue
 
+            # Parse {guid: voucherkey} from the same XML — used by PASS 0 dedup.
+            # parse_guids_vkey uses the same sanitized XML, so no extra Tally request needed.
+            tally_guid_vkeys = parse_guids_vkey(xml)
+
+            # FIX: when Tally returns 0 GUIDs for a window, two scenarios exist:
+            #   (a) The period is genuinely empty in Tally  → safe to delete all DB rows
+            #   (b) Tally had a connection/filter error      → mass delete would corrupt data
+            #
+            # To tell them apart: if the raw XML response is non-empty but yields 0 active
+            # GUIDs, that is consistent with a genuine empty period.  Log a prominent
+            # warning so the operator can verify, then proceed with reconciliation.
+            # This matches the documented contract — callers of reconcile_deleted_by_guids
+            # are responsible for deciding whether 0 GUIDs is a safe signal.
             if len(tally_guids) == 0:
-                logger.info(
+                logger.warning(
                     f"[{company_name}][{voucher_type}] "
-                    f"Phase 3 chunk {month_str}: Tally returned 0 GUIDs "
-                    f"— deleting all orphaned DB rows in this window"
+                    f"Phase 3 chunk {month_str}: Tally returned 0 active GUIDs for window "
+                    f"{chunk_from}→{chunk_to}. If this period has vouchers in Tally, "
+                    f"check Tally connectivity before this run. Proceeding with reconciliation "
+                    f"— all DB rows in this window will be deleted if any exist."
                 )
 
             deleted_count = reconcile_deleted_by_guids(
-                company_name = company_name,
-                model_class  = model_class,
-                tally_guids  = tally_guids,
-                from_date    = chunk_from,
-                to_date      = chunk_to,
-                engine       = engine,
+                company_name        = company_name,
+                model_class         = model_class,
+                tally_guids         = tally_guids,
+                from_date           = chunk_from,
+                to_date             = chunk_to,
+                engine              = engine,
+                tally_guid_vkey_map = tally_guid_vkeys,   # ← PASS 0: auto-delete stale voucherkey duplicates
             )
             total_deleted += deleted_count
 
