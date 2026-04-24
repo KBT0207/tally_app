@@ -356,7 +356,7 @@ class TallySyncApp:
             right, text="⚙",
             font=Font.BODY, bg=Color.BG_HEADER, fg=Color.TEXT_SECONDARY,
             relief="flat", bd=0, padx=6, cursor="hand2",
-            command=self.open_db_settings,
+            command=self._protected_db_settings,
         ).pack(side="left", padx=(Spacing.MD, 0))
 
         tk.Frame(self.main_frame, bg=Color.BORDER, height=1).grid(
@@ -1141,6 +1141,15 @@ class TallySyncApp:
         if dialog.result == "schedule":
             self.state.selected_companies = [co.name]
             self.navigate("scheduler")
+
+    def _protected_db_settings(self):
+        """
+        Gate the ⚙ DB settings button behind admin password + email OTP.
+        On first click ever: shows one-time setup to save password + SMTP.
+        After setup: password → OTP → settings open.
+        """
+        from gui.components.protected_access_dialog import ProtectedAccessDialog
+        ProtectedAccessDialog(self.root, self._config, callback=self.open_db_settings)
 
     def open_db_settings(self):
         """

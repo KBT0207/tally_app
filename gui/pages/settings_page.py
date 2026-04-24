@@ -98,9 +98,6 @@ class SettingsPage(tk.Frame):
         # tk.StringVars for all fields
         self._v = {}
 
-        # DB section state
-        self._db_editing = False
-        self._db_entries = {}   # key → tk.Entry (for toggling readonly)
 
         # Image rows
         self._image_rows = {}   # key → {"filename_var": StringVar, "result_lbl": Label}
@@ -143,9 +140,8 @@ class SettingsPage(tk.Frame):
 
         # Build all 4 sections
         self._build_tally_section(inner,      row=0)
-        self._build_db_section(inner,         row=1)
-        self._build_automation_section(inner, row=2)
-        self._build_images_section(inner,     row=3)
+        self._build_automation_section(inner, row=1)
+        self._build_images_section(inner,     row=2)
 
         # Sticky save bar at bottom
         self._build_save_bar()
@@ -215,242 +211,6 @@ class SettingsPage(tk.Frame):
             self._tally_status_lbl.configure(
                 text=f"✗ Failed — {err or 'Connection refused'}", fg=Color.DANGER)
             self.state.tally.connected = False
-
-    # ──────────────────────────────────────────────
-    #  SECTION 2 — Database
-    # ──────────────────────────────────────────────
-
-    def _build_db_section(self, parent, row):
-        card = self._card(parent, row, "🗄️  Database Connection  (MySQL / MariaDB)")
-
-        db_cfg = self._cfg.get_db_config()
-        fields = [
-            ("db_host",     "Host",     False, "hostname or IP"),
-            ("db_port",     "Port",     False, "default 3306"),
-            ("db_username", "Username", False, ""),
-            ("db_password", "Password", True,  ""),
-            ("db_database", "Database", False, ""),
-        ]
-        defaults = {
-            "db_host":     db_cfg.get("host",     "localhost"),
-            "db_port":     str(db_cfg.get("port", 3306)),
-            "db_username": db_cfg.get("username", "root"),
-            "db_password": db_cfg.get("password", ""),
-            "db_database": db_cfg.get("database", ""),
-        }
-
-        for i, (key, label, secret, hint) in enumerate(fields):
-            self._v[key] = tk.StringVar(value=defaults[key])
-
-            tk.Label(
-                card, text=label,
-                font=Font.BODY, bg=Color.BG_CARD, fg=Color.TEXT_SECONDARY,
-                anchor="w", width=22,
-            ).grid(row=i, column=0, sticky="w", pady=4)
-
-            entry = tk.Entry(
-                card, textvariable=self._v[key],
-                font=Font.BODY, width=26,
-                bg=Color.BG_TABLE_HEADER, fg=Color.TEXT_PRIMARY,
-                relief="solid", bd=1,
-                show="●" if secret else "",
-                state="readonly",
-            )
-            entry.grid(row=i, column=1, sticky="w", pady=4, padx=(Spacing.SM, 0))
-            self._db_entries[key] = entry
-
-            if hint:
-                tk.Label(card, text=hint,
-                         font=Font.BODY_SM, bg=Color.BG_CARD,
-                         fg=Color.TEXT_MUTED).grid(
-                    row=i, column=2, sticky="w", padx=(Spacing.SM, 0))
-
-        # Buttons
-        btn_row = tk.Frame(card, bg=Color.BG_CARD)
-        btn_row.grid(row=len(fields), column=0, columnspan=3,
-                     sticky="w", pady=(Spacing.MD, 0))
-
-        self._db_edit_btn = tk.Button(
-            btn_row, text="✎  Edit Credentials",
-            font=Font.BUTTON_SM, bg=Color.BG_ROOT, fg=Color.TEXT_PRIMARY,
-            relief="solid", bd=1, padx=Spacing.LG, pady=5,
-            cursor="hand2", command=self._toggle_db_edit,
-        )
-        self._db_edit_btn.pack(side="left", padx=(0, Spacing.SM))
-
-        self._db_test_btn = tk.Button(
-            btn_row, text="⚡  Test DB",
-            font=Font.BUTTON_SM, bg=Color.SUCCESS_BG, fg=Color.SUCCESS_FG,
-            relief="flat", bd=0, padx=Spacing.LG, pady=5,
-            cursor="hand2", command=self._test_db,
-        )
-        self._db_test_btn.pack(side="left", padx=(0, Spacing.SM))
-
-        self._db_apply_btn = tk.Button(
-            btn_row, text="✔  Apply & Reconnect",
-            font=Font.BUTTON_SM, bg=Color.PRIMARY, fg=Color.TEXT_WHITE,
-            relief="flat", bd=0, padx=Spacing.LG, pady=5,
-            cursor="hand2", command=self._apply_db,
-        )
-        # Hidden until edit mode is active
-        self._db_apply_btn.pack_forget()
-
-        self._db_status_lbl = tk.Label(
-            btn_row, text="",
-            font=Font.BODY_SM, bg=Color.BG_CARD, fg=Color.TEXT_MUTED,
-        )
-        self._db_status_lbl.pack(side="left", padx=(Spacing.SM, 0))
-
-    def _toggle_db_edit(self):
-        self._db_editing = not self._db_editing
-
-        if self._db_editing:
-            # Unlock all fields
-            for entry in self._db_entries.values():
-                entry.configure(state="normal", bg=Color.BG_INPUT)
-            self._db_edit_btn.configure(text="✖  Cancel", bg="#fde8e8",
-                                        fg=Color.DANGER, relief="flat")
-            self._db_apply_btn.pack(side="left", padx=(0, Spacing.SM))
-            self._db_status_lbl.configure(
-                text="Edit credentials then click Apply & Reconnect",
-                fg=Color.TEXT_MUTED)
-            self._db_entries["db_host"].focus_set()
-        else:
-            # Cancel — reload from ConfigManager
-            db_cfg = self._cfg.get_db_config()
-            self._v["db_host"].set(db_cfg.get("host",     "localhost"))
-            self._v["db_port"].set(str(db_cfg.get("port", 3306)))
-            self._v["db_username"].set(db_cfg.get("username", "root"))
-            self._v["db_password"].set(db_cfg.get("password", ""))
-            self._v["db_database"].set(db_cfg.get("database", ""))
-
-            for entry in self._db_entries.values():
-                entry.configure(state="readonly", bg=Color.BG_TABLE_HEADER)
-            self._db_edit_btn.configure(text="✎  Edit Credentials",
-                                        bg=Color.BG_ROOT, fg=Color.TEXT_PRIMARY,
-                                        relief="solid")
-            self._db_apply_btn.pack_forget()
-            self._db_status_lbl.configure(text="")
-
-    def _get_db_cfg_from_ui(self):
-        return {
-            "host":     self._v["db_host"].get().strip(),
-            "port":     self._v["db_port"].get().strip(),
-            "username": self._v["db_username"].get().strip(),
-            "password": self._v["db_password"].get(),
-            "database": self._v["db_database"].get().strip(),
-        }
-
-    def _test_db(self):
-        self._db_test_btn.configure(state="disabled", text="Testing…")
-        self._db_status_lbl.configure(text="Connecting…", fg=Color.TEXT_MUTED)
-        self.update_idletasks()
-
-        cfg = self._get_db_cfg_from_ui()
-
-        def worker():
-            try:
-                from database.db_connector import DatabaseConnector
-                conn = DatabaseConnector(
-                    username=cfg["username"], password=cfg["password"],
-                    host=cfg["host"], port=int(cfg["port"]),
-                    database=cfg["database"],
-                )
-                ok = conn.test_connection()
-                self.after(0, lambda: self._on_db_test(ok))
-            except Exception as e:
-                self.after(0, lambda err=str(e): self._on_db_test(False, err))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_db_test(self, ok, err=""):
-        self._db_test_btn.configure(state="normal", text="⚡  Test DB")
-        if ok:
-            self._db_status_lbl.configure(text="✓ Connected", fg=Color.SUCCESS)
-        else:
-            self._db_status_lbl.configure(
-                text=f"✗ {err or 'Connection failed'}", fg=Color.DANGER)
-
-    def _apply_db(self):
-        cfg = self._get_db_cfg_from_ui()
-
-        if not cfg["database"]:
-            messagebox.showerror("Error", "Database name cannot be empty.")
-            return
-        if not str(cfg["port"]).isdigit():
-            messagebox.showerror("Error", "Port must be a number.")
-            return
-
-        self._db_apply_btn.configure(state="disabled", text="Applying…")
-        self._db_status_lbl.configure(text="Testing then saving…", fg=Color.TEXT_MUTED)
-        self.update_idletasks()
-
-        def worker():
-            try:
-                from database.db_connector import DatabaseConnector
-
-                # Test first
-                conn = DatabaseConnector(
-                    username=cfg["username"], password=cfg["password"],
-                    host=cfg["host"], port=int(cfg["port"]),
-                    database=cfg["database"],
-                )
-                if not conn.test_connection():
-                    raise RuntimeError("Connection test failed")
-
-                # Save to config.json via ConfigManager
-                self._cfg.save_db_config(cfg)
-                self.state.db_config = self._cfg.get_db_config()
-
-                # Rebuild engine
-                conn2 = DatabaseConnector(
-                    username=cfg["username"], password=cfg["password"],
-                    host=cfg["host"], port=int(cfg["port"]),
-                    database=cfg["database"],
-                )
-                conn2.create_database_if_not_exists()
-                conn2.create_tables()
-                new_engine = conn2.get_engine()
-
-                if self.state.db_engine:
-                    try:
-                        self.state.db_engine.dispose()
-                    except Exception:
-                        pass
-                self.state.db_engine = new_engine
-
-                self.after(0, self._on_db_apply_ok)
-
-            except Exception as e:
-                self.after(0, lambda err=str(e): self._on_db_apply_fail(err))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_db_apply_ok(self):
-        self._db_apply_btn.configure(state="normal", text="✔  Apply & Reconnect")
-        self._db_status_lbl.configure(text="✓ Reconnected successfully", fg=Color.SUCCESS)
-        self._db_editing = False
-
-        for entry in self._db_entries.values():
-            entry.configure(state="readonly", bg=Color.BG_TABLE_HEADER)
-        self._db_edit_btn.configure(text="✎  Edit Credentials",
-                                    bg=Color.BG_ROOT, fg=Color.TEXT_PRIMARY,
-                                    relief="solid")
-        self._db_apply_btn.pack_forget()
-
-        # Update header DB indicator if it exists
-        try:
-            self.app._db_status_lbl.configure(text="● DB: Connected", fg=Color.SUCCESS)
-        except Exception:
-            pass
-
-    def _on_db_apply_fail(self, err):
-        self._db_apply_btn.configure(state="normal", text="✔  Apply & Reconnect")
-        self._db_status_lbl.configure(text=f"✗ {err[:80]}", fg=Color.DANGER)
-
-    # ──────────────────────────────────────────────
-    #  SECTION 3 — Tally Automation (exe + controls)
-    # ──────────────────────────────────────────────
 
     def _build_automation_section(self, parent, row):
         card = self._card(parent, row, "🤖  Tally Automation  (PyAutoGUI)")
@@ -1097,18 +857,6 @@ class SettingsPage(tk.Frame):
         self._v["tally_host"].set(self.state.tally.host or tally_cfg.get("host", "localhost"))
         self._v["tally_port"].set(str(self.state.tally.port or tally_cfg.get("port", 9000)))
         self._tally_status_lbl.configure(text="")
-
-        # DB fields (reload from ConfigManager)
-        if not self._db_editing:
-            db_cfg = self._cfg.get_db_config()
-            self._v["db_host"].set(db_cfg.get("host",     "localhost"))
-            self._v["db_port"].set(str(db_cfg.get("port", 3306)))
-            self._v["db_username"].set(db_cfg.get("username", "root"))
-            self._v["db_password"].set(db_cfg.get("password", ""))
-            self._v["db_database"].set(db_cfg.get("database", ""))
-            for entry in self._db_entries.values():
-                entry.configure(state="readonly", bg=Color.BG_TABLE_HEADER)
-        self._db_status_lbl.configure(text="")
 
         # Automation
         self._v["tally_exe"].set(getattr(self.state, 'tally_exe_path', '') or '')

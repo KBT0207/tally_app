@@ -124,6 +124,15 @@ DEFAULT_CONFIG = {
         "setup_complete": False,
         "first_run":      True,
     },
+    # ── Admin protection — guards DB settings behind password + email OTP ────
+    "admin": {
+        "password_hash": "",        # SHA-256 hash — never plain text
+        "email":         "",        # OTP is sent to this address
+        "smtp_host":     "",        # e.g. smtp.gmail.com
+        "smtp_port":     587,
+        "smtp_user":     "",
+        "smtp_password": "",        # stored via keyring when available
+    },
 }
 
 
@@ -352,6 +361,52 @@ class ConfigManager:
         if not stored:
             return False
         return password == stored
+
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Admin protection config  (password hash + email + SMTP)
+    # ─────────────────────────────────────────────────────────────────────────
+    def get_admin_config(self) -> dict:
+        """
+        Returns admin protection config with keys:
+          password_hash, email, smtp_host, smtp_port, smtp_user, smtp_password
+        smtp_password is decoded from keyring / b64 before returning.
+        """
+        import copy
+        raw = copy.deepcopy(self._data.get("admin", DEFAULT_CONFIG["admin"]))
+        # Reuse the same secure loader used for the DB password
+        raw["smtp_password"] = _load_password(raw.get("smtp_password", ""))
+        return raw
+
+    def save_admin_config(self, admin: dict) -> None:
+        """
+        Save admin protection settings.
+        Expected keys: password_hash, email, smtp_host, smtp_port,
+                       smtp_user, smtp_password
+        smtp_password is stored via keyring / b64 — never plain text.
+        """
+        smtp_pass = str(admin.get("smtp_password", ""))
+        # Use a dedicated keyring key so it doesn't collide with the DB password
+        if _HAS_KEYRING:
+            try:
+                import keyring as _kr
+                _kr.set_password("TallySyncManager", "smtp_password", smtp_pass)
+                token = "__keyring_smtp__"
+            except Exception:
+                token = "b64:" + __import__("base64").b64encode(smtp_pass.encode()).decode()
+        else:
+            token = "b64:" + __import__("base64").b64encode(smtp_pass.encode()).decode()
+
+        self._data["admin"] = {
+            "password_hash": str(admin.get("password_hash", "")),
+            "email":         str(admin.get("email", "")),
+            "smtp_host":     str(admin.get("smtp_host", "")),
+            "smtp_port":     int(admin.get("smtp_port", 587)),
+            "smtp_user":     str(admin.get("smtp_user", "")),
+            "smtp_password": token,
+        }
+        self._save()
+        logger.info("[ConfigManager] Admin protection config saved")
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Convenience: reload from disk
