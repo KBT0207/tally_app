@@ -728,13 +728,14 @@ def _sync_items(
                 return
 
             new_max = _get_max_alter_id(rows)
-            upsert_items(rows, engine)
+            migration_detected = upsert_items(rows, engine)
             with lock:
                 update_sync_state(company_name, 'items', new_max, engine, is_initial_done=True)
             logger.info(
                 f"[{company_name}][items] ✓ SYNC COMPLETE | mode=CDC | last_alter_id={new_max}"
             )
-            _reconcile_deleted_masters(company_name, 'items', tally, engine)
+            if not migration_detected:
+                _reconcile_deleted_masters(company_name, 'items', tally, engine)
             return
 
         elif sync_mode == 'SNAPSHOT':

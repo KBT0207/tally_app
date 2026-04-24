@@ -1104,26 +1104,7 @@ def _propagate_ledger_rename(
     return total
 
 
-def _propagate_item_rename(
-    db,
-    company_name: str,
-    old_name:     str,
-    new_name:     str,
-) -> int:
-    """
-    Cascade a stock item rename to every inventory voucher table that stores
-    item_name as plain text.
-
-    Called INSIDE the upsert_items session — atomic with the Item master update.
-
-    ISOLATION GUARANTEE:
-      Filtered strictly by company_name + item_name (exact, case-sensitive).
-      Only rows belonging to THIS company with THIS exact old name are updated.
-      Another company's item with the same name is never touched.
-
-    Column mapping:
-      item_name → SalesVoucher, PurchaseVoucher, CreditNote, DebitNote
-    """
+def _propagate_item_rename(db, company_name: str, old_name: str, new_name: str) -> int:
     if not old_name or not new_name or old_name == new_name:
         return 0
     total = 0
@@ -1131,134 +1112,160 @@ def _propagate_item_rename(
         count = (
             db.query(model)
             .filter(
-                model.company_name == company_name,   # MUST match company first
-                model.item_name    == old_name,        # exact case-sensitive match
+                model.company_name == company_name,
+                model.item_name    == old_name,
                 model.is_deleted   == 'No',
             )
-            .update(
-                {'company_name': company_name, 'item_name': new_name},
-                synchronize_session='fetch',
-            )
+            .update({'item_name': new_name}, synchronize_session='fetch')
         )
         if count:
             logger.info(
                 f"[{company_name}] item rename cascade | "
                 f"{model.__tablename__}.item_name | "
-                f"'{old_name}' → '{new_name}' | rows={count}"
+                f"'{old_name}' \u2192 '{new_name}' | rows={count}"
             )
         total += count
     return total
 
 
-def upsert_items(rows, engine):
-    """
-    Upsert StockItem master rows.
+def _detect_company_migration(rows: list, company_name: str, db) -> tuple[bool, str, str]:
+    new_raguid = ''
+    for row in rows:
+        v = (row.get('remote_alt_guid') or '').strip()
+        if v:
+            new_raguid = v
+            break
+    if not new_raguid:
+        for row in rows:
+            guid = (row.get('guid') or '').strip()
+            if guid and guid.count('-') >= 5:
+                new_raguid = guid.rsplit('-', 1)[0]
+                break
+    if not new_raguid:
+        return False, '', ''
+    sample = db.query(Item).filter(
+        Item.company_name    == company_name,
+        Item.remote_alt_guid != '',
+    ).first()
+    if not sample:
+        return False, '', new_raguid
+    old_raguid = (sample.remote_alt_guid or '').strip()
+    if old_raguid and old_raguid != new_raguid:
+        return True, old_raguid, new_raguid
+    return False, old_raguid, new_raguid
 
-    FIX: CDC delete handling — when Tally marks an item is_deleted='Yes'
-    via CDC, the old code simply updated the is_deleted field to 'Yes'
-    (soft-delete via alter_id-gated field update).  This is correct for
-    items (we want to keep the item record for historical voucher display),
-    BUT the alter_id guard was preventing the update if somehow alter_id
-    hadn't advanced.  Now we force-update is_deleted='Yes' regardless of
-    alter_id when the incoming row says the item was deleted.
-    """
+
+def upsert_items(rows, engine):
     if not rows:
         logger.warning("No rows to upsert for items")
-        return
+        return False
 
     db = _get_session(engine)
     inserted = updated = unchanged = skipped = 0
 
-    update_fields = [
-        'item_name', 'parent_group', 'category',
-        'base_units', 'gst_type_of_supply',
-        # GST fields
-        'hsn_code', 'gst_applicable_from', 'taxability',
-        'cgst_rate', 'sgst_rate', 'igst_rate', 'cess_rate',
-        # Opening stock
-        'opening_balance', 'opening_rate', 'opening_value',
-        'entered_by', 'is_deleted',
-        'guid', 'remote_alt_guid', 'alter_id',
-    ]
-
     def _safe(row):
         return {
-            'company_name'        : _t(row.get('company_name'),        255),
-            'item_name'           : _t(row.get('item_name'),           500),
-            'parent_group'        : _t(row.get('parent_group'),        255),
-            'category'            : _t(row.get('category'),            255),
-            'base_units'          : _t(row.get('base_units'),          100),
-            'gst_type_of_supply'  : _t(row.get('gst_type_of_supply'),  100),
-            # GST details
-            'hsn_code'            : _t(row.get('hsn_code', ''),         20),
-            'gst_applicable_from' : _t(row.get('gst_applicable_from', ''), 20),
-            'taxability'          : _t(row.get('taxability', ''),       50),
-            'cgst_rate'           : row.get('cgst_rate',  0.0),
-            'sgst_rate'           : row.get('sgst_rate',  0.0),
-            'igst_rate'           : row.get('igst_rate',  0.0),
-            'cess_rate'           : row.get('cess_rate',  0.0),
-            # Opening stock
+            'company_name'        : _t(row.get('company_name'),              255),
+            'item_name'           : _t(row.get('item_name'),                 500),
+            'parent_group'        : _t(row.get('parent_group'),              255),
+            'category'            : _t(row.get('category'),                  255),
+            'base_units'          : _t(row.get('base_units'),                100),
+            'gst_type_of_supply'  : _t(row.get('gst_type_of_supply'),        100),
+            'hsn_code'            : _t(row.get('hsn_code', ''),               20),
+            'gst_applicable_from' : _t(row.get('gst_applicable_from', ''),    20),
+            'taxability'          : _t(row.get('taxability', ''),              50),
+            'cgst_rate'           : row.get('cgst_rate',        0.0),
+            'sgst_rate'           : row.get('sgst_rate',        0.0),
+            'igst_rate'           : row.get('igst_rate',        0.0),
+            'cess_rate'           : row.get('cess_rate',        0.0),
             'opening_balance'     : row.get('opening_balance',  0.0),
             'opening_rate'        : row.get('opening_rate',     0.0),
             'opening_value'       : row.get('opening_value',    0.0),
-            'entered_by'          : _t(row.get('entered_by'),          255),
-            'is_deleted'          : _t(row.get('is_deleted'),           10),
-            'guid'                : _t(row.get('guid'),                100),
-            'remote_alt_guid'     : _t(row.get('remote_alt_guid'),     100),
+            'entered_by'          : _t(row.get('entered_by'),                255),
+            'is_deleted'          : _t(row.get('is_deleted'),                 10),
+            'guid'                : _t(row.get('guid'),                      100),
+            'remote_alt_guid'     : _t(row.get('remote_alt_guid'),           100),
             'alter_id'            : row.get('alter_id', 0),
-            'material_centre'     : _t(row.get('material_centre'),     255),
+            'material_centre'     : _t(row.get('material_centre'),           255),
         }
 
     try:
+        company_name = rows[0].get('company_name', '') if rows else ''
+
+        is_migration, old_raguid, new_raguid = _detect_company_migration(rows, company_name, db)
+
+        if is_migration:
+            logger.warning(
+                f"[{company_name}] TALLY COMPANY MIGRATION DETECTED | "
+                f"old={old_raguid} | new={new_raguid} | wiping old rows and re-inserting."
+            )
+            deleted_count = (
+                db.query(Item)
+                .filter(Item.company_name == company_name)
+                .delete(synchronize_session='fetch')
+            )
+            db.flush()
+            logger.info(f"[{company_name}] Deleted {deleted_count} stale item rows (old: {old_raguid})")
+
         for row in rows:
             if not row.get('guid'):
                 skipped += 1
                 continue
 
             safe = _safe(row)
+            name_changed = False
 
             existing = db.query(Item).filter_by(
-                guid         = safe['guid'],
+                item_name    = safe['item_name'],
                 company_name = safe['company_name'],
             ).first()
+
+            if not existing:
+                existing = db.query(Item).filter_by(
+                    guid         = safe['guid'],
+                    company_name = safe['company_name'],
+                ).first()
+                if existing:
+                    old_item_name = existing.item_name
+                    new_item_name = safe['item_name']
+                    name_changed = (
+                        bool(old_item_name)
+                        and bool(new_item_name)
+                        and old_item_name.strip() != new_item_name.strip()
+                    )
+                    if name_changed:
+                        renamed = _propagate_item_rename(
+                            db           = db,
+                            company_name = existing.company_name,
+                            old_name     = old_item_name,
+                            new_name     = new_item_name,
+                        )
+                        logger.info(
+                            f"[{company_name}] Item RENAMED | "
+                            f"'{old_item_name}' \u2192 '{new_item_name}' | "
+                            f"guid={safe['guid']} | voucher rows updated={renamed}"
+                        )
 
             if existing:
                 new_alter_id     = int(safe['alter_id'])
                 old_alter_id     = int(existing.alter_id or 0)
                 incoming_deleted = safe.get('is_deleted') == 'Yes'
 
-                # ── Rename cascade (checked ALWAYS, independent of alter_id) ──
-                # Rule: store EXACTLY what Tally sends for this company.
-                # Lookup is always by company_name + guid so one company's item
-                # name never affects any other company's rows.
-                # Any name change (including case) is treated as a real rename
-                # and cascaded only within this company.
-                old_item_name = existing.item_name
-                new_item_name = safe.get('item_name', '')
-                name_changed = (
-                    old_item_name
-                    and new_item_name
-                    and old_item_name.lower().strip() != new_item_name.lower().strip()
-                    and not incoming_deleted
-                )
-                if name_changed:
-                    renamed = _propagate_item_rename(
-                        db           = db,
-                        company_name = existing.company_name,  # always use DB value, never incoming row
-                        old_name     = old_item_name,
-                        new_name     = new_item_name,
-                    )
+                guid_changed = existing.guid != safe['guid']
+                if guid_changed:
+                    old_guid = existing.guid
+                    existing.guid = safe['guid']
                     logger.info(
-                        f"[{existing.company_name}] Item rename detected | "
-                        f"guid={safe['guid']} | "
-                        f"'{old_item_name}' → '{new_item_name}' | "
-                        f"voucher rows updated={renamed}"
+                        f"[{company_name}] Item GUID updated | "
+                        f"'{safe['item_name']}' | {old_guid} \u2192 {safe['guid']}"
                     )
 
-                # FIX: always apply delete flag even if alter_id hasn't advanced,
-                # because Tally CDC can sometimes return is_deleted=Yes with the
-                # same alter_id as before (race condition in Tally's CDC response).
-                if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes') or name_changed:
+                if (
+                    new_alter_id > old_alter_id
+                    or (incoming_deleted and existing.is_deleted != 'Yes')
+                    or name_changed
+                    or guid_changed
+                ):
                     _log_changes(
                         "item UPDATE", existing,
                         [f for f in safe if f not in ('guid', 'company_name')],
@@ -1275,7 +1282,15 @@ def upsert_items(rows, engine):
                 inserted += 1
 
         db.commit()
-        _log_result("Items upsert", inserted, updated, unchanged, skipped)
+        if is_migration:
+            logger.warning(
+                f"[{company_name}] Migration complete | "
+                f"{old_raguid} \u2192 {new_raguid} | inserted={inserted} skipped={skipped}"
+            )
+        else:
+            _log_result("Items upsert", inserted, updated, unchanged, skipped)
+
+        return is_migration
 
     except Exception:
         db.rollback()
