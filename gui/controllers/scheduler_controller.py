@@ -36,32 +36,9 @@ except ImportError:
 from gui.state import AppState, CompanyState, CompanyStatus
 from logging_config import logger
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Module-level job function  ←  the ONLY thing APScheduler pickles
-#
-#  All arguments must be picklable primitives.
-#  We look up the live AppState via a module-level registry rather than
-#  capturing it in a closure or instance method.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Module-level SINGLETON  ←  the ONLY thing APScheduler pickles in kwargs
-#
-#  Problem with the old registry-key approach:
-#    APScheduler persists job kwargs (including registry_key) to MySQL.
-#    On next app launch the old key is loaded but the new session's _REGISTRY
-#    hasn't been populated yet when the first job fires → "not ready" fallback.
-#
-#  Fix: store ONE module-level tuple that is always the LATEST live values.
-#  _run_scheduled_sync() takes NO dynamic arguments — it always reads from here.
-#  Jobs are stored with empty kwargs so no stale data survives a restart.
-# ─────────────────────────────────────────────────────────────────────────────
-
-_LIVE_STATE       = None   # AppState
-_LIVE_GUI_QUEUE   = None   # queue.Queue  (to GUI)
-_LIVE_SYNC_QUEUE  = None   # SyncQueueController | None
-
+_LIVE_STATE       = None
+_LIVE_GUI_QUEUE   = None
+_LIVE_SYNC_QUEUE  = None
 
 def _set_live(state, gui_queue, sync_queue_ctrl=None):
     """Called once by SchedulerController.__init__ — sets module-level live refs."""
@@ -70,12 +47,10 @@ def _set_live(state, gui_queue, sync_queue_ctrl=None):
     _LIVE_GUI_QUEUE  = gui_queue
     _LIVE_SYNC_QUEUE = sync_queue_ctrl
 
-
 def _update_sync_queue(sync_queue_ctrl):
     """Called by set_sync_queue() to register SyncQueueController after it starts."""
     global _LIVE_SYNC_QUEUE
     _LIVE_SYNC_QUEUE = sync_queue_ctrl
-
 
 def _run_scheduled_sync(company_name: str):
     """
@@ -99,13 +74,11 @@ def _run_scheduled_sync(company_name: str):
 
     logger.info(f"[Scheduler] Triggered sync for: {company_name}")
 
-    # ── Phase 2 path: enqueue into SyncQueueController ────────────────────
     if sync_queue is not None:
         sync_queue.enqueue(company_name)
         logger.info(f"[Scheduler] '{company_name}' enqueued in SyncQueueController ✓")
         return
 
-    # ── Fallback: direct sync (SyncQueueController not available) ─────────
     logger.warning(
         f"[Scheduler] SyncQueueController not available — "
         f"running '{company_name}' directly (no Tally automation)"
@@ -146,11 +119,9 @@ def _run_scheduled_sync(company_name: str):
             pass
         time.sleep(0.1)
 
-
 def _slug(name: str) -> str:
     """Convert company name to a safe APScheduler job ID base."""
     return "sync_" + re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
 
 def _build_url(db_cfg: dict) -> str:
     """Build a pymysql connection URL from the db_config dict."""
@@ -161,10 +132,6 @@ def _build_url(db_cfg: dict) -> str:
     db   = db_cfg.get("database", "tally_db")
     return f"mysql+pymysql://{user}:{pw}@{host}:{port}/{db}"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SchedulerController
-# ─────────────────────────────────────────────────────────────────────────────
 class SchedulerController:
     """One instance per app session. Call start() once on app launch."""
 
@@ -179,8 +146,6 @@ class SchedulerController:
         self._scheduler: Optional[object] = None
         self._lock     = threading.Lock()
 
-        # Register module-level singleton so _run_scheduled_sync always finds
-        # the latest live state regardless of persisted job kwargs
         _set_live(state, app_queue, sync_queue_ctrl)
         logger.info("[Scheduler] Live state registered in module singleton")
 
@@ -192,9 +157,6 @@ class SchedulerController:
         _update_sync_queue(sync_queue_ctrl)
         logger.info("[Scheduler] SyncQueueController registered in singleton ✓")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Lifecycle
-    # ─────────────────────────────────────────────────────────────────────────
     def start(self):
         """Start APScheduler. Call once on app launch."""
         if not HAS_APSCHEDULER:
@@ -213,30 +175,10 @@ class SchedulerController:
             self._scheduler = BackgroundScheduler(
                 jobstores    = jobstores if jobstores else None,
                 job_defaults = {
-                    # coalesce=True: if multiple runs were missed while app was closed,
-                    # fire only ONE catch-up run — not all of them at once.
                     "coalesce":      True,
 
-                    # max_instances=1: never run same company twice at same time.
                     "max_instances": 1,
 
-                    # ── misfire_grace_time = 1 second ────────────────────────
-                    # MissedSyncChecker is the SOLE owner of catch-up logic.
-                    # We do NOT want APScheduler to also fire a catch-up run
-                    # when the app reopens after being closed — that would cause
-                    # the same company to be enqueued twice:
-                    #   1. APScheduler fires coalesced missed job  (unwanted)
-                    #   2. MissedSyncChecker enqueues it           (correct)
-                    #
-                    # Setting misfire_grace_time=1 means: if a job was missed
-                    # by more than 1 second, APScheduler discards it silently
-                    # and just recalculates next_run from now + interval.
-                    # MissedSyncChecker then handles the one catch-up run.
-                    #
-                    # Result: app closed 10 min, every-1-min job →
-                    #   APScheduler: skips all 10 missed runs ✓
-                    #   MissedSyncChecker: enqueues exactly 1 catch-up ✓
-                    #   Next APScheduler run: now + 1 min (clean schedule) ✓
                     "misfire_grace_time": 1,
                 },
                 timezone="Asia/Kolkata",
@@ -250,19 +192,12 @@ class SchedulerController:
             self._scheduler.start()
             logger.info("[Scheduler] APScheduler started")
 
-            # Clear any jobs persisted from the previous session so _sync_all_jobs()
-            # registers each job exactly once with the correct startup-delay logic.
-            # (SQLAlchemyJobStore auto-loads persisted jobs on start() — without this
-            # every job would be added twice: once by the store, once by _sync_all_jobs.)
             try:
                 self._scheduler.remove_all_jobs()
                 logger.debug("[Scheduler] Cleared persisted jobs from store ✓")
             except Exception as _e:
                 logger.warning(f"[Scheduler] Could not clear persisted jobs: {_e}")
 
-            # Register jobs in a background thread so start() returns immediately.
-            # This prevents the ~150ms-per-company MySQL writes from blocking the
-            # GUI's "scheduler_ready" event and making the scheduler page load slowly.
             threading.Thread(target=self._sync_all_jobs, daemon=True).start()
 
         except Exception as e:
@@ -275,9 +210,6 @@ class SchedulerController:
             logger.info("[Scheduler] Shutdown complete")
         _set_live(None, None, None)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Job management
-    # ─────────────────────────────────────────────────────────────────────────
     def add_or_update_job(self, company_name: str):
         """
         Add or reschedule job(s) for a company.
@@ -299,7 +231,6 @@ class SchedulerController:
 
         with self._lock:
             try:
-                # ── Backward compat: remove old non-indexed job if present ──
                 try:
                     if self._scheduler.get_job(slug):
                         self._scheduler.remove_job(slug)
@@ -307,7 +238,6 @@ class SchedulerController:
                 except Exception:
                     pass
 
-                # ── Remove excess indexed jobs (e.g. user reduced times) ────
                 for i in range(len(triggers), 10):
                     old_id = f"{slug}_{i}"
                     try:
@@ -316,7 +246,6 @@ class SchedulerController:
                     except Exception:
                         pass
 
-                # ── Register one job per trigger ────────────────────────────
                 for i, trigger in enumerate(triggers):
                     job_id   = f"{slug}_{i}"
                     job_name = (
@@ -349,7 +278,6 @@ class SchedulerController:
         slug    = _slug(company_name)
         removed = False
 
-        # Remove legacy non-indexed job
         try:
             if self._scheduler.get_job(slug):
                 self._scheduler.remove_job(slug)
@@ -357,7 +285,6 @@ class SchedulerController:
         except Exception as e:
             logger.error(f"[Scheduler] Failed to remove legacy job for {company_name}: {e}")
 
-        # Remove indexed jobs
         for i in range(10):
             job_id = f"{slug}_{i}"
             try:
@@ -437,12 +364,10 @@ class SchedulerController:
             slug      = _slug(company_name)
             next_runs = []
 
-            # Check legacy non-indexed job
             job = self._scheduler.get_job(slug)
             if job and job.next_run_time:
                 next_runs.append(job.next_run_time)
 
-            # Check indexed jobs
             for i in range(10):
                 job = self._scheduler.get_job(f"{slug}_{i}")
                 if job and job.next_run_time:
@@ -489,9 +414,6 @@ class SchedulerController:
     def is_running(self) -> bool:
         return bool(self._scheduler and self._scheduler.running)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Trigger builder
-    # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
     def _build_trigger(co: CompanyState) -> list:
         """
@@ -519,14 +441,10 @@ class SchedulerController:
                 except Exception:
                     h, m = 9, 0
                 triggers.append(CronTrigger(hour=h, minute=m))
-            # Fallback to 09:00 if nothing parsed
             return triggers if triggers else [CronTrigger(hour=9, minute=0)]
 
-        return [IntervalTrigger(hours=1)]  # fallback
+        return [IntervalTrigger(hours=1)]
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  APScheduler event listener
-    # ─────────────────────────────────────────────────────────────────────────
     def _on_job_event(self, event):
         job_id = getattr(event, "job_id", "")
         if not job_id.startswith("sync_"):
@@ -549,12 +467,6 @@ class SchedulerController:
     def _post_schedule_update(self, company_name: str):
         self._q.put(("scheduler_updated", company_name))
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Sync all enabled jobs on startup
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # Gap between companies that share the same interval — prevents all 6
-    # jobs firing at the exact same millisecond and piling into the queue.
     STAGGER_SECONDS = 10
 
     def _sync_all_jobs(self):
@@ -590,17 +502,11 @@ class SchedulerController:
         except Exception as e:
             logger.error(f"[Scheduler] Failed to load scheduler config from DB: {e}")
 
-        # Pause APScheduler during bulk registration so it doesn't wake up and
-        # log "Looking for jobs to run" / "Next wakeup is due at..." after each
-        # add_job() call. Resume once all jobs are registered.
         try:
             self._scheduler.pause()
         except Exception:
             pass
 
-        # ── Group enabled companies by their interval key ─────────────────────
-        # interval key = (interval_type, value)  e.g. ("hourly", 1) or ("minutes", 5)
-        # Daily jobs are excluded from stagger — handled by CronTrigger directly.
         import collections
         interval_groups: dict = collections.defaultdict(list)
 
@@ -612,16 +518,14 @@ class SchedulerController:
 
         for name, co in enabled_companies:
             if co.schedule_interval == "daily":
-                # Daily: no stagger needed — register immediately (multiple times supported)
                 self.add_or_update_job(name)
             else:
                 key = (co.schedule_interval, co.schedule_value)
                 interval_groups[key].append((name, co))
 
-        # ── Register interval jobs with stagger ───────────────────────────────
         total_registered = 0
         for interval_key, group in interval_groups.items():
-            group_sorted = sorted(group, key=lambda x: x[0].lower())  # alphabetical
+            group_sorted = sorted(group, key=lambda x: x[0].lower())
 
             for position, (name, co) in enumerate(group_sorted):
                 stagger_offset = position * self.STAGGER_SECONDS
@@ -635,7 +539,6 @@ class SchedulerController:
                         f"in group {interval_key})"
                     )
 
-        # Count daily companies (each may have multiple jobs)
         daily_count = sum(
             1 for _, co in enabled_companies
             if co.schedule_interval == "daily"
@@ -650,13 +553,11 @@ class SchedulerController:
             f"sharing the same interval."
         )
 
-        # Resume APScheduler now that all jobs are registered.
         try:
             self._scheduler.resume()
         except Exception:
             pass
 
-    # Delay before first job fires after app opens — gives app time to fully load
     STARTUP_DELAY_SECONDS = 30
 
     def _add_job_with_startup_delay(self, company_name: str, co,
@@ -687,20 +588,17 @@ class SchedulerController:
         now     = _dt.datetime.now()
         triggers = self._build_trigger(co)
 
-        # ── Daily (CronTrigger): delegate to add_or_update_job ───────────────
         if triggers and isinstance(triggers[0], _CT):
             self.add_or_update_job(company_name)
             return
 
-        # ── Interval-based (minutes / hourly) — always exactly one trigger ───
         if co.schedule_interval == "minutes":
             interval_seconds = max(1, co.schedule_value) * 60
-        else:  # hourly
+        else:
             interval_seconds = max(1, co.schedule_value) * 3600
 
         interval_delta = _dt.timedelta(seconds=interval_seconds)
 
-        # Compute ideal next_run from last_sync_time
         last_sync  = getattr(co, 'last_sync_time', None)
         ideal_next = None
 
@@ -709,7 +607,6 @@ class SchedulerController:
                 last_sync = last_sync.replace(tzinfo=None)
             ideal_next = last_sync + interval_delta
 
-        # Minimum start = now + startup_delay + stagger_offset
         min_start = now + _dt.timedelta(
             seconds = self.STARTUP_DELAY_SECONDS + stagger_offset
         )
@@ -742,12 +639,10 @@ class SchedulerController:
             start_date = start_date,
         )
 
-        # Interval jobs always have exactly one trigger → use index 0
         job_id = f"{slug}_0"
 
         with self._lock:
             try:
-                # Remove legacy non-indexed job if present
                 try:
                     if self._scheduler.get_job(slug):
                         self._scheduler.remove_job(slug)

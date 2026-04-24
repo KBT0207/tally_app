@@ -13,7 +13,6 @@ from database.models.outstanding_models import OutstandingData
 
 from logging_config import logger
 
-# ── Per-company SyncState write locks ────────────────────────────────────────
 _DB_COMPANY_LOCKS: dict[str, threading.Lock] = {}
 _DB_COMPANY_LOCKS_MUTEX = threading.Lock()
 
@@ -111,10 +110,6 @@ def _insert_voucher_rows(rows, model_class, db, set_total_amt=True):
             material_centre  = row.get('material_centre', ''),
         ))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Inventory voucher upsert  (Sales / Purchase / Credit / Debit)
-# ─────────────────────────────────────────────────────────────────────────────
 def _upsert_inventory_voucher_in_session(rows, model_class, db):
     """
     Upsert inventory voucher rows with strict 3-phase commit order:
@@ -132,7 +127,6 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
 
     inserted = updated = unchanged = skipped = deleted = 0
 
-    # ── Group rows by voucherkey (or guid if no voucherkey) ──────────────────
     groups: dict[str, list] = defaultdict(list)
     for row in rows:
         if not row.get('guid'):
@@ -141,14 +135,9 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
         key = row.get('voucherkey') or row.get('guid', '')
         groups[key].append(row)
 
-    # Pre-fetch existing rows for all keys in ONE query per batch
     all_keys        = list(groups.keys())
     company_name_0  = next(iter(groups.values()))[0].get('company_name', '') if groups else ''
 
-    # Build lookup: key → list[existing db rows]
-    # FIX: key includes company_name to prevent cross-company voucherkey collisions.
-    # Without this, two companies sharing the same voucherkey string would corrupt
-    # each other's rows during the PHASE 2 update check.
     existing_map: dict[str, list] = defaultdict(list)
     if all_keys:
         has_voucherkey = hasattr(model_class, 'voucherkey')
@@ -180,13 +169,6 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
         key = row.get('voucherkey') or row.get('guid', '')
         return f"{co}|{key}"
 
-    # ── GUID secondary index ─────────────────────────────────────────────────
-    # Tally can re-save a voucher and assign a NEW voucherkey while keeping
-    # the same GUID. In that case existing_map (keyed by voucherkey) misses
-    # the record and PHASE 3 inserts a duplicate instead of updating.
-    # guid_map lets us detect this: if a new row's GUID already exists in DB
-    # under a different voucherkey, we treat it as an update (PHASE 2), not
-    # a new insert (PHASE 3).
     guid_map: dict[str, list] = defaultdict(list)
     if all_keys:
         for rec in db_rows:
@@ -217,7 +199,6 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
             )
         return rows_by_guid
 
-    # ── PHASE 1: Process all DELETEs first ───────────────────────────────────
     delete_keys = set()
     for key, group_rows in groups.items():
         if group_rows[0].get('is_deleted', 'No') == 'Yes':
@@ -232,9 +213,8 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
                 f"{len(existing_rows)} rows for key={key}"
             )
     if delete_keys:
-        db.flush()   # ← commit deletes to DB before any inserts
+        db.flush()
 
-    # ── PHASE 2: Process all UPDATEs (delete-old → flush → insert-new) ──────
     update_keys = set()
     for key, group_rows in groups.items():
         if key in delete_keys:
@@ -257,20 +237,17 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
             unchanged += len(existing_rows)
 
     if update_keys:
-        db.flush()   # ← old rows gone before we insert new ones
+        db.flush()
         for key in update_keys:
             group_rows = groups[key]
             _insert_voucher_rows(group_rows, model_class, db)
             updated += len(group_rows)
-        db.flush()   # ← new rows visible before phase 3
+        db.flush()
 
-    # ── PHASE 3: Process all INSERTs (brand new vouchers) ───────────────────
     for key, group_rows in groups.items():
         if key in delete_keys or key in update_keys:
             continue
         if _resolve_existing(group_rows[0]):
-            # Exists in DB (same voucherkey OR same GUID) but alter_id didn't
-            # increase — treat as unchanged, do not insert a duplicate.
             unchanged += len(group_rows)
             continue
         _insert_voucher_rows(group_rows, model_class, db)
@@ -278,10 +255,6 @@ def _upsert_inventory_voucher_in_session(rows, model_class, db):
 
     return inserted, updated, unchanged, skipped, deleted
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Ledger voucher upsert  (Receipt / Payment / Journal / Contra)
-# ─────────────────────────────────────────────────────────────────────────────
 def _upsert_ledger_voucher_in_session(rows, model_class, db):
     """
     Upsert ledger voucher rows with strict 3-phase commit order:
@@ -300,7 +273,6 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
 
     inserted = updated = unchanged = skipped = deleted = 0
 
-    # ── Group rows by GUID ───────────────────────────────────────────────────
     groups: dict[str, list] = defaultdict(list)
     for row in rows:
         if not row.get('guid'):
@@ -313,7 +285,6 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
 
     all_companies = list({g[0].get('company_name', '') for g in groups.values()})
 
-    # Pre-fetch ALL existing rows for these companies in one query
     existing_map: dict[str, list] = defaultdict(list)
     db_rows = db.query(model_class).filter(
         model_class.company_name.in_(all_companies),
@@ -322,7 +293,6 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
     for rec in db_rows:
         existing_map[rec.guid].append(rec)
 
-    # ── PHASE 1: DELETE ──────────────────────────────────────────────────────
     delete_guids = set()
     for guid, group_rows in groups.items():
         if group_rows[0].get('is_deleted', 'No') == 'Yes':
@@ -337,9 +307,8 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
                 f"ledger rows for guid={guid}"
             )
     if delete_guids:
-        db.flush()   # ← deletes committed before any insert
+        db.flush()
 
-    # ── PHASE 2: UPDATE (delete-old → flush → insert-new → flush) ───────────
     update_guids = set()
     for guid, group_rows in groups.items():
         if guid in delete_guids:
@@ -362,7 +331,7 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
             unchanged += len(existing_rows)
 
     if update_guids:
-        db.flush()   # ← old rows gone before inserts
+        db.flush()
         for guid in update_guids:
             group_rows = groups[guid]
             company_name = group_rows[0].get('company_name', '')
@@ -387,14 +356,13 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
                     material_centre= row.get('material_centre', ''),
                 ))
             updated += len(group_rows)
-        db.flush()   # ← new rows visible before phase 3
+        db.flush()
 
-    # ── PHASE 3: INSERT (brand-new GUIDs) ────────────────────────────────────
     for guid, group_rows in groups.items():
         if guid in delete_guids or guid in update_guids:
             continue
         if existing_map.get(guid):
-            continue   # unchanged
+            continue
         company_name = group_rows[0].get('company_name', '')
         for row in group_rows:
             db.add(model_class(
@@ -420,15 +388,11 @@ def _upsert_ledger_voucher_in_session(rows, model_class, db):
 
     return inserted, updated, unchanged, skipped, deleted
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  GUID + VoucherKey Duplicate Auto-Cleaner  (Tally is source of truth)
-# ─────────────────────────────────────────────────────────────────────────────
 def _auto_dedup_by_guid_voucherkey(
     company_name:        str,
     model_class,
     db,
-    tally_guid_vkey_map: dict,   # {guid: voucherkey} — live from Tally XML
+    tally_guid_vkey_map: dict,
     from_date=None,
     to_date=None,
 ) -> int:
@@ -463,7 +427,6 @@ def _auto_dedup_by_guid_voucherkey(
     from collections import defaultdict
 
     if not tally_guid_vkey_map:
-        # No Tally data available — skip safely, do not delete anything
         logger.debug(
             f"[{company_name}][{model_class.__tablename__}] "
             f"PASS 0 GUID+VKey dedup skipped — tally_guid_vkey_map empty"
@@ -481,7 +444,6 @@ def _auto_dedup_by_guid_voucherkey(
 
     all_rows = query.all()
 
-    # Only consider GUIDs that actually have duplicates in DB
     guid_groups: dict[str, list] = defaultdict(list)
     for rec in all_rows:
         guid = getattr(rec, 'guid', None)
@@ -491,20 +453,18 @@ def _auto_dedup_by_guid_voucherkey(
     dedup_deleted = 0
     for guid, records in guid_groups.items():
 
-        # GUID not in Tally at all → PASS 1 will handle deletion, skip here
         if guid not in tally_guid_vkey_map:
             continue
 
         tally_vkey = str(tally_guid_vkey_map[guid])
 
-        # Find stale rows: same GUID but voucherkey doesn't match Tally's current one
         stale = [
             r for r in records
             if str(getattr(r, 'voucherkey', '')) != tally_vkey
         ]
 
         if not stale:
-            continue  # all rows for this GUID are already correct
+            continue
 
         live = [r for r in records if str(getattr(r, 'voucherkey', '')) == tally_vkey]
 
@@ -531,18 +491,14 @@ def _auto_dedup_by_guid_voucherkey(
 
     return dedup_deleted
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  GUID Reconciliation (Phase 3 — catch deletes CDC missed)
-# ─────────────────────────────────────────────────────────────────────────────
 def reconcile_deleted_by_guids(
     company_name: str,
     model_class,
-    tally_guids: dict,           # {guid: voucher_number} — for PASS 1 + PASS 2
+    tally_guids: dict,
     from_date:   str,
     to_date:     str,
     engine,
-    tally_guid_vkey_map: dict = None,  # {guid: voucherkey} — for PASS 0 dedup (optional, from parse_guids_vkey)
+    tally_guid_vkey_map: dict = None,
 ) -> int:
     """
     Phase 3 reconciliation — three passes for the given date window.
@@ -574,16 +530,12 @@ def reconcile_deleted_by_guids(
         fd = datetime.strptime(from_date, '%Y%m%d').date()
         td = datetime.strptime(to_date,   '%Y%m%d').date()
 
-        # ── PASS 0: Precise GUID + VoucherKey dedup ─────────────────────────
-        # Uses tally_guid_vkey_map={guid: voucherkey} from parse_guids_vkey().
-        # Skipped gracefully if caller didn't provide the map.
         dedup_deleted = _auto_dedup_by_guid_voucherkey(
             company_name, model_class, db,
             tally_guid_vkey_map=tally_guid_vkey_map or {},
             from_date=fd, to_date=td,
         )
 
-        # Re-fetch after dedup so PASS 1 & 2 see a clean state
         db_rows = db.query(model_class).filter(
             model_class.company_name == company_name,
             model_class.date         >= fd,
@@ -601,7 +553,6 @@ def reconcile_deleted_by_guids(
 
         tally_guid_set = set(tally_guids.keys())
 
-        # ── PASS 1: Hard delete rows whose GUID is gone from Tally ──────────
         to_delete = [r for r in db_rows if r.guid not in tally_guid_set]
         for rec in to_delete:
             db.delete(rec)
@@ -614,7 +565,6 @@ def reconcile_deleted_by_guids(
                 f"not found in Tally | window {from_date}→{to_date}"
             )
 
-        # ── PASS 2: Fix stale voucher_numbers for renumbered vouchers ────────
         surviving_guids = {r.guid for r in db_rows if r.guid in tally_guid_set}
 
         renumber_count = 0
@@ -667,10 +617,6 @@ def reconcile_deleted_by_guids(
     finally:
         db.close()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Snapshot chunk helper
-# ─────────────────────────────────────────────────────────────────────────────
 def upsert_and_advance_month(
     rows, model_class, upsert_fn,
     company_name, voucher_type, month_str, engine,
@@ -729,7 +675,6 @@ def upsert_and_advance_month(
         finally:
             db2.close()
 
-
 def get_sync_state(company_name, voucher_type, engine):
     db = _get_session(engine)
     try:
@@ -739,7 +684,6 @@ def get_sync_state(company_name, voucher_type, engine):
         ).first()
     finally:
         db.close()
-
 
 def update_sync_state(
     company_name, voucher_type, last_alter_id, engine,
@@ -753,11 +697,6 @@ def update_sync_state(
         ).first()
 
         if state:
-            # FIX: never let alter_id go backwards.
-            # Tally sometimes returns ALTERID=0 for records that haven't
-            # changed — saving 0 would wipe the real watermark and cause
-            # CDC to re-fetch the same batch on every subsequent sync.
-            # Only advance the watermark; never reduce it.
             if last_alter_id > (state.last_alter_id or 0):
                 state.last_alter_id = last_alter_id
             state.is_initial_done = is_initial_done
@@ -787,7 +726,6 @@ def update_sync_state(
     finally:
         db.close()
 
-
 def _upsert_inventory(rows, model_class, unique_fields, update_fields, engine):
     """
     Generic master upsert for Item / Ledger (alter_id-gated field update).
@@ -797,7 +735,7 @@ def _upsert_inventory(rows, model_class, unique_fields, update_fields, engine):
     """
     if not rows:
         logger.warning(f"No rows to upsert for {model_class.__tablename__}")
-        return 0, 0, 0, 0, 0   # FIX: was 4-tuple
+        return 0, 0, 0, 0, 0
 
     db = _get_session(engine)
     inserted = updated = unchanged = skipped = 0
@@ -835,8 +773,7 @@ def _upsert_inventory(rows, model_class, unique_fields, update_fields, engine):
     finally:
         db.close()
 
-    return inserted, updated, unchanged, skipped, 0   # FIX: 5-tuple
-
+    return inserted, updated, unchanged, skipped, 0
 
 def _upsert_inventory_voucher(rows, model_class, engine):
     if not rows:
@@ -854,7 +791,6 @@ def _upsert_inventory_voucher(rows, model_class, engine):
     finally:
         db.close()
 
-
 def _upsert_ledger_voucher(rows, model_class, engine):
     if not rows:
         logger.warning(f"No rows to upsert for {model_class.__tablename__}")
@@ -870,7 +806,6 @@ def _upsert_ledger_voucher(rows, model_class, engine):
         raise
     finally:
         db.close()
-
 
 def upsert_sales_vouchers(rows, engine):
     i, u, unch, s, d = _upsert_inventory_voucher(rows, SalesVoucher, engine)
@@ -904,7 +839,6 @@ def upsert_contra_vouchers(rows, engine):
     i, u, unch, s, d = _upsert_ledger_voucher(rows, ContraVoucher, engine)
     _log_result("Contra vouchers upsert", i, u, unch, s, d)
 
-
 def upsert_trial_balance(rows, engine):
     """
     Full delete + full re-insert for trial balance.
@@ -932,14 +866,12 @@ def upsert_trial_balance(rows, engine):
     db = _get_session(engine)
     inserted = 0
     try:
-        # Step 1: delete all existing rows for this company + date window
         deleted = db.query(TrialBalance).filter_by(
             company_name = company_name,
             start_date   = start_date,
             end_date     = end_date,
         ).delete(synchronize_session='fetch')
 
-        # Step 2: insert fresh rows
         skipped = 0
         for row in rows:
             if not row.get('guid'):
@@ -975,7 +907,6 @@ def upsert_trial_balance(rows, engine):
     finally:
         db.close()
 
-
 INVENTORY_MODEL_MAP = {
     'sales'       : SalesVoucher,
     'purchase'    : PurchaseVoucher,
@@ -989,11 +920,6 @@ LEDGER_MODEL_MAP = {
     'journal' : JournalVoucher,
     'contra'  : ContraVoucher,
 }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Ledger rename cascade
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _propagate_ledger_rename(
     db,
@@ -1034,9 +960,6 @@ def _propagate_ledger_rename(
         return 0
     total = 0
 
-    # ── Tables with party_name ────────────────────────────────────────────────
-    # Inventory vouchers store the party (customer/supplier) ledger name here.
-    # OutstandingData also uses party_name for the receivable party.
     for model, col_attr in (
         (SalesVoucher,      SalesVoucher.party_name),
         (PurchaseVoucher,   PurchaseVoucher.party_name),
@@ -1048,7 +971,6 @@ def _propagate_ledger_rename(
             model.company_name == company_name,
             col_attr           == old_name,
         ]
-        # Voucher tables have is_deleted; OutstandingData is always fresh (no flag)
         if hasattr(model, 'is_deleted'):
             filters.append(model.is_deleted == 'No')
 
@@ -1068,9 +990,6 @@ def _propagate_ledger_rename(
             )
         total += count
 
-    # ── Tables with ledger_name ───────────────────────────────────────────────
-    # Ledger vouchers store ALL entry ledger names (party + non-party) here.
-    # TrialBalance stores each ledger as its own row keyed by ledger_name.
     for model, col_attr in (
         (ReceiptVoucher, ReceiptVoucher.ledger_name),
         (PaymentVoucher, PaymentVoucher.ledger_name),
@@ -1103,7 +1022,6 @@ def _propagate_ledger_rename(
 
     return total
 
-
 def _propagate_item_rename(db, company_name: str, old_name: str, new_name: str) -> int:
     if not old_name or not new_name or old_name == new_name:
         return 0
@@ -1126,7 +1044,6 @@ def _propagate_item_rename(db, company_name: str, old_name: str, new_name: str) 
             )
         total += count
     return total
-
 
 def _detect_company_migration(rows: list, company_name: str, db) -> tuple[bool, str, str]:
     new_raguid = ''
@@ -1153,7 +1070,6 @@ def _detect_company_migration(rows: list, company_name: str, db) -> tuple[bool, 
     if old_raguid and old_raguid != new_raguid:
         return True, old_raguid, new_raguid
     return False, old_raguid, new_raguid
-
 
 def upsert_items(rows, engine):
     if not rows:
@@ -1299,7 +1215,6 @@ def upsert_items(rows, engine):
     finally:
         db.close()
 
-
 def _parse_date_str(val) -> "date | None":
     """Parse YYYYMMDD string → date object. Returns None on failure."""
     from datetime import date as date_type
@@ -1307,7 +1222,6 @@ def _parse_date_str(val) -> "date | None":
         return datetime.strptime(str(val)[:8], '%Y%m%d').date()
     except Exception:
         return None
-
 
 def company_import_db(data, engine):
     db = _get_session(engine)
@@ -1372,7 +1286,6 @@ def company_import_db(data, engine):
         raise
     finally:
         db.close()
-
 
 def upsert_ledgers(rows, engine):
     """
@@ -1456,12 +1369,6 @@ def upsert_ledgers(rows, engine):
                 old_alter_id     = int(existing.alter_id or 0)
                 incoming_deleted = safe.get('is_deleted') == 'Yes'
 
-                # ── Rename cascade (checked ALWAYS, independent of alter_id) ──
-                # Rule: store EXACTLY what Tally sends for this company.
-                # Lookup is always by company_name + guid so one company's ledger
-                # name never affects any other company's rows.
-                # Any name change (including case) is treated as a real rename
-                # and cascaded only within this company.
                 old_ledger_name = existing.ledger_name
                 new_ledger_name = safe.get('ledger_name', '')
                 name_changed = (
@@ -1473,7 +1380,7 @@ def upsert_ledgers(rows, engine):
                 if name_changed:
                     renamed = _propagate_ledger_rename(
                         db           = db,
-                        company_name = existing.company_name,  # always use DB value, never incoming row
+                        company_name = existing.company_name,
                         old_name     = old_ledger_name,
                         new_name     = new_ledger_name,
                     )
@@ -1484,7 +1391,6 @@ def upsert_ledgers(rows, engine):
                         f"voucher rows updated={renamed}"
                     )
 
-                # FIX: force-update is_deleted flag even if alter_id unchanged
                 if new_alter_id > old_alter_id or (incoming_deleted and existing.is_deleted != 'Yes') or name_changed:
                     _log_changes("ledger UPDATE", existing, [f for f in safe if f not in ('guid', 'company_name')], safe)
                     for field, value in safe.items():
@@ -1507,11 +1413,10 @@ def upsert_ledgers(rows, engine):
     finally:
         db.close()
 
-
 def reconcile_deleted_masters_in_db(
     company_name: str,
-    master_type:  str,   # 'items' or 'ledger'
-    tally_guids:  dict,  # {guid: name} from parse_guids()
+    master_type:  str,
+    tally_guids:  dict,
     engine,
 ) -> int:
     """
@@ -1529,8 +1434,6 @@ def reconcile_deleted_masters_in_db(
     try:
         tally_guid_set = set(tally_guids.keys())
 
-        # Fetch ALL rows for this company (including any previously soft-deleted)
-        # Hard delete removes the row entirely — no is_deleted filter needed
         active_rows = db.query(model_class).filter(
             model_class.company_name == company_name,
         ).all()
@@ -1593,11 +1496,6 @@ def upsert_outstanding(rows, engine):
     db = _get_session(engine)
     inserted = 0
     try:
-        # ── Pre-fetch ALL ledgers for this company ─────────────────────────
-        # Fetch by exact company_name first; if zero rows returned (can happen
-        # if company_name casing differs between ledger sync and outstanding sync),
-        # fall back to a case-insensitive LIKE so no company silently gets
-        # an empty parent_group_map across 40+ companies.
         party_names = {r['party_name'] for r in rows if r.get('party_name')}
 
         ledger_rows = (
@@ -1606,7 +1504,6 @@ def upsert_outstanding(rows, engine):
             .all()
         )
 
-        # Fallback: case-insensitive match if exact company_name returned nothing
         if not ledger_rows:
             logger.warning(
                 f"[{company_name}] No ledger rows found with exact company_name match — "
@@ -1618,8 +1515,6 @@ def upsert_outstanding(rows, engine):
                 .all()
             )
 
-        # Compound key: (company_name_norm, ledger_name_norm) → parent_group
-        # Prevents same ledger name across different companies from colliding
         parent_group_map: dict[tuple, str] = {
             (row.company_name.strip().lower(), row.ledger_name.strip().lower()): (row.parent_group or '')
             for row in ledger_rows
@@ -1639,7 +1534,6 @@ def upsert_outstanding(rows, engine):
                 f"Unmatched parties (no ledger master) [{company_name}]: {unmatched}"
             )
 
-        # ── Full-replace: delete then insert ──────────────────────────────
         db.query(OutstandingData).filter_by(
             company_name=company_name
         ).delete(synchronize_session='fetch')
@@ -1673,20 +1567,7 @@ def upsert_outstanding(rows, engine):
     finally:
         db.close()
 
-# ── Resync: delete all company data and reset sync state ─────────────────────
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Lock cleanup  (call after each company sync to prevent memory growth)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def cleanup_db_locks(company_name: str = '') -> None:
-    """
-    FIX (Gap 4): _DB_COMPANY_LOCKS was never cleared, growing unbounded over
-    long-running processes with many companies.  Call this after each company
-    sync (alongside cleanup_sync_state in sync_service) — it is safe to clear
-    because locks are only needed during an active sync; no lock is held across
-    sync boundaries.  Zero data impact.
-    """
     with _DB_COMPANY_LOCKS_MUTEX:
         count = len(_DB_COMPANY_LOCKS)
         _DB_COMPANY_LOCKS.clear()
@@ -1694,10 +1575,38 @@ def cleanup_db_locks(company_name: str = '') -> None:
         prefix = f"[{company_name}] " if company_name else ""
         logger.debug(f"{prefix}cleanup_db_locks: cleared {count} DB company lock(s)")
 
+def save_company_last_sync(company_name: str, engine) -> None:
+    from database.models.scheduler_config import CompanySchedulerConfig
+    db = _get_session(engine)
+    try:
+        row = db.query(CompanySchedulerConfig).filter_by(
+            company_name=company_name
+        ).first()
+        if row:
+            row.last_sync_time = datetime.utcnow()
+            db.commit()
+            logger.info(f"[{company_name}] scheduler last_sync_time saved (UTC): {row.last_sync_time}")
+        else:
+            logger.warning(f"[{company_name}] save_company_last_sync: no scheduler config row found")
+    except Exception:
+        db.rollback()
+        logger.exception(f"[{company_name}] Failed to save scheduler last_sync_time")
+    finally:
+        db.close()
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Post-sync validation  (na zyada, na kam verification)
-# ─────────────────────────────────────────────────────────────────────────────
+def get_company_last_sync(company_name: str, engine) -> datetime | None:
+    from database.models.scheduler_config import CompanySchedulerConfig
+    db = _get_session(engine)
+    try:
+        row = db.query(CompanySchedulerConfig).filter_by(
+            company_name=company_name
+        ).first()
+        return row.last_sync_time if row else None
+    except Exception:
+        logger.exception(f"[{company_name}] Failed to read scheduler last_sync_time")
+        return None
+    finally:
+        db.close()
 
 def validate_sync_count(
     company_name:   str,
@@ -1768,7 +1677,6 @@ def validate_sync_count(
     finally:
         db.close()
 
-
 def resync_company(company_name: str, engine) -> dict:
     """
     Full resync for a single company.
@@ -1795,7 +1703,6 @@ def resync_company(company_name: str, engine) -> dict:
     try:
         logger.info(f"[{company_name}] RESYNC START — deleting all company data")
 
-        # ── 1. Data tables ────────────────────────────────────────────────────
         data_models = [
             ("Ledger",          Ledger),
             ("Item",            Item),
@@ -1820,7 +1727,6 @@ def resync_company(company_name: str, engine) -> dict:
             counts[label] = n
             logger.info(f"[{company_name}] Deleted {n:>6} rows from {label}")
 
-        # ── 2. Reset sync-state watermarks ────────────────────────────────────
         n_state = (
             db.query(SyncState)
             .filter(SyncState.company_name == company_name)

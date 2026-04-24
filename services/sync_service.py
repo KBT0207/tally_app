@@ -49,14 +49,11 @@ from database.database_processor import (
     _get_session,
 )
 
-# ── Tuning constants ──────────────────────────────────────────────────────────
 SNAPSHOT_CHUNK_MONTHS = 3
 VOUCHER_WORKERS       = 1
 
-# ── Global Tally request semaphore ───────────────────────────────────────────
 _TALLY_SEMAPHORE         = threading.Semaphore(1)
 _TALLY_SEMAPHORE_TIMEOUT = 120
-
 
 def _tally_semaphore_acquire(voucher_type: str = "") -> bool:
     acquired = _TALLY_SEMAPHORE.acquire(timeout=_TALLY_SEMAPHORE_TIMEOUT)
@@ -68,7 +65,6 @@ def _tally_semaphore_acquire(voucher_type: str = "") -> bool:
         )
     return acquired
 
-# ── Per-company SyncState write lock ─────────────────────────────────────────
 _SYNC_STATE_LOCKS: dict[str, threading.Lock] = {}
 _SYNC_STATE_LOCKS_MUTEX = threading.Lock()
 
@@ -77,7 +73,6 @@ def _get_company_lock(company_name: str) -> threading.Lock:
         if company_name not in _SYNC_STATE_LOCKS:
             _SYNC_STATE_LOCKS[company_name] = threading.Lock()
         return _SYNC_STATE_LOCKS[company_name]
-
 
 def _should_sync_entity(
     entity_type: str,
@@ -98,21 +93,16 @@ def _should_sync_entity(
         (should_sync, reason, mode)
         mode = 'SNAPSHOT' or 'CDC' or 'SKIP'
     """
-    # STEP 1: Check user selection FIRST
     if not is_user_selected:
         return False, f"User did not select {entity_type}", "SKIP"
 
-    # STEP 2: If sync_state doesn't exist, user is selecting for first time
     if not sync_state_exists:
         return True, f"{entity_type} selected (first time, no sync_state)", "SNAPSHOT"
 
-    # STEP 3: If sync_state exists but snapshot not done yet
     if not is_initial_done:
         return True, f"{entity_type} selected (snapshot not done yet)", "SNAPSHOT"
 
-    # STEP 4: All conditions met for CDC
     return True, f"{entity_type} selected (ready for CDC)", "CDC"
-
 
 def cleanup_sync_state(company_name: str = "") -> None:
     """
@@ -121,20 +111,14 @@ def cleanup_sync_state(company_name: str = "") -> None:
     across repeated runs. Zero data impact — only clears in-memory lock dicts.
     """
     prefix = f"[{company_name}] " if company_name else ""
-    # cleanup
 
     with _SYNC_STATE_LOCKS_MUTEX:
         sync_lock_count = len(_SYNC_STATE_LOCKS)
         _SYNC_STATE_LOCKS.clear()
 
-    # FIX (Gap 4): also clear the DB-layer company locks so they don't grow unbounded
     cleanup_db_locks(company_name)
 
-    # locks cleared
-
     gc.collect()
-    # cleanup done
-
 
 class MemoryMonitor:
     """Tracks RSS memory and warns if growth exceeds a threshold."""
@@ -163,8 +147,6 @@ class MemoryMonitor:
             )
         return current_mb
 
-
-# ── Voucher type routing ──────────────────────────────────────────────────────
 VOUCHER_TYPE_NAMES = {
     'sales'       : None,
     'purchase'    : None,
@@ -266,14 +248,10 @@ VOUCHER_CONFIG = [
     },
 ]
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def _get_max_alter_id(rows: list) -> int:
     if not rows:
         return 0
     return max(int(r.get('alter_id', 0)) for r in rows)
-
 
 def _resolve_from_date(company: dict) -> str:
     starting_from = company.get('starting_from', '')
@@ -286,7 +264,6 @@ def _resolve_from_date(company: dict) -> str:
         f"No valid starting_from for '{company.get('name')}' — using fallback {fallback}"
     )
     return fallback
-
 
 def _generate_chunks(from_date_str: str, to_date_str: str, chunk_months: int = SNAPSHOT_CHUNK_MONTHS):
     """
@@ -316,7 +293,6 @@ def _generate_chunks(from_date_str: str, to_date_str: str, chunk_months: int = S
         next_month  = chunk_end.month + 1 if chunk_end.month < 12 else 1
         next_year   = chunk_end.year      if chunk_end.month < 12 else chunk_end.year + 1
         chunk_start = date(next_year, next_month, 1)
-
 
 def _mark_chunk_done(company_name: str, voucher_type: str, month_str: str, engine):
     """Persist progress for a chunk that returned no data."""
@@ -349,7 +325,6 @@ def _mark_chunk_done(company_name: str, voucher_type: str, month_str: str, engin
             raise
         finally:
             db.close()
-
 
 def _advance_alter_id_from_xml(
     xml:          bytes,
@@ -395,9 +370,6 @@ def _advance_alter_id_from_xml(
             f"[{company_name}][{voucher_type}] "
             f"_advance_alter_id_from_xml failed (non-fatal): {e}"
         )
-
-
-# ── Phase 3 — GUID Reconciliation ────────────────────────────────────────────
 
 def _reconcile_deleted_vouchers(
     company_name: str,
@@ -459,19 +431,8 @@ def _reconcile_deleted_vouchers(
                 )
                 continue
 
-            # Parse {guid: voucherkey} from the same XML — used by PASS 0 dedup.
-            # parse_guids_vkey uses the same sanitized XML, so no extra Tally request needed.
             tally_guid_vkeys = parse_guids_vkey(xml)
 
-            # FIX: when Tally returns 0 GUIDs for a window, two scenarios exist:
-            #   (a) The period is genuinely empty in Tally  → safe to delete all DB rows
-            #   (b) Tally had a connection/filter error      → mass delete would corrupt data
-            #
-            # To tell them apart: if the raw XML response is non-empty but yields 0 active
-            # GUIDs, that is consistent with a genuine empty period.  Log a prominent
-            # warning so the operator can verify, then proceed with reconciliation.
-            # This matches the documented contract — callers of reconcile_deleted_by_guids
-            # are responsible for deciding whether 0 GUIDs is a safe signal.
             if len(tally_guids) == 0:
                 logger.warning(
                     f"[{company_name}][{voucher_type}] "
@@ -488,7 +449,7 @@ def _reconcile_deleted_vouchers(
                 from_date           = chunk_from,
                 to_date             = chunk_to,
                 engine              = engine,
-                tally_guid_vkey_map = tally_guid_vkeys,   # ← PASS 0: auto-delete stale voucherkey duplicates
+                tally_guid_vkey_map = tally_guid_vkeys,
             )
             total_deleted += deleted_count
 
@@ -513,11 +474,6 @@ def _reconcile_deleted_vouchers(
         f"[{company_name}][{voucher_type}] "
         f"Phase 3: done | total removed={total_deleted}"
     )
-
-
-# ── Sub-sync functions ────────────────────────────────────────────────────────
-
-# ── Master GUID Reconciliation (items + ledgers) ─────────────────────────────
 
 def _reconcile_deleted_masters(
     company_name: str,
@@ -556,7 +512,6 @@ def _reconcile_deleted_masters(
         engine       = engine,
     )
     logger.info(f"[{company_name}][{master_type}] Master GUID reconciliation done | hard-deleted={deleted}")
-
 
 def _sync_trial_balance(
     company_name:     str,
@@ -609,7 +564,6 @@ def _sync_trial_balance(
 
     except Exception:
         logger.exception(f"[{company_name}] Trial Balance sync failed")
-
 
 def _sync_outstanding(
     company_name:     str,
@@ -667,7 +621,6 @@ def _sync_outstanding(
     except Exception:
         logger.exception(f"[{company_name}] Outstanding Debtors sync failed")
 
-
 def _sync_items(
     company_name:     str,
     tally:            TallyConnector,
@@ -675,7 +628,7 @@ def _sync_items(
     progress_cb=None,
     material_centre:  str = '',
     default_currency: str = 'INR',
-    is_user_selected: bool = True,  # NEW: respect UI selection
+    is_user_selected: bool = True,
 ):
     logger.info(f"[{company_name}] ═══ ITEM SYNC START ═══")
     lock = _get_company_lock(company_name)
@@ -688,7 +641,6 @@ def _sync_items(
         is_initial_done   = state.is_initial_done if state else False
         last_alter_id     = state.last_alter_id   if state else 0
 
-        # NEW: Check selection + decide mode
         should_sync, reason, sync_mode = _should_sync_entity(
             entity_type       = 'items',
             is_user_selected  = is_user_selected,
@@ -767,7 +719,6 @@ def _sync_items(
     except Exception:
         logger.exception(f"[{company_name}] Item sync failed")
 
-
 def _sync_ledgers(
     company_name:     str,
     tally:            TallyConnector,
@@ -775,7 +726,7 @@ def _sync_ledgers(
     progress_cb=None,
     material_centre:  str = '',
     default_currency: str = 'INR',
-    is_user_selected: bool = True,  # NEW: respect UI selection
+    is_user_selected: bool = True,
 ):
     logger.info(f"[{company_name}] ═══ LEDGER SYNC START ═══")
     lock = _get_company_lock(company_name)
@@ -788,7 +739,6 @@ def _sync_ledgers(
         is_initial_done   = state.is_initial_done if state else False
         last_alter_id     = state.last_alter_id   if state else 0
 
-        # NEW: Check selection + decide mode
         should_sync, reason, sync_mode = _should_sync_entity(
             entity_type       = 'ledger',
             is_user_selected  = is_user_selected,
@@ -866,7 +816,6 @@ def _sync_ledgers(
     except Exception:
         logger.exception(f"[{company_name}] Ledger sync failed")
 
-
 def _sync_voucher(
     company_name:     str,
     config:           dict,
@@ -878,7 +827,7 @@ def _sync_voucher(
     progress_cb=None,
     material_centre:  str = '',
     default_currency: str = 'INR',
-    is_user_selected: bool = True,  # NEW: respect UI selection
+    is_user_selected: bool = True,
 ):
     voucher_type     = config['voucher_type']
     snapshot_fetch   = config['snapshot_fetch']
@@ -899,7 +848,6 @@ def _sync_voucher(
         last_alter_id     = state.last_alter_id     if state else 0
         last_synced_month = state.last_synced_month if state else None
 
-        # NEW: Check selection + decide mode
         should_sync, reason, sync_mode = _should_sync_entity(
             entity_type       = voucher_type,
             is_user_selected  = is_user_selected,
@@ -913,7 +861,6 @@ def _sync_voucher(
 
         logger.info(f"[{company_name}][{voucher_type}] Proceeding: {reason}")
 
-        # ── PHASE 2: CDC mode ─────────────────────────────────────────────────
         if sync_mode == 'CDC':
             logger.info(f"[{company_name}][{voucher_type}] Phase 2: CDC | last_alter_id={last_alter_id}")
 
@@ -965,7 +912,6 @@ def _sync_voucher(
             _reconcile_deleted_vouchers(company_name, config, tally, engine, full_from, to_date)
             return
 
-        # ── PHASE 1: Snapshot mode ────────────────────────────────────────────
         elif sync_mode == 'SNAPSHOT':
             logger.info(
                 f"[{company_name}][{voucher_type}] Phase 1: SNAPSHOT "
@@ -1078,9 +1024,6 @@ def _sync_voucher(
             f"will resume from last committed chunk on next run"
         )
 
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
 def sync_company(
     company:               dict,
     tally:                 TallyConnector,
@@ -1190,9 +1133,14 @@ def sync_company(
         elapsed = (datetime.now() - start_time).total_seconds()
         logger.info(f"[{comp_name}] Sync completed in {elapsed:.1f}s")
 
+        try:
+            from database.database_processor import save_company_last_sync
+            save_company_last_sync(comp_name, engine)
+        except Exception:
+            logger.warning(f"[{comp_name}] Could not save scheduler last_sync_time")
+
     finally:
         cleanup_sync_state(comp_name)
-
 
 def sync_all_companies(
     companies:        list,
@@ -1220,7 +1168,6 @@ def sync_all_companies(
             manual_from_date      = manual_from_date,
             parallel_company_mode = False,
         )
-
 
 def sync_all_companies_parallel(
     companies:           list,
@@ -1267,9 +1214,6 @@ def sync_all_companies_parallel(
                 logger.info(f"Company '{name}' sync thread finished ✓")
             except Exception:
                 logger.error(f"Company '{name}' sync thread raised an exception")
-
-
-# ── Deep Reconcile ────────────────────────────────────────────────────────────
 
 def deep_reconcile_company(
     company:     dict,
@@ -1332,7 +1276,6 @@ def deep_reconcile_company(
         f"total deleted={total_deleted} | by type={results}"
     )
     return results
-
 
 def _count_active_rows(
     company_name: str,

@@ -34,7 +34,7 @@ logging.getLogger("PIL.PngImagePlugin").setLevel(logging.WARNING)
 try:
     import ttkbootstrap as tb
     from ttkbootstrap.constants import *
-    HAS_TTKBOOTSTRAP = False   # disabled — ttkbootstrap overrides all custom styles
+    HAS_TTKBOOTSTRAP = False
 except ImportError:
     HAS_TTKBOOTSTRAP = False
 
@@ -47,10 +47,6 @@ from gui.styles import (
 )
 from gui.tray_manager import TrayManager
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Main Application Class
-# ─────────────────────────────────────────────────────────────────────────────
 class TallySyncApp:
 
     def __init__(self):
@@ -58,38 +54,27 @@ class TallySyncApp:
         self._q             = queue.Queue()
         self._frames        = {}
         self._active_page   = None
-        self._config        = ConfigManager()   # ← Phase 1: replaces .env
+        self._config        = ConfigManager()
 
-        # ── Build root window (hidden until setup complete) ──
         self._build_root()
 
-        # ── Phase 1: Run setup wizard if needed BEFORE showing main UI ──
         if not self._run_setup_if_needed():
-            # User cancelled setup — exit cleanly
             self.root.destroy()
             return
 
-        # ── Setup complete — load config into AppState ────────
         self._apply_config_to_state()
 
-        # ── Build the main UI ─────────────────────────────────
         self._build_layout()
         self._build_sidebar()
         self._build_header()
         self._build_content_area()
         self._load_pages()
 
-        # Show main window now
         self.root.deiconify()
 
-        # Listen for sync_finished to detect post-snapshot completion
         self.state.on("sync_finished", self._on_sync_finished_app)
         self._snapshot_celebrated: set = set()
 
-        # ── Phase 1: System Tray ──────────────────────────────────────────────
-        # TrayManager intercepts ✖ close → hides to tray instead of quitting.
-        # If pystray is not installed, tray is silently skipped and ✖ closes
-        # the app normally (same as before).
         self._syncs_paused = False
         self._tray = TrayManager(
             root             = self.root,
@@ -100,21 +85,15 @@ class TallySyncApp:
         )
         self._tray.start()
 
-        # ── Start background startup sequence ─────────────────
         self._start_startup_sequence()
         self._poll_queue()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Root window
-    # ─────────────────────────────────────────────────────────────────────────
     def _build_root(self):
-        # Tell Windows this app handles its own DPI scaling.
-        # Prevents Windows from blurring the UI at 125%/150% on laptops.
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             try:
-                ctypes.windll.user32.SetProcessDPIAware()   # Fallback
+                ctypes.windll.user32.SetProcessDPIAware()
             except Exception:
                 pass
 
@@ -128,10 +107,8 @@ class TallySyncApp:
         self.root.minsize(Layout.MIN_WIDTH, Layout.MIN_HEIGHT)
         self.root.configure(bg=Color.BG_ROOT)
 
-        # Hide main window until setup is done
         self.root.withdraw()
 
-        # Center on screen
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
@@ -141,9 +118,6 @@ class TallySyncApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Phase 1: Setup wizard gate
-    # ─────────────────────────────────────────────────────────────────────────
     def _run_setup_if_needed(self) -> bool:
         """
         Check if setup is needed. If yes, show the wizard.
@@ -155,15 +129,12 @@ class TallySyncApp:
           2. setup_complete = False — previous run failed or was cancelled
           3. DB connection fails with existing config — credentials changed
         """
-        # Case 1 & 2: No config or setup not marked complete
         if not self._config.is_setup_complete():
             return self._show_setup_wizard(error_msg="")
 
-        # Case 3: Config exists and setup_complete=True, but DB might be unreachable
         db_cfg = self._config.get_db_config()
         ok, detail = self._test_db_connection(db_cfg)
         if not ok:
-            # Mark incomplete so next launch also shows wizard
             self._config.mark_setup_incomplete()
             error = (
                 f"Could not connect to the database with saved settings:\n\n"
@@ -172,7 +143,7 @@ class TallySyncApp:
             )
             return self._show_setup_wizard(error_msg=error)
 
-        return True   # All good — existing config works
+        return True
 
     def _show_setup_wizard(self, error_msg: str = "") -> bool:
         """Show the setup wizard. Returns True if completed, False if cancelled."""
@@ -201,9 +172,6 @@ class TallySyncApp:
         except Exception as e:
             return False, str(e)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Phase 1: Apply config to AppState
-    # ─────────────────────────────────────────────────────────────────────────
     def _apply_config_to_state(self):
         """
         Load config from ConfigManager into AppState.
@@ -212,17 +180,12 @@ class TallySyncApp:
         db_cfg    = self._config.get_db_config()
         tally_cfg = self._config.get_tally_config()
 
-        # Store on AppState so all controllers can access
         self.state.db_config    = db_cfg
         self.state.tally_config = tally_cfg
 
-        # Apply tally defaults to TallyConnectionState
         self.state.tally.host = tally_cfg.get("host", "localhost")
         self.state.tally.port = int(tally_cfg.get("port", 9000))
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Main layout
-    # ─────────────────────────────────────────────────────────────────────────
     def _build_layout(self):
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
@@ -240,9 +203,6 @@ class TallySyncApp:
         self.main_frame.rowconfigure(1, weight=1)
         self.main_frame.columnconfigure(0, weight=1)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Sidebar
-    # ─────────────────────────────────────────────────────────────────────────
     def _build_sidebar(self):
         f = self.sidebar_frame
 
@@ -270,10 +230,6 @@ class TallySyncApp:
             btn = self._make_nav_button(nav_container, item)
             self._nav_buttons[item["page"]] = btn
 
-        # ── bottom section (packs upward via side="bottom") ──────────────────
-        # Pack order determines visual order: first packed = lowest, last = highest
-
-        # 1. Tally status + version — sits at the very bottom
         bottom = tk.Frame(f, bg=Color.BG_SIDEBAR)
         bottom.pack(side="bottom", fill="x", padx=Spacing.MD, pady=Spacing.LG)
 
@@ -296,10 +252,8 @@ class TallySyncApp:
             anchor="w",
         ).pack(fill="x")
 
-        # 2. Separator line — above the bottom section
         tk.Frame(f, bg=Color.SIDEBAR_HOVER_BG, height=1).pack(side="bottom", fill="x")
 
-        # 3. Check for Updates button — above the separator
         self._update_btn = tk.Label(
             f,
             text="↑ Check for Updates",
@@ -364,9 +318,6 @@ class TallySyncApp:
             for w in btn._widgets:
                 w.configure(bg=bg)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Header bar
-    # ─────────────────────────────────────────────────────────────────────────
     def _build_header(self):
         header = tk.Frame(
             self.main_frame,
@@ -401,7 +352,6 @@ class TallySyncApp:
         self._clock_lbl.pack(side="left")
         self._update_clock()
 
-        # ⚙ Settings button — opens setup wizard to let user change DB/Tally config
         tk.Button(
             right, text="⚙",
             font=Font.BODY, bg=Color.BG_HEADER, fg=Color.TEXT_SECONDARY,
@@ -418,18 +368,12 @@ class TallySyncApp:
         self._clock_lbl.configure(text=now)
         self.root.after(1000, self._update_clock)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Content area
-    # ─────────────────────────────────────────────────────────────────────────
     def _build_content_area(self):
         self.content_frame = tk.Frame(self.main_frame, bg=Color.BG_ROOT)
         self.content_frame.grid(row=1, column=0, sticky="nsew")
         self.content_frame.rowconfigure(0, weight=1)
         self.content_frame.columnconfigure(0, weight=1)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Page management
-    # ─────────────────────────────────────────────────────────────────────────
     def _load_pages(self):
         from gui.pages.home_page      import HomePage
         from gui.pages.sync_page      import SyncPage
@@ -461,7 +405,6 @@ class TallySyncApp:
         if page_key not in self._frames:
             return
 
-        # Notify the current page it's being hidden (e.g. logs stops tail polling)
         if self._active_page and self._active_page != page_key:
             prev = self._frames.get(self._active_page)
             if prev and hasattr(prev, "on_hide"):
@@ -484,9 +427,6 @@ class TallySyncApp:
         if hasattr(page, "on_show"):
             page.on_show()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Phase 1: Startup sequence — uses ConfigManager, not .env
-    # ─────────────────────────────────────────────────────────────────────────
     def _start_startup_sequence(self):
         threading.Thread(target=self._startup_worker, daemon=True).start()
 
@@ -517,7 +457,6 @@ class TallySyncApp:
         """
         from logging_config import logger
 
-        # ── Step 1: Connect to database ───────────────────────────────────────
         try:
             db_cfg = self._config.get_db_config()
             engine = self._create_engine(db_cfg)
@@ -527,31 +466,24 @@ class TallySyncApp:
             self._q.put(("db_status", False, str(e)))
             return
 
-        # ── Step 2: Load companies from DB ────────────────────────────────────
         try:
             self._load_companies_from_db(engine)
         except Exception as e:
             self._q.put(("error", f"Failed to load companies: {e}"))
 
-        # ── Step 3: Load scheduler config from DB ─────────────────────────────
         try:
             from gui.controllers.company_controller import CompanyController
             CompanyController(self.state).load_scheduler_config()
         except Exception as e:
             logger.warning(f"[App] Could not load scheduler config: {e}")
 
-        # ── Step 4: Load TallySettings + AutomationSettings ───────────────────
         try:
             self._load_automation_settings(engine)
         except Exception as e:
             logger.warning(f"[App] Could not load automation settings: {e}")
 
-        # ── Step 5: Notify GUI — companies ready ──────────────────────────────
         self._q.put(("companies_loaded", None))
 
-        # ── Step 6: Start SyncQueueController ────────────────────────────────
-        # Must start BEFORE scheduler so missed syncs can be queued
-        # BEFORE APScheduler fires any jobs.
         try:
             from gui.controllers.sync_queue_controller import SyncQueueController
             self._sync_queue_controller = SyncQueueController(self.state, self._q)
@@ -561,14 +493,6 @@ class TallySyncApp:
             logger.warning(f"[App] Could not start SyncQueueController: {e}")
             self._sync_queue_controller = None
 
-        # ── Step 7: Run MissedSyncChecker ────────────────────────────────────
-        # CRITICAL: Must run BEFORE SchedulerController.start().
-        # Reason: APScheduler.start() may immediately fire persisted jobs,
-        # which call enqueue() and set _round_active=True. If MissedSyncChecker
-        # runs after that, its enqueue() calls are blocked by Rule 1 Check 3
-        # (_round_active=True + company in _round_companies → skip).
-        # Running it here guarantees missed companies are queued first,
-        # and APScheduler fires AFTER they are already in the round.
         if self._sync_queue_controller:
             try:
                 from gui.controllers.missed_sync_checker import MissedSyncChecker
@@ -582,11 +506,6 @@ class TallySyncApp:
             except Exception as e:
                 logger.warning(f"[App] Missed sync check failed: {e}")
 
-        # ── Step 8: Start SchedulerController ────────────────────────────────
-        # Starts LAST so APScheduler jobs fire only after:
-        #   - SyncQueueController is running and ready
-        #   - Missed syncs are already in the queue
-        # Wire SyncQueueController in immediately so all jobs use the queue.
         try:
             from gui.controllers.scheduler_controller import SchedulerController
             self._scheduler_controller = SchedulerController(
@@ -599,14 +518,8 @@ class TallySyncApp:
             logger.warning(f"[App] Could not start scheduler: {e}")
             self._scheduler_controller = None
 
-        # ── Step 9: Notify GUI — scheduler fully ready ────────────────────────
-        # Fires AFTER both SyncQueueController and SchedulerController started.
-        # Scheduler page uses this event to wire up _sched_ctrl and show
-        # correct status + next_run times. "companies_loaded" (Step 5) fires
-        # too early — before the scheduler starts — so we need this second event.
         self._q.put(("scheduler_ready", None))
 
-        # ── Step 10: Ping Tally ───────────────────────────────────────────────
         try:
             from services.tally_connector import TallyConnector
             tally     = TallyConnector(
@@ -650,7 +563,6 @@ class TallySyncApp:
         Session = sessionmaker(bind=engine)
         db      = Session()
         try:
-            # ── TallySettings ─────────────────────────────
             ts = db.query(TallySettings).filter_by(id=1).first()
             if not ts:
                 ts = TallySettings(id=1)
@@ -658,7 +570,6 @@ class TallySyncApp:
                 db.commit()
             self.state.tally_exe_path = ts.exe_path or ""
 
-            # Store full image map on state for Phase 2 TallyLauncher
             self.state.tally_images = {
                 "gateway":      ts.image_gateway      or "tally_gateway_screen.png",
                 "search_box":   ts.image_search_box   or "tally_company_search_box.png",
@@ -673,7 +584,6 @@ class TallySyncApp:
                 "change_period": getattr(ts, 'image_change_period', None) or "tally_change_period.png",
             }
 
-            # ── AutomationSettings ────────────────────────
             aut = db.query(AutomationSettings).filter_by(id=1).first()
             if not aut:
                 aut = AutomationSettings(id=1)
@@ -696,13 +606,11 @@ class TallySyncApp:
         finally:
             db.close()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Load companies (unchanged from original)
-    # ─────────────────────────────────────────────────────────────────────────
     def _load_companies_from_db(self, engine):
         from sqlalchemy.orm import sessionmaker
-        from database.models.company    import Company
-        from database.models.sync_state import SyncState
+        from database.models.company          import Company
+        from database.models.sync_state       import SyncState
+        from database.models.scheduler_config import CompanySchedulerConfig
         from collections import defaultdict
 
         Session = sessionmaker(bind=engine)
@@ -710,11 +618,15 @@ class TallySyncApp:
         try:
             db_companies = {co.name: co for co in db.query(Company).all()}
 
-            # Load ALL SyncState rows in one query instead of one query per company (N+1 fix)
             all_states = db.query(SyncState).all()
             states_by_company = defaultdict(list)
             for s in all_states:
                 states_by_company[s.company_name].append(s)
+
+            all_sched_configs = {
+                sc.company_name: sc
+                for sc in db.query(CompanySchedulerConfig).all()
+            }
 
             for name, co in db_companies.items():
                 states = states_by_company.get(name, [])
@@ -725,12 +637,13 @@ class TallySyncApp:
                 last_month = None
 
                 if states:
-                    times = [s.last_sync_time for s in states if s.last_sync_time]
-                    if times:
-                        last_sync = max(times)
+                    times      = [s.last_sync_time for s in states if s.last_sync_time]
                     last_alter = max(s.last_alter_id for s in states)
-                    # is_initial_done: True when the 4 core inventory types are all done.
-                    # This avoids forcing a full re-snapshot if a minor type failed mid-snapshot.
+                    sched_cfg  = all_sched_configs.get(name)
+                    if sched_cfg and sched_cfg.last_sync_time:
+                        last_sync = sched_cfg.last_sync_time.replace(tzinfo=None)
+                    elif times:
+                        last_sync = max(times)
                     core_types = {'sales', 'purchase', 'credit_note', 'debit_note'}
                     done_types = {s.voucher_type for s in states if s.is_initial_done}
                     is_initial = core_types.issubset(done_types)
@@ -773,7 +686,6 @@ class TallySyncApp:
         finally:
             db.close()
 
-        # Fetch live Tally companies
         tally_companies = []
         try:
             from services.tally_connector import TallyConnector
@@ -783,8 +695,6 @@ class TallySyncApp:
             )
             if tally.status == "Connected":
                 tally_companies = tally.fetch_all_companies()
-
-                # Tally companies stay in-memory only until user clicks Configure.
 
         except Exception as e:
             from logging_config import logger
@@ -806,7 +716,6 @@ class TallySyncApp:
                 self.state.companies[name].tally_open = True
                 if not self.state.companies[name].books_from and books_str:
                     self.state.companies[name].books_from = books_str
-                # Always update these from Tally — they're read-only Tally fields
                 if tc.get('formal_name'):
                     self.state.companies[name].formal_name    = tc['formal_name']
                 if tc.get('company_number'):
@@ -907,9 +816,6 @@ class TallySyncApp:
         finally:
             db.close()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Queue polling
-    # ─────────────────────────────────────────────────────────────────────────
     def _poll_queue(self):
         try:
             while True:
@@ -929,7 +835,6 @@ class TallySyncApp:
                 self._db_status_lbl.configure(text="● DB: Connected", fg=Color.SUCCESS)
             else:
                 self._db_status_lbl.configure(text="● DB: Error", fg=Color.DANGER)
-                # Offer to reconfigure
                 if messagebox.askyesno(
                     "Database Connection Error",
                     f"{detail}\n\nWould you like to reconfigure the database connection?",
@@ -950,14 +855,9 @@ class TallySyncApp:
             sched = self._frames.get("scheduler")
             if sched and hasattr(sched, "refresh_companies"):
                 sched.refresh_companies()
-            # Update tray tooltip with new company count
             if hasattr(self, '_tray'):
                 self._tray.update_tooltip()
 
-        # ── Scheduler fully ready — fire AFTER scheduler + queue both started ──
-        # This is the correct moment to wire up the scheduler page because
-        # _sched_ctrl is now available. "companies_loaded" fires too early
-        # (before scheduler starts) which caused "Not running" on first open.
         elif event == "scheduler_ready":
             sched = self._frames.get("scheduler")
             if sched and hasattr(sched, "on_scheduler_ready"):
@@ -993,7 +893,6 @@ class TallySyncApp:
             _, company_name, err = msg
             self.state.set_company_status(company_name, CompanyStatus.SYNC_ERROR)
 
-        # ── Phase 2: SyncQueueController messages ──────────────────────────
         elif event == "sync_queue_done":
             _, company_name, success = msg
             self.state.emit("scheduler_updated", company=company_name)
@@ -1013,23 +912,19 @@ class TallySyncApp:
             self.state.set_company_status(company_name, CompanyStatus.SYNCING)
 
         elif event == "queue_updated":
-            # Queue state changed — update card queue labels (lightweight, no rebuild)
             home = self._frames.get("home")
             if home and hasattr(home, "_refresh_cards_queue_state"):
                 home.after(0, home._refresh_cards_queue_state)
             elif home and hasattr(home, "refresh_companies"):
-                home.refresh_companies()   # fallback
-            # Also refresh queue status strip on scheduler page
+                home.refresh_companies()
             sched = self._frames.get("scheduler")
             if sched and hasattr(sched, "refresh_queue_status"):
                 sched.refresh_queue_status()
 
-        # ── Phase 2: Missed sync catch-up notification ─────────────────────────
         elif event == "missed_syncs_found":
             _, company_names = msg
             self._show_missed_sync_banner(company_names)
 
-        # ── Phase 1 Fix 2: Round overrun notification ──────────────────────────
         elif event == "sync_overrun_detected":
             _, companies, elapsed_min, interval_min, suggested_min = msg
             self._show_overrun_banner(companies, elapsed_min, interval_min, suggested_min)
@@ -1037,9 +932,6 @@ class TallySyncApp:
     def post(self, *args):
         self._q.put(args)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Phase 2 — Missed sync notification banner
-    # ─────────────────────────────────────────────────────────────────────────
     def _show_missed_sync_banner(self, company_names: list):
         """
         Show a non-blocking notification banner at the top of the main window
@@ -1065,21 +957,17 @@ class TallySyncApp:
         from gui.styles import Color, Font, Spacing
         import tkinter as tk
 
-        # Banner frame — insert above content_frame
         banner = tk.Frame(
             self.main_frame,
             bg     = Color.WARNING_BG,
             relief = "flat",
             bd     = 0,
         )
-        # Place it between header (row 0) and content (row 1)
-        # by temporarily re-gridding content_frame to row 2
         self.content_frame.grid(row=2, column=0, sticky="nsew")
         self.main_frame.rowconfigure(1, weight=0)
         self.main_frame.rowconfigure(2, weight=1)
         banner.grid(row=1, column=0, sticky="ew")
 
-        # Separator line at top
         tk.Frame(banner, bg=Color.WARNING_FG, height=1).pack(fill="x")
 
         inner = tk.Frame(banner, bg=Color.WARNING_BG, padx=Spacing.LG, pady=Spacing.SM)
@@ -1100,7 +988,6 @@ class TallySyncApp:
         def _dismiss():
             try:
                 banner.destroy()
-                # Restore content_frame to row 1
                 self.content_frame.grid(row=1, column=0, sticky="nsew")
                 self.main_frame.rowconfigure(1, weight=1)
                 self.main_frame.rowconfigure(2, weight=0)
@@ -1119,18 +1006,13 @@ class TallySyncApp:
             command = _dismiss,
         ).grid(row=0, column=1, sticky="e", padx=(Spacing.LG, 0))
 
-        # Separator line at bottom
         tk.Frame(banner, bg=Color.BORDER, height=1).pack(fill="x")
 
-        # Auto-dismiss after 8 seconds
         self.root.after(8000, _dismiss)
 
         from logging_config import logger
         logger.info(f"[App] Missed sync banner shown for: {company_names}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Phase 1 Fix 2 — Overrun notification banner
-    # ─────────────────────────────────────────────────────────────────────────
     def _show_overrun_banner(
         self,
         companies:    list,
@@ -1226,7 +1108,6 @@ class TallySyncApp:
 
         tk.Frame(banner, bg=Color.BORDER, height=1).pack(fill="x")
 
-        # Auto-dismiss after 12 seconds (longer than missed sync — more important)
         self.root.after(12_000, _dismiss)
 
         from logging_config import logger
@@ -1235,9 +1116,6 @@ class TallySyncApp:
             f"{elapsed_min:.0f}min round vs {interval_min:.0f}min interval"
         )
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Post-snapshot celebration
-    # ─────────────────────────────────────────────────────────────────────────
     def _on_sync_finished_app(self):
         self._check_post_snapshot_companies()
 
@@ -1264,9 +1142,6 @@ class TallySyncApp:
             self.state.selected_companies = [co.name]
             self.navigate("scheduler")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Open DB/Tally settings (from header ⚙ button or after DB error)
-    # ─────────────────────────────────────────────────────────────────────────
     def open_db_settings(self):
         """
         Re-open the setup wizard so user can change DB or Tally config.
@@ -1274,17 +1149,14 @@ class TallySyncApp:
         """
         from gui.components.setup_wizard import SetupWizard
 
-        # Temporarily mark setup incomplete so wizard shows both steps
         self._config.mark_setup_incomplete()
 
         wizard = SetupWizard(self.root, self._config)
         self.root.wait_window(wizard)
 
         if wizard.completed:
-            # Re-apply new config to state
             self._apply_config_to_state()
 
-            # Reconnect DB with new credentials
             try:
                 if self.state.db_engine:
                     self.state.db_engine.dispose()
@@ -1292,7 +1164,6 @@ class TallySyncApp:
                 self.state.db_engine = self._create_engine(db_cfg)
                 self._db_status_lbl.configure(text="● DB: Connected", fg=Color.SUCCESS)
 
-                # Reload companies with new DB
                 self._load_companies_from_db(self.state.db_engine)
                 home = self._frames.get("home")
                 if home and hasattr(home, "refresh_companies"):
@@ -1301,12 +1172,8 @@ class TallySyncApp:
             except Exception as e:
                 messagebox.showerror("Reconnect Failed", str(e))
         else:
-            # Wizard cancelled — restore setup_complete so app continues
             self._config.mark_setup_complete()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Phase 1 — Tray helpers
-    # ─────────────────────────────────────────────────────────────────────────
     def _show_window(self):
         """Bring the main window back from the tray."""
         self._tray.show_window()
@@ -1333,7 +1200,6 @@ class TallySyncApp:
         from logging_config import logger
         logger.info(f"[App] Scheduled syncs {status} via tray")
 
-        # Refresh tray tooltip
         self._tray.update_tooltip()
         return self._syncs_paused
 
@@ -1363,12 +1229,6 @@ class TallySyncApp:
         self._tray.stop()
         self.root.destroy()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Shutdown — ✖ button now hides to tray instead of closing
-    # ─────────────────────────────────────────────────────────────────────────
-    # ─────────────────────────────────────────────────────────────────────
-    #  Update checker
-    # ─────────────────────────────────────────────────────────────────────
     def _check_for_updates(self):
         """Check public gist for a newer version and notify the user."""
         if not GIST_VERSION_URL:
@@ -1459,7 +1319,6 @@ class TallySyncApp:
         dialog.grab_set()
         dialog.configure(bg=Color.BG_CARD)
 
-        # Center over main window
         self.root.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width()  // 2) - 175
         y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 90
@@ -1521,7 +1380,6 @@ class TallySyncApp:
           - If tray is NOT available (pystray not installed) → ask and quit
         """
         if not self._tray.available:
-            # No tray — fall back to original close behaviour
             if self.state.sync_active:
                 if not messagebox.askyesno(
                     "Sync in Progress",
@@ -1531,7 +1389,6 @@ class TallySyncApp:
             self._do_shutdown()
             return
 
-        # Tray is available — check if sync is active first
         if self.state.sync_active:
             if not messagebox.askyesno(
                 "Sync in Progress",
@@ -1540,11 +1397,7 @@ class TallySyncApp:
             ):
                 return
 
-        # Hide to tray — scheduler and queue keep running
         self._tray.hide_to_tray()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Entry point
-    # ─────────────────────────────────────────────────────────────────────────
     def run(self):
         self.root.mainloop()
