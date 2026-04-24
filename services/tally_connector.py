@@ -13,32 +13,18 @@ from urllib3.util.retry import Retry
 from logging_config import logger
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  EXE-safe resource path  (dev: relative to project root, EXE: _MEIPASS)
-# ─────────────────────────────────────────────────────────────────────────────
 def _resource_path(relative: str) -> str:
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        base = sys._MEIPASS  # type: ignore[attr-defined]
+        base = sys._MEIPASS
     else:
-        # services/tally_connector.py  →  one folder up = project root
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative.replace("/", os.sep))
 
 
 class TallyConnector:
-    """
-    HTTP connector to a locally-running Tally Prime instance.
-
-    Handles:
-      • XML template loading & caching
-      • Request preparation (date range, CDC AlterID substitution)
-      • Response sanitisation for safe XML parsing
-      • Debug file saving
-      • All fetch methods for every voucher / master type
-    """
 
     _xml_template_cache: Dict[str, ET.Element] = {}
-    _xml_template_cache_lock = threading.Lock()  # guards concurrent writes to the cache
+    _xml_template_cache_lock = threading.Lock()
 
     def __init__(self, host='localhost', port=9000, timeout=(60, 1800), max_retries=3):
         self.host    = host
@@ -50,8 +36,6 @@ class TallyConnector:
         self.session = self._create_session(max_retries)
         logger.info(f'Initializing TallyConnector → {self.url}')
         self.connect()
-
-    # ── Session / connection ──────────────────────────────────────────────────
 
     def _create_session(self, max_retries: int) -> requests.Session:
         session = requests.Session()
@@ -81,18 +65,16 @@ class TallyConnector:
             self.status = 'Disconnected'
             logger.warning(f'Tally returned status {response.status_code}')
             return False
+        except requests.exceptions.ConnectionError:
+            self.status = 'Disconnected'
+            logger.error(f'Cannot connect to Tally at {self.url} — make sure Tally is open and HTTP port is enabled.')
+            return False
         except Exception as e:
             self.status = 'Disconnected'
-            logger.error(f'Cannot connect to Tally: {e}', exc_info=True)
+            logger.error(f'Tally connection failed: {e}')
             return False
 
     def ping(self) -> bool:
-        """
-        Quick connectivity check — used by setup wizard and settings page.
-        Returns True if Tally responds, False otherwise.
-        Does NOT update self.status — non-destructive.
-        Uses a short 8s timeout so the UI doesn't freeze.
-        """
         try:
             response = self.session.post(
                 url=self.url, headers=self.header, timeout=8
@@ -101,12 +83,8 @@ class TallyConnector:
         except Exception:
             return False
 
-    # ── XML template management ───────────────────────────────────────────────
-
     @classmethod
     def _load_xml_template(cls, template_path: str) -> ET.Element:
-        # Double-checked locking: fast path (no lock) for already-cached entries,
-        # slow path (with lock) for the first load of each template.
         if template_path not in cls._xml_template_cache:
             with cls._xml_template_cache_lock:
                 if template_path not in cls._xml_template_cache:
@@ -136,7 +114,6 @@ class TallyConnector:
 
         xml_str = ET.tostring(root, encoding='unicode')
 
-        # Substitute text placeholders that can't be placed as XML elements
         alter_id_value = alter_id if alter_id is not None else 0
         xml_str = xml_str.replace('PLACEHOLDER_ALTER_ID',  str(alter_id_value))
         xml_str = xml_str.replace('PLACEHOLDER_FROM_DATE', from_date or '')
@@ -144,19 +121,8 @@ class TallyConnector:
 
         return xml_str.encode('utf-8')
 
-    # ── Response sanitisation ─────────────────────────────────────────────────
-
     @staticmethod
     def sanitize_xml(xml_content) -> bytes:
-        """
-        Decode, strip control characters, and fix unescaped ampersands so the
-        response can be safely parsed by ElementTree.
-
-        NOTE: Tally uses '?' as a placeholder for the home/base currency symbol.
-              This is intentional — do NOT strip or replace it.  The FCY parsers
-              in data_processor.py rely on it to detect exchange-rate patterns
-              such as '? 84.5/$'.
-        """
         if isinstance(xml_content, bytes):
             for encoding in ('utf-8', 'windows-1252', 'latin-1'):
                 try:
@@ -167,44 +133,32 @@ class TallyConnector:
 
         xml_content = str(xml_content)
 
-        # Log which foreign-currency symbols are present (debug only)
         _known_symbols = {
             '$': 'USD', '£': 'GBP', '€': 'EUR', '¥': 'JPY/CNY',
             '₹': 'INR', '₨': 'INR/PKR', '₩': 'KRW', '₱': 'PHP',
             '₽': 'RUB', '₺': 'TRY', '₪': 'ILS', '₦': 'NGN',
             '฿': 'THB', '₫': 'VND',
-            # '?' is intentionally excluded — it is Tally's home-currency marker,
-            # NOT a corrupt byte, and must be preserved for FCY parsing.
         }
         found = [f"{sym}({cur})" for sym, cur in _known_symbols.items() if sym in xml_content]
         if found:
             logger.debug(f'Currency symbols in response: {", ".join(found)}')
 
-        # Strip truly invalid XML control characters (except \t \n \r which are fine)
         xml_content = re.sub(r'&#([0-8]|1[1-2]|1[4-9]|2[0-9]|3[0-1]);', '', xml_content)
         xml_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', xml_content)
 
-        # Fix bare & that are not part of a valid entity reference
         xml_content = re.sub(
             r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)',
             '&amp;',
             xml_content,
         )
 
-        # Fix unbound namespace prefixes (e.g. <UDF:FIELD> without xmlns:UDF="...").
-        # Tally sometimes omits the xmlns declaration for UDF and other custom prefixes,
-        # which causes ElementTree to raise "unbound prefix" and reject the entire response.
-        # Strategy: detect all prefix:TAG patterns, find which prefixes have no xmlns: declaration,
-        # and inject a dummy declaration into the root element so ElementTree accepts the XML.
-        # The UDF fields themselves are ignored by the parser — only standard Tally tags are read.
-        used_prefixes    = set(re.findall(r'<([A-Za-z][A-Za-z0-9_]*):[A-Za-z]', xml_content))
+        used_prefixes     = set(re.findall(r'<([A-Za-z][A-Za-z0-9_]*):[A-Za-z]', xml_content))
         declared_prefixes = set(re.findall(r'xmlns:([A-Za-z][A-Za-z0-9_]*)\s*=', xml_content))
-        missing_prefixes = used_prefixes - declared_prefixes
+        missing_prefixes  = used_prefixes - declared_prefixes
         if missing_prefixes:
             ns_decls = ' '.join(
                 f'xmlns:{p}="urn:tally-{p}"' for p in sorted(missing_prefixes)
             )
-            # Inject into the first opening tag of the document
             xml_content = re.sub(
                 r'(<[A-Za-z][^>]*?)>',
                 lambda m: m.group(1) + ' ' + ns_decls + '>',
@@ -217,8 +171,6 @@ class TallyConnector:
             )
 
         return xml_content.encode('utf-8')
-
-    # ── Debug helpers ─────────────────────────────────────────────────────────
 
     def _save_debug_file(
         self,
@@ -234,8 +186,6 @@ class TallyConnector:
             f.write(content)
         logger.info(f'Saved debug file: {filename}')
         return filename
-
-    # ── Core fetch ────────────────────────────────────────────────────────────
 
     def _fetch(
         self,
@@ -278,6 +228,9 @@ class TallyConnector:
             except requests.exceptions.Timeout:
                 logger.error(f'[{company_name}] Timeout fetching {data_type}')
                 return None
+            except requests.exceptions.ConnectionError:
+                logger.error(f'[{company_name}] Tally not reachable — make sure Tally is open and HTTP port is enabled.')
+                return None
 
             if response.status_code != 200:
                 logger.error(f'[{company_name}] HTTP {response.status_code} for {data_type}')
@@ -305,13 +258,10 @@ class TallyConnector:
             return self.sanitize_xml(response.content)
 
         except Exception as e:
-            logger.error(
-                f'[{company_name}] Unexpected error fetching {data_type}: {e}', exc_info=True
-            )
+            logger.error(f'[{company_name}] Unexpected error fetching {data_type}: {e}')
             return None
 
     def _verify_alter_id_filter(self, raw_content: bytes, alter_id: int, data_type: str):
-        """Log a warning if any returned records are at or below the CDC threshold."""
         try:
             sanitized = self.sanitize_xml(raw_content)
             root      = ET.fromstring(sanitized)
@@ -333,8 +283,6 @@ class TallyConnector:
                 )
         except Exception as e:
             logger.debug(f'[ALTER_ID CHECK] {data_type} | could not inspect response: {e}')
-
-    # ── Company master ────────────────────────────────────────────────────────
 
     def fetch_all_companies(self, debug: bool = False) -> list:
         try:
@@ -368,7 +316,7 @@ class TallyConnector:
             return companies
 
         except Exception as e:
-            logger.error(f'fetch_all_companies error: {e}', exc_info=True)
+            logger.error(f'fetch_all_companies error: {e}')
             return []
 
     @staticmethod
@@ -382,7 +330,6 @@ class TallyConnector:
             'books_from'    : (company.findtext('BOOKSFROM',              '') or '').strip(),
             'audited_upto'  : (company.findtext('AUDITEDUPTO',            '') or '').strip(),
         }
-    # ── Master fetches ────────────────────────────────────────────────────────
 
     def fetch_ledgers(
         self,
@@ -424,8 +371,6 @@ class TallyConnector:
             company_name, alter_id=last_alter_id, debug=debug,
         )
 
-    # ── Inventory voucher fetches (snapshot) ──────────────────────────────────
-
     def fetch_sales(
         self,
         company_name: str,
@@ -462,8 +407,6 @@ class TallyConnector:
     ) -> Optional[bytes]:
         return self._fetch('utils/debit_note.xml', 'Debit Note', company_name, from_date, to_date, debug=debug)
 
-    # ── Ledger voucher fetches (snapshot) ─────────────────────────────────────
-
     def fetch_receipt(
         self,
         company_name: str,
@@ -499,8 +442,6 @@ class TallyConnector:
         debug:        bool          = False,
     ) -> Optional[bytes]:
         return self._fetch('utils/contra_vouchers.xml', 'Contra', company_name, from_date, to_date, debug=debug)
-
-    # ── CDC fetches ───────────────────────────────────────────────────────────
 
     def fetch_sales_cdc(
         self,
@@ -589,11 +530,6 @@ class TallyConnector:
             'utils/cdc/debit_cdc.xml', 'Debit Note CDC',
             company_name, alter_id=last_alter_id, debug=debug,
         )
-
-    # ── GUID reconciliation fetches (Phase 3) ────────────────────────────────
-    # Lightweight calls — only fetch GUID + VOUCHERKEY + DATE for a date window.
-    # Used by _reconcile_deleted_vouchers() in sync_service to detect missed deletes.
-    # SAFE FAILURE: _fetch() returns None on any error — callers must handle None.
 
     def fetch_sales_guids(
         self,
@@ -691,8 +627,6 @@ class TallyConnector:
             company_name, from_date=from_date, to_date=to_date, debug=debug,
         )
 
-    # ── Report fetches ────────────────────────────────────────────────────────
-
     def fetch_trial_balance(
         self,
         company_name: str,
@@ -720,15 +654,11 @@ class TallyConnector:
     ) -> Optional[bytes]:
         return self._fetch('utils/reports/profit_loss.xml', 'Profit & Loss', company_name, from_date, to_date, debug=debug)
 
-
-# ── Item (StockItem) master fetches ───────────────────────────────────────
-
     def fetch_items(
         self,
         company_name: str,
         debug:        bool = False,
     ) -> Optional[bytes]:
-        """Full snapshot of all StockItem masters."""
         return self._fetch(
             'utils/item.xml', 'Items',
             company_name, debug=debug,
@@ -740,7 +670,6 @@ class TallyConnector:
         last_alter_id: int,
         debug:         bool = False,
     ) -> Optional[bytes]:
-        """CDC fetch — only StockItems changed since last_alter_id."""
         return self._fetch(
             'utils/cdc/item_cdc.xml', 'Items CDC',
             company_name, alter_id=last_alter_id, debug=debug,
@@ -751,11 +680,6 @@ class TallyConnector:
         company_name: str,
         debug:        bool = False,
     ) -> Optional[bytes]:
-        """
-        Fetch all StockItem GUIDs + ISDELETED for GUID reconciliation.
-        No date range — item masters have no transaction date.
-        Used to detect items deleted in Tally that CDC missed.
-        """
         return self._fetch(
             'utils/guid/item_guid.xml', 'Item GUIDs',
             company_name, debug=debug,
@@ -766,17 +690,10 @@ class TallyConnector:
         company_name: str,
         debug:        bool = False,
     ) -> Optional[bytes]:
-        """
-        Fetch all Ledger GUIDs + ISDELETED for GUID reconciliation.
-        No date range — ledger masters have no transaction date.
-        Used to detect ledgers deleted in Tally that CDC missed.
-        """
         return self._fetch(
             'utils/guid/ledger_guid.xml', 'Ledger GUIDs',
             company_name, debug=debug,
         )
-
-    # ── Outstanding fetches ───────────────────────────────────────────────────
 
     def fetch_outstanding(
         self,
@@ -785,16 +702,10 @@ class TallyConnector:
         to_date:      Optional[str] = None,
         debug:        bool          = False,
     ) -> Optional[bytes]:
-        """
-        Fetch all vouchers under Sundry Debtors (Receivables) for the given
-        date range.  Parsed by data_processor.parse_outstanding().
-        """
         return self._fetch(
             'utils/outstanding.xml', 'Outstanding',
             company_name, from_date, to_date, debug=debug,
         )
-
-    # ── Date utilities ────────────────────────────────────────────────────────
 
     @staticmethod
     def parse_tally_date(date_str: str) -> Optional[datetime]:
@@ -808,8 +719,6 @@ class TallyConnector:
     @staticmethod
     def format_tally_date(dt: datetime) -> Optional[str]:
         return dt.strftime('%Y%m%d') if dt else None
-
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def close(self):
         if hasattr(self, 'session'):
