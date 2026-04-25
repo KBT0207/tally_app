@@ -38,10 +38,61 @@ import copy
 import shutil
 import logging
 import base64
+import hashlib
 
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Fernet encryption — encrypts the ENTIRE config.json
+#  Anyone who opens config.json sees only encrypted gibberish.
+#  If they edit it manually, decryption fails → app resets to defaults.
+#
+#  The encryption key is derived from a secret phrase baked into the EXE.
+#  Change _CONFIG_SECRET if you ever want to invalidate all existing configs.
+# ─────────────────────────────────────────────────────────────────────────────
+_CONFIG_SECRET = "TallySyncManager@Kaybee#2025$Secure!"   # ← only change this if needed
+
+def _derive_fernet_key(secret: str) -> bytes:
+    """Derive a 32-byte Fernet key from the secret phrase using SHA-256."""
+    digest = hashlib.sha256(secret.encode()).digest()
+    return base64.urlsafe_b64encode(digest)
+
+def _get_fernet():
+    """Return a Fernet instance. Returns None if cryptography not installed."""
+    try:
+        from cryptography.fernet import Fernet
+        key = _derive_fernet_key(_CONFIG_SECRET)
+        return Fernet(key)
+    except ImportError:
+        logger.warning("[ConfigManager] cryptography not installed — config stored unencrypted")
+        return None
+
+def _encrypt_config(data: dict) -> str:
+    """Serialize dict to JSON then encrypt. Returns encrypted string."""
+    fernet = _get_fernet()
+    raw    = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+    if fernet:
+        return "ENC:" + fernet.encrypt(raw).decode("utf-8")
+    # Fallback: store as plain JSON (no cryptography library)
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+def _decrypt_config(text: str) -> dict:
+    """Decrypt encrypted config string → dict. Returns None on failure."""
+    try:
+        if text.startswith("ENC:"):
+            fernet = _get_fernet()
+            if not fernet:
+                return None
+            raw = fernet.decrypt(text[4:].encode("utf-8"))
+            return json.loads(raw.decode("utf-8"))
+        else:
+            # Plain JSON (legacy or no cryptography library)
+            return json.loads(text)
+    except Exception as e:
+        logger.error(f"[ConfigManager] Failed to decrypt config: {e}")
+        return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Secure password storage
@@ -124,15 +175,6 @@ DEFAULT_CONFIG = {
         "setup_complete": False,
         "first_run":      True,
     },
-    # ── Admin protection — guards DB settings behind password + email OTP ────
-    "admin": {
-        "password_hash": "",        # SHA-256 hash — never plain text
-        "email":         "",        # OTP is sent to this address
-        "smtp_host":     "",        # e.g. smtp.gmail.com
-        "smtp_port":     587,
-        "smtp_user":     "",
-        "smtp_password": "",        # stored via keyring when available
-    },
 }
 
 
@@ -186,9 +228,9 @@ class ConfigManager:
     # ─────────────────────────────────────────────────────────────────────────
     def _load(self) -> dict:
         """
-        Load config from disk.
-        If file missing or corrupt → return defaults.
-        If file corrupt → save a backup of the bad file, then return defaults.
+        Load and decrypt config from disk.
+        If file missing, corrupt or tampered → return defaults.
+        If file tampered → backup bad file, reset to defaults (forces re-setup).
         """
         if not os.path.exists(self._path):
             logger.info(f"[ConfigManager] No config file found at {self._path} — using defaults")
@@ -196,33 +238,40 @@ class ConfigManager:
 
         try:
             with open(self._path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                text = f.read().strip()
 
-            # Merge with defaults so any new keys added in future versions
-            # are automatically present even in old config files
+            data = _decrypt_config(text)
+
+            if data is None:
+                # Decryption failed — file was tampered or corrupted
+                logger.error("[ConfigManager] Config decryption failed — file may be tampered. Resetting.")
+                try:
+                    shutil.copy2(self._path, self._backup)
+                    logger.warning(f"[ConfigManager] Tampered config backed up to {self._backup}")
+                except Exception:
+                    pass
+                return self._deep_copy(DEFAULT_CONFIG)
+
+            # Merge with defaults so new keys are present in old configs
             merged = self._deep_copy(DEFAULT_CONFIG)
             self._deep_merge(merged, data)
-            logger.info(f"[ConfigManager] Config loaded from {self._path}")
+            logger.info(f"[ConfigManager] Config decrypted and loaded from {self._path}")
             return merged
 
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"[ConfigManager] Config file corrupt: {e} — backing up and using defaults")
-            try:
-                shutil.copy2(self._path, self._backup)
-                logger.warning(f"[ConfigManager] Bad config backed up to {self._backup}")
-            except Exception:
-                pass
+        except (IOError, OSError) as e:
+            logger.error(f"[ConfigManager] Could not read config file: {e}")
             return self._deep_copy(DEFAULT_CONFIG)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Save
     # ─────────────────────────────────────────────────────────────────────────
     def _save(self):
-        """Write current _data to disk as pretty-printed JSON."""
+        """Encrypt and write current _data to disk."""
         try:
+            encrypted = _encrypt_config(self._data)
             with open(self._path, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, indent=2, ensure_ascii=False)
-            logger.debug(f"[ConfigManager] Config saved to {self._path}")
+                f.write(encrypted)
+            logger.debug(f"[ConfigManager] Config encrypted and saved to {self._path}")
         except IOError as e:
             logger.error(f"[ConfigManager] Failed to save config: {e}")
             raise
@@ -361,52 +410,6 @@ class ConfigManager:
         if not stored:
             return False
         return password == stored
-
-
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Admin protection config  (password hash + email + SMTP)
-    # ─────────────────────────────────────────────────────────────────────────
-    def get_admin_config(self) -> dict:
-        """
-        Returns admin protection config with keys:
-          password_hash, email, smtp_host, smtp_port, smtp_user, smtp_password
-        smtp_password is decoded from keyring / b64 before returning.
-        """
-        import copy
-        raw = copy.deepcopy(self._data.get("admin", DEFAULT_CONFIG["admin"]))
-        # Reuse the same secure loader used for the DB password
-        raw["smtp_password"] = _load_password(raw.get("smtp_password", ""))
-        return raw
-
-    def save_admin_config(self, admin: dict) -> None:
-        """
-        Save admin protection settings.
-        Expected keys: password_hash, email, smtp_host, smtp_port,
-                       smtp_user, smtp_password
-        smtp_password is stored via keyring / b64 — never plain text.
-        """
-        smtp_pass = str(admin.get("smtp_password", ""))
-        # Use a dedicated keyring key so it doesn't collide with the DB password
-        if _HAS_KEYRING:
-            try:
-                import keyring as _kr
-                _kr.set_password("TallySyncManager", "smtp_password", smtp_pass)
-                token = "__keyring_smtp__"
-            except Exception:
-                token = "b64:" + __import__("base64").b64encode(smtp_pass.encode()).decode()
-        else:
-            token = "b64:" + __import__("base64").b64encode(smtp_pass.encode()).decode()
-
-        self._data["admin"] = {
-            "password_hash": str(admin.get("password_hash", "")),
-            "email":         str(admin.get("email", "")),
-            "smtp_host":     str(admin.get("smtp_host", "")),
-            "smtp_port":     int(admin.get("smtp_port", 587)),
-            "smtp_user":     str(admin.get("smtp_user", "")),
-            "smtp_password": token,
-        }
-        self._save()
-        logger.info("[ConfigManager] Admin protection config saved")
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Convenience: reload from disk

@@ -138,7 +138,8 @@ hidden_imports = [
     'gui.components.date_range_picker',
     'gui.components.image_test_overlay',
     'gui.components.voucher_selector',
-    'gui.components.protected_access_dialog',   # ← admin password + OTP dialog
+    'gui.components.protected_access_dialog',   # ← admin password + OTP dialog (⚙ button)
+    'gui.components.first_run_password_dialog',  # ← mandatory password on first launch
 
     # ── GUI core modules ──────────────────────────────────────────────────────
     'gui.app',

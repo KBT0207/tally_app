@@ -55,7 +55,6 @@ class TallySyncApp:
         self._frames        = {}
         self._active_page   = None
         self._config        = ConfigManager()
-
         self._build_root()
 
         if not self._run_setup_if_needed():
@@ -126,10 +125,16 @@ class TallySyncApp:
 
         Cases that trigger the wizard:
           1. First run — config.json doesn't exist yet
+             → Step A: mandatory admin password dialog
+             → Step B: DB setup wizard
           2. setup_complete = False — previous run failed or was cancelled
           3. DB connection fails with existing config — credentials changed
         """
         if not self._config.is_setup_complete():
+            # ── First run: require admin password before DB setup ─────────────
+            if self._config.is_first_run():
+                if not self._show_first_run_password():
+                    return False   # wrong password / closed → exit app
             return self._show_setup_wizard(error_msg="")
 
         db_cfg = self._config.get_db_config()
@@ -144,6 +149,16 @@ class TallySyncApp:
             return self._show_setup_wizard(error_msg=error)
 
         return True
+
+    def _show_first_run_password(self) -> bool:
+        """
+        Show mandatory admin password dialog on very first launch.
+        Returns True if correct password entered, False if closed/cancelled.
+        """
+        from gui.components.first_run_password_dialog import FirstRunPasswordDialog
+        dlg = FirstRunPasswordDialog(self.root)
+        self.root.wait_window(dlg)
+        return dlg.verified
 
     def _show_setup_wizard(self, error_msg: str = "") -> bool:
         """Show the setup wizard. Returns True if completed, False if cancelled."""
@@ -1144,9 +1159,8 @@ class TallySyncApp:
 
     def _protected_db_settings(self):
         """
-        Gate the ⚙ DB settings button behind admin password + email OTP.
-        On first click ever: shows one-time setup to save password + SMTP.
-        After setup: password → OTP → settings open.
+        Gate DB settings behind admin password + OTP.
+        Asked every single time ⚙ is clicked — no session memory.
         """
         from gui.components.protected_access_dialog import ProtectedAccessDialog
         ProtectedAccessDialog(self.root, self._config, callback=self.open_db_settings)

@@ -24,32 +24,18 @@ from tkinter              import messagebox
 from logging_config import logger
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  ✏  CHANGE THESE 4 VALUES ONLY
+#  All settings are in admin_config.py — edit that file only
 # ═════════════════════════════════════════════════════════════════════════════
+from admin_config import (
+    ADMIN_PASSWORD    as _ADMIN_PASSWORD,
+    OTP_TO_EMAILS     as _OTP_TO_EMAILS,
+    SMTP_USER         as _SMTP_USER,
+    SMTP_APP_PASSWORD as _SMTP_APP_PASSWORD,
+    SMTP_HOST         as _SMTP_HOST,
+    SMTP_PORT         as _SMTP_PORT,
+)
 
-# Your admin password (plain text here — it is hashed at runtime, never stored)
-_ADMIN_PASSWORD   = "VI@ve2209$"
-
-# Gmail account that SENDS the OTP  (must match App Password below)
-_SMTP_USER        = "vivekkumar@Kaybeeexports.com"
-
-# Gmail App Password (16 chars, no spaces)
-_SMTP_APP_PASSWORD = "wknedkryueitwewm"
-
-_OTP_TO_EMAILS    = [
-    "vivekkumar@Kaybeeexports.com",
-    "danish@Kaybeeexports.com",   
-    "s.gaurav@Kaybeeexports.com",   
-    "yadav.sakshi@Kaybeeexports.com",   
-]
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  Do not change anything below this line
-# ═════════════════════════════════════════════════════════════════════════════
-
-_SMTP_HOST        = "smtp.gmail.com"
-_SMTP_PORT        = 587
-_ADMIN_PASS_HASH  = hashlib.sha256(_ADMIN_PASSWORD.encode()).hexdigest()
+_ADMIN_PASS_HASH = hashlib.sha256(_ADMIN_PASSWORD.encode()).hexdigest()
 
 
 def _make_otp(length: int = 6) -> str:
