@@ -7,6 +7,11 @@ Phase 3 fixes:
   - bind_all("<MouseWheel>") replaced with Enter/Leave scoped binding
     (same fix as home_page — prevents scroll leaking to other pages)
 
+Phase 4 fixes:
+  - LOGS_DIR now resolved from tally_config.ini [tally] log_dir
+    (written by installer when user picks a custom drive/folder).
+  - Falls back to "logs" relative to exe dir if key is absent.
+
 Features:
   - Tabs: Live (sync events streamed from queue) | Main Log | Error Log
   - Tail log files — auto-detects today's log file, re-checks every 2s
@@ -19,6 +24,8 @@ Features:
 """
 
 import os
+import sys
+import configparser
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -30,7 +37,49 @@ from gui.styles import Color, Font, Spacing
 TAIL_LINES       = 500
 TAIL_INTERVAL_MS = 2000
 MAX_LIVE_LINES   = 2000
-LOGS_DIR         = "logs"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Resolve log directory — mirrors the same logic as logging_config.py
+#  so both modules always point to the same folder.
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_exe_dir() -> str:
+    """Folder containing the .exe (frozen) or this source file (dev)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    # In dev the gui/pages/ folder is two levels below the project root
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _get_bundle_dir() -> str:
+    """Temp extraction folder in frozen mode (_MEIPASS), else project root."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS  # type: ignore[attr-defined]
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _resolve_logs_dir() -> str:
+    """
+    Return the log directory to use.
+
+    Priority:
+      1. [tally] log_dir in tally_config.ini  (set by installer)
+      2. <exe_dir>\\logs                        (fallback)
+    """
+    try:
+        ini_path = os.path.join(_get_bundle_dir(), "tally_config.ini")
+        cfg      = configparser.ConfigParser()
+        if os.path.exists(ini_path):
+            cfg.read(ini_path, encoding="utf-8")
+        log_dir = cfg.get("tally", "log_dir", fallback="").strip()
+        if log_dir:
+            return log_dir
+    except Exception:
+        pass
+    return os.path.join(_get_exe_dir(), "logs")
+
+
+LOGS_DIR = _resolve_logs_dir()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

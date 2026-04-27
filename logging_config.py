@@ -11,6 +11,12 @@ Phase 3 fixes:
     retention window — cleans up accumulation from multi-day gaps.
   - Retention window read from tally_config.ini [tally] log_retention_days
     (default 30 days); 0 = keep forever.
+
+Phase 4 fixes:
+  - LOG_DIR now reads log_dir from tally_config.ini [tally] section.
+    This allows the installer to let the user choose any drive/folder
+    for log storage (e.g. D:\logs\TallySyncManager).
+  - Falls back to <exe_dir>\logs if log_dir is missing or empty in the ini.
 """
 
 import logging
@@ -46,30 +52,60 @@ def _get_bundle_dir() -> str:
         return sys._MEIPASS  # type: ignore[attr-defined]
     return os.path.dirname(os.path.abspath(__file__))
 
-LOG_DIR = os.path.join(_get_exe_dir(), "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-
-today_date     = datetime.now().strftime("%d-%b-%Y")
-main_log_file  = os.path.join(LOG_DIR, f"main_{today_date}.log")
-error_log_file = os.path.join(LOG_DIR, f"error_{today_date}.log")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Read retention setting from tally_config.ini
+#  Read log_dir and retention setting from tally_config.ini
 # ─────────────────────────────────────────────────────────────────────────────
-_ADVANCED_CFG = os.path.join(_get_bundle_dir(), "tally_config.ini")
+_ADVANCED_CFG           = os.path.join(_get_bundle_dir(), "tally_config.ini")
 _DEFAULT_RETENTION_DAYS = 30
+
+
+def _read_ini() -> configparser.ConfigParser:
+    """Read tally_config.ini and return the parser. Safe to call at import time."""
+    cfg = configparser.ConfigParser()
+    if os.path.exists(_ADVANCED_CFG):
+        cfg.read(_ADVANCED_CFG, encoding="utf-8")
+    return cfg
+
+
+def _resolve_log_dir() -> str:
+    """
+    Return the log directory to use.
+
+    Priority:
+      1. [tally] log_dir in tally_config.ini  (set by installer, any drive)
+      2. <exe_dir>\\logs                        (safe fallback for dev / fresh install)
+    """
+    try:
+        cfg     = _read_ini()
+        log_dir = cfg.get("tally", "log_dir", fallback="").strip()
+        if log_dir:
+            return log_dir
+    except Exception:
+        pass
+    # Fallback: logs folder next to the .exe (or main.py in dev)
+    return os.path.join(_get_exe_dir(), "logs")
 
 
 def _read_retention_days() -> int:
     try:
-        cfg = configparser.ConfigParser()
-        if os.path.exists(_ADVANCED_CFG):
-            cfg.read(_ADVANCED_CFG)
+        cfg = _read_ini()
         val = cfg.get("tally", "log_retention_days", fallback=str(_DEFAULT_RETENTION_DAYS))
         days = int(val)
         return days if days >= 0 else _DEFAULT_RETENTION_DAYS
     except Exception:
         return _DEFAULT_RETENTION_DAYS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Resolve and create the log directory
+# ─────────────────────────────────────────────────────────────────────────────
+LOG_DIR = _resolve_log_dir()
+os.makedirs(LOG_DIR, exist_ok=True)
+
+today_date     = datetime.now().strftime("%d-%b-%Y")
+main_log_file  = os.path.join(LOG_DIR, f"main_{today_date}.log")
+error_log_file = os.path.join(LOG_DIR, f"error_{today_date}.log")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,3 +231,5 @@ if _purged:
         f"[LogConfig] Startup purge: removed {_purged} log file(s) "
         f"older than {_retention} days"
     )
+
+logger.info(f"[LogConfig] Log directory: {LOG_DIR}")
