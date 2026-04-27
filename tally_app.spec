@@ -68,6 +68,9 @@ added_datas = [
 
     # ── Tally config (log retention, etc.) ───────────────────────────────────
     ('tally_config.ini',    '.'),
+
+    # ── Admin config — password + email list (single source of truth) ─────────
+    ('admin_config.py',     '.'),
 ]
 
 # Merge in collected package datas
@@ -140,6 +143,7 @@ hidden_imports = [
     'gui.components.voucher_selector',
     'gui.components.protected_access_dialog',   # ← admin password + OTP dialog (⚙ button)
     'gui.components.first_run_password_dialog',  # ← mandatory password on first launch
+    'admin_config',                              # ← central password + email config
 
     # ── GUI core modules ──────────────────────────────────────────────────────
     'gui.app',
