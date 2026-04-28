@@ -177,7 +177,8 @@ def clean_narration(text):
     return re.sub(r' {2,}', ' ', text).strip()
 
 
-def sanitize_xml_content(content):
+
+def sanitize_xml_content(content) -> str:
     if content is None:
         logger.error("XML content is None")
         return ""
@@ -189,8 +190,37 @@ def sanitize_xml_content(content):
             content = content.decode('latin-1')
 
     content = str(content)
+
     content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', content)
-    content = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)', '&amp;', content)
+    
+    def _filter_char_ref(m):
+        n = int(m.group(1))
+        if (n in (9, 10, 13)
+                or (0x20    <= n <= 0xD7FF)
+                or (0xE000  <= n <= 0xFFFD)
+                or (0x10000 <= n <= 0x10FFFF)):
+            return m.group(0)   # valid — keep as-is
+        return ''               # invalid — drop it
+
+    content = re.sub(r'&#(\d+);', _filter_char_ref, content)
+
+    content = re.sub(
+        r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)',
+        '&amp;',
+        content,
+    )
+
+    used_prefixes = set(re.findall(r'</?([A-Za-z][A-Za-z0-9_]*):', content))
+    if used_prefixes:
+        def _inject_namespaces(m):
+            root_tag = m.group(0)
+            for prefix in sorted(used_prefixes):
+                attr = f'xmlns:{prefix}'
+                if attr not in root_tag:
+                    root_tag = root_tag[:-1] + f' {attr}="urn:tally:{prefix.lower()}">'
+            return root_tag
+        content = re.sub(r'<ENVELOPE\b[^>]*>', _inject_namespaces, content, count=1)
+
     return content
 
 
@@ -254,6 +284,7 @@ _ISO_TEXT_CODES = [
     'EUR', 'GBP', 'JPY', 'USD',
 ]
 _ISO_TEXT_PATTERN = r'(?<!\w)(' + '|'.join(_ISO_TEXT_CODES) + r')(?=[\d\s\-/])'
+# _ISO_TEXT_PATTERN = r'(?<!\w)(' + '|'.join(_ISO_TEXT_CODES) + r')(?![\w])'
 
 
 def _detect_currency(text: str, default_currency: str = 'INR') -> str:
