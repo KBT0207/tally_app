@@ -17,6 +17,7 @@ class _LedgerVoucherMixin:
     exchange_rate  = Column(Float,        nullable=True,  default=1.0)
     narration      = Column(Text,         nullable=True)
     guid           = Column(String(255),  nullable=False, index=True)
+    voucherkey     = Column(String(255),  nullable=False, default='', index=True)
     alter_id       = Column(BigInteger,   nullable=False, default=0)
     master_id      = Column(String(255),  nullable=True)
     change_status  = Column(String(50),   nullable=True)

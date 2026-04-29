@@ -437,10 +437,11 @@ def _reconcile_deleted_vouchers(
                 logger.warning(
                     f"[{company_name}][{voucher_type}] "
                     f"Phase 3 chunk {month_str}: Tally returned 0 active GUIDs for window "
-                    f"{chunk_from}→{chunk_to}. If this period has vouchers in Tally, "
-                    f"check Tally connectivity before this run. Proceeding with reconciliation "
-                    f"— all DB rows in this window will be deleted if any exist."
+                    f"{chunk_from}→{chunk_to}. Skipping reconciliation for this chunk to "
+                    f"avoid deleting all DB rows. Check Tally connectivity if you believe "
+                    f"vouchers exist in this period."
                 )
+                continue
 
             deleted_count = reconcile_deleted_by_guids(
                 company_name        = company_name,

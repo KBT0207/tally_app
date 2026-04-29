@@ -544,6 +544,7 @@ def parse_ledger_voucher(
             guid           = voucher.findtext('GUID', '')
             alter_id       = voucher.findtext('ALTERID', '0')
             master_id      = voucher.findtext('MASTERID', '')
+            voucherkey     = get_voucher_key(voucher)
             voucher_number = clean_text(voucher.findtext('VOUCHERNUMBER', ''))
             voucher_type   = clean_text(voucher.findtext('VOUCHERTYPENAME', ''))
             date           = clean_text(voucher.findtext('DATE', ''))
@@ -573,6 +574,7 @@ def parse_ledger_voucher(
                     'exchange_rate'  : 1.0,
                     'narration'      : narration,
                     'guid'           : guid,
+                    'voucherkey'     : voucherkey,
                     'alter_id'       : int(alter_id) if alter_id else 0,
                     'master_id'      : master_id,
                     'change_status'  : change_status,
@@ -622,6 +624,7 @@ def parse_ledger_voucher(
                     'exchange_rate'  : currency_info['exchange_rate'],
                     'narration'      : narration,
                     'guid'           : guid,
+                    'voucherkey'     : voucherkey,
                     'alter_id'       : int(alter_id) if alter_id else 0,
                     'master_id'      : master_id,
                     'change_status'  : change_status,
